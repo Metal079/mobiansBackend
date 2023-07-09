@@ -1,11 +1,10 @@
 import os
-import json
 import io
 import base64
 import requests
-import random
 import time
 from typing import Optional
+import time
 
 from fastapi import FastAPI, Request, Depends, status, Response, HTTPException
 from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
@@ -17,6 +16,7 @@ from pydantic import BaseModel
 # from slowapi.errors import RateLimitExceeded
 from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 from dotenv import load_dotenv
+import zipfile
 load_dotenv()
 
 
@@ -139,24 +139,56 @@ async def get_job(job_data: GetJobData):
         # Try it one more time
         response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
 
-    # Add watermark and metadata to images if they're ready
-    metadata = "placeholder"
     try:
         if response.json()['status'] == 'completed':
-            # Add watermark to images
-            watermarked_images = []
-            finished_response = {'status': 'completed', 'result': []}
+            start_time = time.time()  # start timer
 
-            for index, image in enumerate(response.json()['result']):
-                watermarked_images.append(add_watermark(Image.open(io.BytesIO(base64.b64decode(image)))).convert("RGB"))
-                finished_response['result'].append(add_image_metadata(watermarked_images[index], metadata))
+            image_response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_images/{job_data.job_id}", stream=True)
+            download_time = time.time()  # time after downloading images
+
+            if image_response.status_code != 200:
+                print(f"Error fetching images for job {job_data.job_id}")
+                print(f"Image response: {image_response.text}")
+                return JSONResponse(content=response.json(), status_code=response.status_code)
+
+            # Save the received zip file to a BytesIO object
+            zip_io = io.BytesIO(image_response.content)
+
+            # Open the zip file
+            finished_response = {'status': 'completed', 'result': []}
+            metadata = "placeholder"
+            with zipfile.ZipFile(zip_io) as zip_file:
+                # Iterate over each file in the zip file
+                for filename in zip_file.namelist():
+                    # Open each image file and convert it to a PIL Image
+                    with zip_file.open(filename) as image_file:
+                        image = Image.open(image_file)
+                        open_time = time.time()  # time after opening image
+
+                        # Add watermark
+                        watermarked_image = add_watermark(image.convert("RGB"))
+                        watermark_time = time.time()  # time after adding watermark
+
+                        # Add metadata
+                        watermarked_image_base64 = add_image_metadata(watermarked_image, metadata)
+                        metadata_time = time.time()  # time after adding metadata
+
+                        # Add the watermarked and metadata-added image to the result
+                        finished_response['result'].append(watermarked_image_base64)
+
+            total_time = time.time() - start_time  # end timer and calculate total elapsed time
+            print(f"Image download took {download_time - start_time} seconds.")
+            print(f"Image opening took {open_time - download_time} seconds.")
+            print(f"Watermarking took {watermark_time - open_time} seconds.")
+            print(f"Metadata addition took {metadata_time - watermark_time} seconds.")
+            print(f"Total image processing took {total_time} seconds.")
 
             return JSONResponse(content=finished_response, status_code=response.status_code)
-    #print the error message
-    except:
+    except Exception as e:
         print(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
         print(f"response: {response.text}")
         print(f"response.json(): {response.json()}")
+        print(f"Exception: {e}")
         return JSONResponse(content=response.json(), status_code=response.status_code)
 
     return JSONResponse(content=response.json(), status_code=response.status_code)
