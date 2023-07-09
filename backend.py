@@ -16,13 +16,21 @@ from pydantic import BaseModel
 # from slowapi.util import get_remote_address
 # from slowapi.errors import RateLimitExceeded
 from starlette.status import HTTP_429_TOO_MANY_REQUESTS
-
+import debugpy
 from dotenv import load_dotenv
 load_dotenv()
 
+# Allow other computers to attach to debugpy at this IP address and port.
+debugpy.listen(('0.0.0.0', 3000))
+
+# Pause the program until a remote debugger is attached
+debugpy.wait_for_client()
+
 API_IP_List = os.environ.get('API_IP_List').split(' ')
 
-app = FastAPI()
+DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() in ["true", "1"]
+app = FastAPI(debug=DEBUG_MODE)
+
 
 # Set up the CORS middleware
 app.add_middleware(

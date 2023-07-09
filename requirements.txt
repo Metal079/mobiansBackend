@@ -5,3 +5,4 @@ slowapi
 pillow
 python-dotenv
 gunicorn
+debugpy
