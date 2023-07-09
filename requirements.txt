@@ -4,3 +4,4 @@ uvicorn
 slowapi
 pillow
 python-dotenv
+gunicorn
