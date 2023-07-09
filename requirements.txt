@@ -1,0 +1,6 @@
+requests
+fastapi
+uvicorn
+slowapi
+pillow
+python-dotenv
