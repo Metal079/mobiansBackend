@@ -16,20 +16,13 @@ from pydantic import BaseModel
 # from slowapi.util import get_remote_address
 # from slowapi.errors import RateLimitExceeded
 from starlette.status import HTTP_429_TOO_MANY_REQUESTS
-import debugpy
 from dotenv import load_dotenv
 load_dotenv()
 
-# Allow other computers to attach to debugpy at this IP address and port.
-debugpy.listen(('0.0.0.0', 3000))
-
-# Pause the program until a remote debugger is attached
-debugpy.wait_for_client()
 
 API_IP_List = os.environ.get('API_IP_List').split(' ')
 
-DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() in ["true", "1"]
-app = FastAPI(debug=DEBUG_MODE)
+app = FastAPI()
 
 
 # Set up the CORS middleware
@@ -148,16 +141,23 @@ async def get_job(job_data: GetJobData):
 
     # Add watermark and metadata to images if they're ready
     metadata = "placeholder"
-    if response.json()['status'] == 'completed':
-        # Add watermark to images
-        watermarked_images = []
-        finished_response = {'status': 'completed', 'result': []}
+    try:
+        if response.json()['status'] == 'completed':
+            # Add watermark to images
+            watermarked_images = []
+            finished_response = {'status': 'completed', 'result': []}
 
-        for index, image in enumerate(response.json()['result']):
-            watermarked_images.append(add_watermark(Image.open(io.BytesIO(base64.b64decode(image)))).convert("RGB"))
-            finished_response['result'].append(add_image_metadata(watermarked_images[index], metadata))
+            for index, image in enumerate(response.json()['result']):
+                watermarked_images.append(add_watermark(Image.open(io.BytesIO(base64.b64decode(image)))).convert("RGB"))
+                finished_response['result'].append(add_image_metadata(watermarked_images[index], metadata))
 
-        return JSONResponse(content=finished_response, status_code=response.status_code)
+            return JSONResponse(content=finished_response, status_code=response.status_code)
+    #print the error message
+    except:
+        print(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
+        print(f"response: {response.text}")
+        print(f"response.json(): {response.json()}")
+        return JSONResponse(content=response.json(), status_code=response.status_code)
 
     return JSONResponse(content=response.json(), status_code=response.status_code)
 
