@@ -149,7 +149,9 @@ async def get_job(job_data: GetJobData):
             if image_response.status_code != 200:
                 print(f"Error fetching images for job {job_data.job_id}")
                 print(f"Image response: {image_response.text}")
-                return JSONResponse(content=response.json(), status_code=response.status_code)
+
+                # Try it one more time
+                image_response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_images/{job_data.job_id}", stream=True)
 
             # Save the received zip file to a BytesIO object
             zip_io = io.BytesIO(image_response.content)
