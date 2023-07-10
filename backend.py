@@ -5,6 +5,7 @@ import requests
 import time
 from typing import Optional
 import time
+import hashlib
 
 from fastapi import FastAPI, Request, Depends, status, Response, HTTPException
 from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
@@ -144,44 +145,29 @@ async def get_job(job_data: GetJobData):
 
     try:
         if response.json()['status'] == 'completed':
-            # Retry logic
-            attempts = 0
-            while attempts < 2:
-                # Trigger image saving to Redis by calling the /get_images/ endpoint
-                image_response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_images/{job_data.job_id}")
-                if image_response.status_code != 200:
-                    print(f"Error storing images to Redis for job {job_data.job_id}")
-                    print(f"Image response: {image_response.text}")
-                    attempts += 1
-                    time.sleep(1)  # delay before retrying
-                    continue  # try again
-                else:
-                    break  # successful, so break the loop
-
-            if attempts == 2:
-                print(f"Failed to store images to Redis after 2 attempts for job {job_data.job_id}")
-                return JSONResponse(content=response.json(), status_code=response.status_code)
-
             # Fetch images from Redis
             finished_response = {'status': 'completed', 'result': []}
             metadata = "placeholder"
-            image_data = []
-            pipe = r.pipeline()
             for i in range(4):
                 key = f"job:{job_data.job_id}:image:{i}"
-                pipe.get(key)
-            image_data = pipe.execute()
+                attempts = 0
+                while attempts < 3:
+                    image_bytes = r.get(key)
+                    fetched_checksum = r.get(f"job:{job_data.job_id}:image:{i}:checksum")
+                    if image_bytes is not None and fetched_checksum is not None:
+                        computed_checksum = hashlib.sha256(image_bytes).hexdigest()
+                        if fetched_checksum.decode() == computed_checksum:
+                            image = Image.open(io.BytesIO(image_bytes))
 
-            for image in image_data:
-                if image is None:
-                    print(f"No image data retrieved with key: {key}")
-                    break
-                image = Image.open(io.BytesIO(image))
-
-                # Add watermark and metadata
-                watermarked_image = add_watermark(image.convert("RGB"))
-                watermarked_image_base64 = add_image_metadata(watermarked_image, metadata)
-                finished_response['result'].append(watermarked_image_base64)
+                            # Add watermark and metadata
+                            watermarked_image = add_watermark(image.convert("RGB"))
+                            watermarked_image_base64 = add_image_metadata(watermarked_image, metadata)
+                            finished_response['result'].append(watermarked_image_base64)
+                            break
+                    attempts += 1
+                    time.sleep(1)  # delay before retrying
+                else:
+                    print(f"Failed to fetch uncorrupted image data after 3 attempts: {key}")
 
             return JSONResponse(content=finished_response, status_code=response.status_code)
     except Exception as e:
@@ -192,6 +178,7 @@ async def get_job(job_data: GetJobData):
         return JSONResponse(content=response.json(), status_code=response.status_code)
 
     return JSONResponse(content=response.json(), status_code=response.status_code)
+
 
 
 # Get the queue length of each API and choose the one with the shortest queue
