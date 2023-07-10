@@ -16,7 +16,6 @@ from pydantic import BaseModel
 # from slowapi.errors import RateLimitExceeded
 from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 from dotenv import load_dotenv
-import zipfile
 import redis
 
 

@@ -6,3 +6,4 @@ pillow
 python-dotenv
 gunicorn
 debugpy
+redis
