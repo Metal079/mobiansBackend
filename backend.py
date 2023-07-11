@@ -20,7 +20,7 @@ from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 from dotenv import load_dotenv
 import redis
 
-logging.basicConfig(level=logging.INFO)  # Configure logging
+logging.basicConfig(level=logging.DEBUG)  # Configure logging
 
 r = redis.Redis(host='7.tcp.ngrok.io', port=21658, db=0)
 load_dotenv()
@@ -141,7 +141,7 @@ async def get_job(job_data: GetJobData):
     try:
         response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
         response.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xx
-    except:
+    except Exception as e:
         logging.error(f"Exception occurred when making GET request: {e}")
         logging.error(f"trying again")
         response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
