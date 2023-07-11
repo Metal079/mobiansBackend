@@ -141,9 +141,9 @@ async def get_job(job_data: GetJobData):
     response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
 
     if response.status_code != 200:
-        logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
-        logging.error(f"response: {response.text}")
-        response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
+        logging.error(f"Got status code error here")
+        # logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
+        # logging.error(f"response: {response.text}")
         time.sleep(1)
 
         # Try it one more time
@@ -197,10 +197,11 @@ async def get_job(job_data: GetJobData):
             return JSONResponse(content=finished_response, status_code=response.status_code)
 
     except Exception as e:
-        logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
-        logging.error(f"response: {response.text}")
-        logging.error(f"response.json(): {response.json()}")
-        logging.error(f"Exception: {e}")
+        # logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
+        # logging.error(f"response: {response.text}")
+        # logging.error(f"response.json(): {response.json()}")
+        # logging.error(f"Exception: {e}")
+        logging.error(f"Exception happened on get_job")
         return JSONResponse(content=response.json(), status_code=response.status_code)
 
     return JSONResponse(content=response.json(), status_code=response.status_code)
@@ -321,6 +322,7 @@ def add_image_metadata(image, request_data):
         metadata.add_text("cfg", str(request_data.guidance_scale))
     except:
         # log to text file
+        logging.error(f"Error adding metadata to image")
         with open("error_log.txt", "a") as f:
             f.write(f"Error adding metadata to image: {request_data}\n")
     metadata.add_text("model", "Mobians.ai / SonicDiffusionV3Beta4")
