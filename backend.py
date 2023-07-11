@@ -141,11 +141,11 @@ async def get_job(job_data: GetJobData):
     try:
         response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
         response.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xx
-    except requests.exceptions.RequestException as e:
+    except:
         logging.error(f"Exception occurred when making GET request: {e}")
         logging.error(f"trying again")
         response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
-        return JSONResponse(content={'message': 'Error occurred while making GET request'}, status_code=500)
+        # return JSONResponse(content={'message': 'Error occurred while making GET request'}, status_code=500)
 
     if response.status_code != 200:
         logging.error(f"Got status code error here")
