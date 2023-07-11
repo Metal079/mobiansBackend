@@ -23,7 +23,8 @@ import redis
 
 logging.basicConfig(level=logging.INFO)  # Configure logging
 
-r = redis.Redis(host='7.tcp.ngrok.io', port=21658, db=0)
+# r = redis.Redis(host='7.tcp.ngrok.io', port=21658, db=0)
+r = redis.Redis(host='76.157.184.213', port=6379, db=0)
 load_dotenv()
 
 
