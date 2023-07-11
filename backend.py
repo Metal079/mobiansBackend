@@ -6,6 +6,7 @@ import time
 from typing import Optional, List
 import time
 import hashlib
+import logging
 
 from fastapi import FastAPI, Request, Depends, status, Response, HTTPException
 from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
@@ -19,6 +20,7 @@ from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 from dotenv import load_dotenv
 import redis
 
+logging.basicConfig(level=logging.INFO)  # Configure logging
 
 r = redis.Redis(host='7.tcp.ngrok.io', port=21658, db=0)
 load_dotenv()
@@ -139,8 +141,8 @@ async def get_job(job_data: GetJobData):
     response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
 
     if response.status_code != 200:
-        print(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
-        print(f"response: {response.text}")
+        logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
+        logging.error(f"response: {response.text}")
         response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
         time.sleep(1)
 
@@ -167,7 +169,7 @@ async def get_job(job_data: GetJobData):
 
             # If there are corrupted images, resend them
             if corrupted_indexes:
-                print(f"Corrupted images detected for job {job_data.job_id}, resending corrupted images")
+                logging.info(f"Corrupted images detected for job {job_data.job_id}, resending corrupted images")
                 retry_info = JobRetryInfo(job_id=job_data.job_id, indexes=corrupted_indexes)
                 requests.get(url=f"{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}", json=retry_info.dict())
 
@@ -189,21 +191,19 @@ async def get_job(job_data: GetJobData):
                             finished_response['result'].append(watermarked_image_base64)
                             break  # valid image, no need for further attempts
                     else:
-                        print(f"Corrupted image STILL detected for job {job_data.job_id}")
+                        logging.error(f"Corrupted image STILL detected for job {job_data.job_id}")
                     attempts += 1
 
             return JSONResponse(content=finished_response, status_code=response.status_code)
 
     except Exception as e:
-        print(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
-        print(f"response: {response.text}")
-        print(f"response.json(): {response.json()}")
-        print(f"Exception: {e}")
+        logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
+        logging.error(f"response: {response.text}")
+        logging.error(f"response.json(): {response.json()}")
+        logging.error(f"Exception: {e}")
         return JSONResponse(content=response.json(), status_code=response.status_code)
 
     return JSONResponse(content=response.json(), status_code=response.status_code)
-
-
 
 # Get the queue length of each API and choose the one with the shortest queue
 def chooseAPI(generateType, triedAPIs=[]):
