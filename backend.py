@@ -3,7 +3,7 @@ import io
 import base64
 import requests
 import time
-from typing import Optional
+from typing import Optional, List
 import time
 import hashlib
 
@@ -130,6 +130,10 @@ class GetJobData(BaseModel):
     job_id: str
     API_IP: int
 
+class JobRetryInfo(BaseModel):
+    job_id: str
+    indexes: List[int]
+
 @app.post("/get_job/")
 async def get_job(job_data: GetJobData):
     response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
@@ -147,11 +151,31 @@ async def get_job(job_data: GetJobData):
         if response.json()['status'] == 'completed':
             # Fetch images from Redis
             finished_response = {'status': 'completed', 'result': []}
-            metadata = "placeholder"
+            metadata_json = r.get(f"job:{job_data.job_id}:metadata")
+            metadata = JobData.parse_raw(metadata_json)
+
+            # First pass: Identify corrupted images
+            corrupted_indexes = []
+            for i in range(4):
+                key = f"job:{job_data.job_id}:image:{i}"
+                image_bytes = r.get(key)
+                fetched_checksum = r.get(f"job:{job_data.job_id}:image:{i}:checksum")
+                if image_bytes is not None and fetched_checksum is not None:
+                    computed_checksum = hashlib.sha256(image_bytes).hexdigest()
+                    if fetched_checksum.decode() != computed_checksum:
+                        corrupted_indexes.append(i)
+
+            # If there are corrupted images, resend them
+            if corrupted_indexes:
+                print(f"Corrupted images detected for job {job_data.job_id}, resending corrupted images")
+                retry_info = JobRetryInfo(job_id=job_data.job_id, indexes=corrupted_indexes)
+                requests.get(url=f"{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}", json=retry_info.dict())
+
+            # Second pass: Fetch images, re-attempting if necessary
             for i in range(4):
                 key = f"job:{job_data.job_id}:image:{i}"
                 attempts = 0
-                while attempts < 3:
+                while attempts < 2:
                     image_bytes = r.get(key)
                     fetched_checksum = r.get(f"job:{job_data.job_id}:image:{i}:checksum")
                     if image_bytes is not None and fetched_checksum is not None:
@@ -163,13 +187,13 @@ async def get_job(job_data: GetJobData):
                             watermarked_image = add_watermark(image.convert("RGB"))
                             watermarked_image_base64 = add_image_metadata(watermarked_image, metadata)
                             finished_response['result'].append(watermarked_image_base64)
-                            break
+                            break  # valid image, no need for further attempts
+                    else:
+                        print(f"Corrupted image STILL detected for job {job_data.job_id}")
                     attempts += 1
-                    time.sleep(1)  # delay before retrying
-                else:
-                    print(f"Failed to fetch uncorrupted image data after 3 attempts: {key}")
 
             return JSONResponse(content=finished_response, status_code=response.status_code)
+
     except Exception as e:
         print(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
         print(f"response: {response.text}")
@@ -239,7 +263,7 @@ def promptFilter(data):
     if any(character in prompt.lower() for character in character_list):
         for tag in censored_tags:
             prompt = prompt.replace(tag, '')
-        negative_prompt = "nipples, pussy, breasts, " + negative_prompt
+        negative_prompt = "nipples, sexy, breasts, " + negative_prompt
             
     return prompt, negative_prompt
 
@@ -278,6 +302,8 @@ def add_watermark(image):
     image_with_watermark = Image.alpha_composite(image.convert("RGBA"), watermark)
     return image_with_watermark
 
+
+
 def add_image_metadata(image, request_data):
     img_io = io.BytesIO()
 
@@ -285,13 +311,19 @@ def add_image_metadata(image, request_data):
 
     # Add metadata
     metadata = PngImagePlugin.PngInfo()
-    # Add disclamer to metadata if job is not txt2img
-    # if job_type != "txt2img":
-    #     metadata.add_text("NOTE", "The image was not generated purely using txt2img, using the info below may not give you the same results.")
-    # metadata.add_text("prompt", request_data.data['prompt'])
-    # metadata.add_text("negative_prompt", request_data.data['negative_prompt'])
-    # metadata.add_text("seed", str(request_data.data['seed']))
-    # metadata.add_text("cfg", str(request_data.data['guidance_scale']))
+    try:
+        # Add disclamer to metadata if job is not txt2img
+        # if job_type != "txt2img":
+        #     metadata.add_text("NOTE", "The image was not generated purely using txt2img, using the info below may not give you the same results.")
+        metadata.add_text("prompt", request_data.prompt)
+        metadata.add_text("negative_prompt", request_data.negative_prompt)
+        metadata.add_text("seed", str(request_data.seed))
+        metadata.add_text("cfg", str(request_data.guidance_scale))
+    except:
+        # log to text file
+        with open("error_log.txt", "a") as f:
+            f.write(f"Error adding metadata to image: {request_data}\n")
+    metadata.add_text("model", "Mobians.ai / SonicDiffusionV3Beta4")
     metadata.add_text("Disclaimer", "The image is generated by Mobians.ai. The image is not real and is generated by an AI.")
 
     image_with_watermark.save(img_io, format='PNG', pnginfo=metadata)
