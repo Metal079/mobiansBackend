@@ -7,6 +7,7 @@ from typing import Optional, List
 import time
 import hashlib
 import logging
+import random
 
 from fastapi import FastAPI, Request, Depends, status, Response, HTTPException
 from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
@@ -138,14 +139,26 @@ class JobRetryInfo(BaseModel):
 
 @app.post("/get_job/")
 async def get_job(job_data: GetJobData):
-    try:
-        response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
-        response.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xx
-    except Exception as e:
-        logging.error(f"Exception occurred when making GET request: {e}")
-        logging.error(f"trying again")
-        response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
-        # return JSONResponse(content={'message': 'Error occurred while making GET request'}, status_code=500)
+    MAX_RETRIES = 5
+    MIN_DELAY = 1
+    MAX_DELAY = 10
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
+            response.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xx
+            break  # success, no need for more retries
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1:  # if this was the last attempt
+                logging.error(f"Max retries exceeded when making GET request, JOB: {job_data.job_id}")
+                return JSONResponse(content={'message': 'Error occurred while making GET request'}, status_code=500)
+            else:
+                # Calculate next sleep time
+                sleep_time = MIN_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                sleep_time = min(sleep_time, MAX_DELAY)
+
+                logging.error(f"Exception occurred when making GET request, JOB: {job_data.job_id}. Retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
 
     if response.status_code != 200:
         logging.error(f"Got status code error here")
