@@ -141,7 +141,7 @@ class JobRetryInfo(BaseModel):
 async def get_job(job_data: GetJobData):
     MAX_RETRIES = 5
     MIN_DELAY = 1
-    MAX_DELAY = 10
+    MAX_DELAY = 60
 
     for attempt in range(MAX_RETRIES):
         try:
