@@ -8,8 +8,9 @@ import time
 import hashlib
 import logging
 import random
+import asyncio
 
-from fastapi import FastAPI, Request, Depends, status, Response, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
@@ -140,10 +141,11 @@ class JobRetryInfo(BaseModel):
 
 @app.post("/get_job/")
 async def get_job(job_data: GetJobData):
-    MAX_RETRIES = 5
+    MAX_RETRIES = 2
     MIN_DELAY = 1
     MAX_DELAY = 60
 
+    response = None
     for attempt in range(MAX_RETRIES):
         try:
             response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
@@ -159,13 +161,13 @@ async def get_job(job_data: GetJobData):
                 sleep_time = min(sleep_time, MAX_DELAY)
 
                 logging.error(f"Exception occurred when making GET request, JOB: {job_data.job_id}. Retrying in {sleep_time} seconds...")
-                time.sleep(sleep_time)
+                asyncio.sleep(sleep_time)
 
     if response.status_code != 200:
         logging.error(f"Got status code error here")
         # logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
         # logging.error(f"response: {response.text}")
-        time.sleep(1)
+        asyncio.sleep(1)
 
         # Try it one more time
         response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
