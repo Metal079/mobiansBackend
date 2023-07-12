@@ -161,13 +161,13 @@ async def get_job(job_data: GetJobData):
                 sleep_time = min(sleep_time, MAX_DELAY)
 
                 logging.error(f"Exception occurred when making GET request, JOB: {job_data.job_id}. Retrying in {sleep_time} seconds...")
-                asyncio.sleep(sleep_time)
+                await asyncio.sleep(sleep_time)
 
     if response.status_code != 200:
         logging.error(f"Got status code error here")
         # logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
         # logging.error(f"response: {response.text}")
-        asyncio.sleep(1)
+        await asyncio.sleep(1)
 
         # Try it one more time
         response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
