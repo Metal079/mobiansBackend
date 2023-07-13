@@ -21,11 +21,20 @@ from pydantic import BaseModel
 from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 from dotenv import load_dotenv
 import redis
+from redis.backoff import ExponentialBackoff
+from redis.retry import Retry
+from redis.exceptions import (
+   BusyLoadingError,
+   ConnectionError,
+   TimeoutError
+)
 
 logging.basicConfig(level=logging.INFO)  # Configure logging
 
 # r = redis.Redis(host='7.tcp.ngrok.io', port=21658, db=0)
-r = redis.Redis(host='76.157.184.213', port=6379, db=0)
+# Run 3 retries with exponential backoff strategy
+retry = Retry(ExponentialBackoff(), 3)
+r = redis.Redis(host='76.157.184.213', port=6379, db=0, retry=retry, retry_on_error=[BusyLoadingError, ConnectionError, TimeoutError])
 load_dotenv()
 
 
