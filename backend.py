@@ -193,7 +193,7 @@ class JobRetryInfo(BaseModel):
 
 @app.post("/get_job/")
 async def get_job(job_data: GetJobData):
-    MAX_RETRIES = 2
+    MAX_RETRIES = 3
     MIN_DELAY = 1
     MAX_DELAY = 60
 
