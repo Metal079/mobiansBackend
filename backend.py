@@ -55,6 +55,8 @@ app.add_middleware(
 class JobData(BaseModel):
     prompt: str
     image: Optional[str] = None
+    mask_image: Optional[str] = None
+    control_image: Optional[str] = None
     scheduler: int
     steps: int
     negative_prompt: str
@@ -76,7 +78,7 @@ async def submit_job(job_data: JobData):
     API_IP = chooseAPI('txt2img')
 
     # Do img2img filtering if it's an img2img request
-    if job_data.job_type == 'img2img':
+    if job_data.job_type == 'img2img' or job_data.job_type == 'inpainting':
         # Convert base64 string to image to remove alpha channel if needed
         try:
             received_image = Image.open(io.BytesIO(base64.b64decode(job_data.image.split(",", 1)[0])))
@@ -116,6 +118,47 @@ async def submit_job(job_data: JobData):
         # Encode BytesIO object to base64
         encoded_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
         job_data.image = encoded_image
+
+    # Do the same for mask image
+    if job_data.mask_image:
+        try:
+            received_image = Image.open(io.BytesIO(base64.b64decode(job_data.mask_image.split(",", 1)[0])))
+        except:
+            received_image = Image.open(io.BytesIO(base64.b64decode(job_data.mask_image.split(",", 1)[1])))
+        if received_image.mode == 'RGBA':
+            buffer = io.BytesIO()
+            
+            # Separate alpha channel and add white background
+            background = Image.new('RGBA', received_image.size, (255, 255, 255))
+            alpha_composite = Image.alpha_composite(background, received_image).convert('RGB')
+            alpha_composite.save(buffer, format='PNG')
+
+            # Convert received_image back to base64 string
+            buffer.seek(0)
+            encoded_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
+            job_data.mask_image = encoded_image
+
+        # Resize image if needed
+        try:
+            init_image = Image.open(io.BytesIO(base64.b64decode(job_data.mask_image.split(",", 1)[0])))
+        except:
+            init_image = Image.open(io.BytesIO(base64.b64decode(job_data.mask_image.split(",", 1)[1])))
+        tempAspectRatio = init_image.width / init_image.height
+        if tempAspectRatio < 0.8:
+            init_image = init_image.resize((512, 768))
+        elif tempAspectRatio > 1.2:
+            init_image = init_image.resize((768, 512))
+        else:
+            init_image = init_image.resize((512, 512))
+
+        # Save resized image to a BytesIO object
+        buffer = io.BytesIO()
+        init_image.save(buffer, format='PNG')
+        buffer.seek(0)
+
+        # Encode BytesIO object to base64
+        encoded_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        job_data.mask_image = encoded_image
 
     # Try using the requested API, if it fails, use the other one
     try:

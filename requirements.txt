@@ -7,3 +7,5 @@ python-dotenv
 gunicorn
 debugpy
 redis
+flower
+celery
