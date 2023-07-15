@@ -10,6 +10,7 @@ import logging
 import random
 import asyncio
 
+import httpx
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -75,7 +76,7 @@ async def submit_job(job_data: JobData):
     job_data.prompt, job_data.negative_prompt = promptFilter(job_data)
     job_data.negative_prompt = fortify_default_negative(job_data.negative_prompt)
 
-    API_IP = chooseAPI('txt2img')
+    API_IP = await chooseAPI('txt2img')
 
     # Do img2img filtering if it's an img2img request
     if job_data.job_type == 'img2img' or job_data.job_type == 'inpainting':
@@ -161,19 +162,20 @@ async def submit_job(job_data: JobData):
         job_data.mask_image = encoded_image
 
     # Try using the requested API, if it fails, use the other one
-    try:
-        response = requests.post(url=f'{API_IP}/submit_job/', json=job_data.dict())
-    except:
-        API_IP = chooseAPI('txt2img', [API_IP])
-        response = requests.post(url=f'{API_IP}/submit_job/', json=job_data.dict())
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url=f'{API_IP}/submit_job/', json=job_data.dict())
+        except:
+            API_IP = chooseAPI('txt2img', [API_IP])
+            response = await client.post(url=f'{API_IP}/submit_job/', json=job_data.dict())
 
-    attempts = 0
-    while response.status_code != 200 and attempts < 3:
-        API_IP = chooseAPI('txt2img', [API_IP])
-        print(f"got error: {response.status_code} for submit_job, api: {API_IP}")
-        attempts += 1
-        response = requests.post(url=f'{API_IP}/submit_job/', json=job_data.dict())
-        time.sleep(1)
+        attempts = 0
+        while response.status_code != 200 and attempts < 3:
+            API_IP = chooseAPI('txt2img', [API_IP])
+            print(f"got error: {response.status_code} for submit_job, api: {API_IP}")
+            attempts += 1
+            response = await client.post(url=f'{API_IP}/submit_job/', json=job_data.dict())
+            await asyncio.sleep(1)
 
     returned_data = response.json()
     # Get index of API_IP in API_IP_List
@@ -198,107 +200,116 @@ async def get_job(job_data: GetJobData):
     MAX_DELAY = 60
 
     response = None
-    for attempt in range(MAX_RETRIES):
+    async with httpx.AsyncClient() as client:
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = await client.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}")
+                response.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xx
+                break  # success, no need for more retries
+            except Exception as e:
+                if attempt == MAX_RETRIES - 1:  # if this was the last attempt
+                    logging.error(f"Max retries exceeded when making GET request, JOB: {job_data.job_id}")
+                    return JSONResponse(content={'message': 'Error occurred while making GET request'}, status_code=500)
+                else:
+                    # Calculate next sleep time
+                    sleep_time = MIN_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                    sleep_time = min(sleep_time, MAX_DELAY)
+
+                    logging.error(f"Exception occurred when making GET request, JOB: {job_data.job_id}. Retrying in {sleep_time} seconds...")
+                    logging.error(e)
+                    await asyncio.sleep(sleep_time)
+
+        if response.status_code != 200:
+            logging.error(f"Got status code error here")
+            # logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
+            # logging.error(f"response: {response.text}")
+            await asyncio.sleep(1)
+
+            # Try it one more time
+            response = await client.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
+
+
         try:
-            response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
-            response.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xx
-            break  # success, no need for more retries
-        except Exception as e:
-            if attempt == MAX_RETRIES - 1:  # if this was the last attempt
-                logging.error(f"Max retries exceeded when making GET request, JOB: {job_data.job_id}")
-                return JSONResponse(content={'message': 'Error occurred while making GET request'}, status_code=500)
-            else:
-                # Calculate next sleep time
-                sleep_time = MIN_DELAY * (2 ** attempt) + random.uniform(0, 1)
-                sleep_time = min(sleep_time, MAX_DELAY)
+            if response.json()['status'] == 'completed':
+                # Fetch images from Redis
+                finished_response = {'status': 'completed', 'result': []}
+                metadata_json = r.get(f"job:{job_data.job_id}:metadata")
+                metadata = JobData.parse_raw(metadata_json)
 
-                logging.error(f"Exception occurred when making GET request, JOB: {job_data.job_id}. Retrying in {sleep_time} seconds...")
-                await asyncio.sleep(sleep_time)
-
-    if response.status_code != 200:
-        logging.error(f"Got status code error here")
-        # logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
-        # logging.error(f"response: {response.text}")
-        await asyncio.sleep(1)
-
-        # Try it one more time
-        response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
-
-    try:
-        if response.json()['status'] == 'completed':
-            # Fetch images from Redis
-            finished_response = {'status': 'completed', 'result': []}
-            metadata_json = r.get(f"job:{job_data.job_id}:metadata")
-            metadata = JobData.parse_raw(metadata_json)
-
-            # First pass: Identify corrupted images
-            corrupted_indexes = []
-            for i in range(4):
-                key = f"job:{job_data.job_id}:image:{i}"
-                image_bytes = r.get(key)
-                fetched_checksum = r.get(f"job:{job_data.job_id}:image:{i}:checksum")
-                if image_bytes is not None and fetched_checksum is not None:
-                    computed_checksum = hashlib.sha256(image_bytes).hexdigest()
-                    if fetched_checksum.decode() != computed_checksum:
-                        corrupted_indexes.append(i)
-
-            # If there are corrupted images, resend them
-            if corrupted_indexes:
-                logging.info(f"Corrupted images detected for job {job_data.job_id}, resending corrupted images")
-                retry_info = JobRetryInfo(job_id=job_data.job_id, indexes=corrupted_indexes)
-                requests.get(url=f"{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}", json=retry_info.dict())
-
-            # Second pass: Fetch images, re-attempting if necessary
-            for i in range(4):
-                key = f"job:{job_data.job_id}:image:{i}"
-                attempts = 0
-                while attempts < 2:
+                # First pass: Identify corrupted images
+                corrupted_indexes = []
+                for i in range(4):
+                    key = f"job:{job_data.job_id}:image:{i}"
                     image_bytes = r.get(key)
                     fetched_checksum = r.get(f"job:{job_data.job_id}:image:{i}:checksum")
                     if image_bytes is not None and fetched_checksum is not None:
                         computed_checksum = hashlib.sha256(image_bytes).hexdigest()
-                        if fetched_checksum.decode() == computed_checksum:
-                            image = Image.open(io.BytesIO(image_bytes))
+                        if fetched_checksum.decode() != computed_checksum:
+                            corrupted_indexes.append(i)
 
-                            # Add watermark and metadata
-                            watermarked_image = add_watermark(image.convert("RGB"))
-                            watermarked_image_base64 = add_image_metadata(watermarked_image, metadata)
-                            finished_response['result'].append(watermarked_image_base64)
-                            break  # valid image, no need for further attempts
-                    else:
-                        logging.error(f"Corrupted image STILL detected for job {job_data.job_id}")
-                    attempts += 1
+                # If there are corrupted images, resend them
+                if corrupted_indexes:
+                    logging.info(f"Corrupted images detected for job {job_data.job_id}, resending corrupted images")
+                    retry_info = JobRetryInfo(job_id=job_data.job_id, indexes=corrupted_indexes)
+                    await client.get(url=f"{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}", json=retry_info.dict())
 
-            return JSONResponse(content=finished_response, status_code=response.status_code)
+                # Second pass: Fetch images, re-attempting if necessary
+                for i in range(4):
+                    key = f"job:{job_data.job_id}:image:{i}"
+                    attempts = 0
+                    while attempts < 2:
+                        image_bytes = r.get(key)
+                        fetched_checksum = r.get(f"job:{job_data.job_id}:image:{i}:checksum")
+                        if image_bytes is not None and fetched_checksum is not None:
+                            computed_checksum = hashlib.sha256(image_bytes).hexdigest()
+                            if fetched_checksum.decode() == computed_checksum:
+                                image = Image.open(io.BytesIO(image_bytes))
 
-    except Exception as e:
-        # logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
-        # logging.error(f"response: {response.text}")
-        # logging.error(f"response.json(): {response.json()}")
-        # logging.error(f"Exception: {e}")
-        logging.error(f"Exception happened on get_job")
+                                # Add watermark and metadata
+                                watermarked_image = add_watermark(image.convert("RGB"))
+                                watermarked_image_base64 = add_image_metadata(watermarked_image, metadata)
+                                finished_response['result'].append(watermarked_image_base64)
+                                break  # valid image, no need for further attempts
+                        else:
+                            logging.error(f"Corrupted image STILL detected for job {job_data.job_id}")
+                        attempts += 1
+
+                return JSONResponse(content=finished_response, status_code=response.status_code)
+
+        except Exception as e:
+            # logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
+            # logging.error(f"response: {response.text}")
+            # logging.error(f"response.json(): {response.json()}")
+            # logging.error(f"Exception: {e}")
+            logging.error(f"Exception happened on get_job")
 
     return JSONResponse(content=response.json(), status_code=response.status_code)
 
 # Get the queue length of each API and choose the one with the shortest queue
-def chooseAPI(generateType, triedAPIs=[]):
+async def chooseAPI(generateType, triedAPIs=[]):
     API_queue_length_list = []
     current_lowest_queue = 9999
-    for index, api in enumerate(API_IP_List):
-        try:
-            if api not in triedAPIs:
-                response = requests.get(url=f'{api}/get_queue_length/')
-                API_queue_length_list.append(response.json()['queue_length'])
-                print(f"API {api} queue length: {response.json()['queue_length']}")
 
-                if response.json()['queue_length'] < current_lowest_queue:
-                    current_lowest_queue = response.json()['queue_length']
-                    lowest_index = index
-        except:
-            print(f"API {api} is down")
-            continue
+    print(f"API_IP_List: {API_IP_List}")
+
+    async with httpx.AsyncClient() as client:
+        # Gather all the coroutines into one list
+        coroutines = [get_queue_length(client, api) for api in API_IP_List if api not in triedAPIs]
+        # Run all the coroutines concurrently
+        results = await asyncio.gather(*coroutines)
     
-    return API_IP_List[lowest_index]
+    # Find the API with the lowest queue length
+    queue_lengths, apis = zip(*results)
+    min_queue_length, min_api = min(zip(queue_lengths, apis))
+    return min_api
+
+async def get_queue_length(client, api):
+    try:
+        response = await client.get(url=f'{api}/get_queue_length/')
+        return response.json()['queue_length'], api
+    except:
+        print(f"API {api} is down")
+        return float('inf'), api  # Return a large value for the queue length if the API is down
 
 def promptFilter(data):
     prompt = data.prompt
