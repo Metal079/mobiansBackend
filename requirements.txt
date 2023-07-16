@@ -9,5 +9,4 @@ debugpy
 redis
 flower
 celery
-gevent
 httpx[http2]
