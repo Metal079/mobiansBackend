@@ -10,6 +10,7 @@ import logging
 import random
 import asyncio
 
+import aiohttp
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,6 +43,16 @@ API_IP_List = os.environ.get('API_IP_List').split(' ')
 
 app = FastAPI()
 
+session = None
+
+@app.on_event("startup")
+async def startup_event():
+    global session
+    session = aiohttp.ClientSession()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await session.close()
 
 # Set up the CORS middleware
 app.add_middleware(
@@ -75,7 +86,7 @@ async def submit_job(job_data: JobData):
     job_data.prompt, job_data.negative_prompt = promptFilter(job_data)
     job_data.negative_prompt = fortify_default_negative(job_data.negative_prompt)
 
-    API_IP = chooseAPI('txt2img')
+    API_IP = await chooseAPI('txt2img')
 
     # Do img2img filtering if it's an img2img request
     if job_data.job_type == 'img2img' or job_data.job_type == 'inpainting':
@@ -191,6 +202,10 @@ class JobRetryInfo(BaseModel):
     job_id: str
     indexes: List[int]
 
+async def call_get_job(job_id: str, API_IP: str):
+    async with session.get(url=f"{API_IP}/get_job/{job_id}") as response:
+        return await response.json()
+
 @app.post("/get_job/")
 async def get_job(job_data: GetJobData):
     MAX_RETRIES = 3
@@ -200,8 +215,8 @@ async def get_job(job_data: GetJobData):
     response = None
     for attempt in range(MAX_RETRIES):
         try:
-            response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
-            response.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xx
+            response = await call_get_job(job_data.job_id, API_IP_List[job_data.API_IP])
+            # response.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xx
             break  # success, no need for more retries
         except Exception as e:
             if attempt == MAX_RETRIES - 1:  # if this was the last attempt
@@ -212,11 +227,12 @@ async def get_job(job_data: GetJobData):
                 sleep_time = MIN_DELAY * (2 ** attempt) + random.uniform(0, 1)
                 sleep_time = min(sleep_time, MAX_DELAY)
 
+                logging.error(e)
                 logging.error(f"Exception occurred when making GET request, JOB: {job_data.job_id}. Retrying in {sleep_time} seconds...")
                 await asyncio.sleep(sleep_time)
 
     try:
-        if response.json()['status'] == 'completed':
+        if response['status'] == 'completed':
             # Fetch images from Redis
             finished_response = {'status': 'completed', 'result': []}
             metadata_json = r.get(f"job:{job_data.job_id}:metadata")
@@ -260,7 +276,7 @@ async def get_job(job_data: GetJobData):
                         logging.error(f"Corrupted image STILL detected for job {job_data.job_id}")
                     attempts += 1
 
-            return JSONResponse(content=finished_response, status_code=response.status_code)
+            return JSONResponse(content=finished_response)
 
     except Exception as e:
         # logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
@@ -269,15 +285,24 @@ async def get_job(job_data: GetJobData):
         # logging.error(f"Exception: {e}")
         logging.error(f"Exception happened on get_job")
 
-    return JSONResponse(content=response.json(), status_code=response.status_code)
+    return JSONResponse(content=response)
+
+async def call_api(api, session):
+    async with session.get(url=f"{api}/get_queue_length/") as response:
+        return await response.text()
 
 # Get the queue length of each API and choose the one with the shortest queue
-def chooseAPI(generateType, triedAPIs=[]):
+async def chooseAPI(generateType, triedAPIs=[]):
     API_queue_length_list = []
     current_lowest_queue = 9999
+
+    # global session
+    # tasks = []
     for index, api in enumerate(API_IP_List):
         try:
             if api not in triedAPIs:
+                # task = asyncio.create_task(call_api(api, session))
+                # tasks.append(task)
                 response = requests.get(url=f'{api}/get_queue_length/')
                 API_queue_length_list.append(response.json()['queue_length'])
                 print(f"API {api} queue length: {response.json()['queue_length']}")
@@ -288,8 +313,29 @@ def chooseAPI(generateType, triedAPIs=[]):
         except:
             print(f"API {api} is down")
             continue
+
+    # thing = await asyncio.gather(*tasks)
     
     return API_IP_List[lowest_index]
+
+# def chooseAPI(generateType, triedAPIs=[]):
+#     API_queue_length_list = []
+#     current_lowest_queue = 9999
+#     for index, api in enumerate(API_IP_List):
+#         try:
+#             if api not in triedAPIs:
+#                 response = requests.get(url=f'{api}/get_queue_length/')
+#                 API_queue_length_list.append(response.json()['queue_length'])
+#                 print(f"API {api} queue length: {response.json()['queue_length']}")
+
+#                 if response.json()['queue_length'] < current_lowest_queue:
+#                     current_lowest_queue = response.json()['queue_length']
+#                     lowest_index = index
+#         except:
+#             print(f"API {api} is down")
+#             continue
+    
+#     return API_IP_List[lowest_index]
 
 def promptFilter(data):
     prompt = data.prompt
@@ -379,7 +425,19 @@ def promptFilter(data):
                     'clothes lift',
                     'stomach',
                     'spreading legs',
-                    'hentai'
+                    'hentai',
+                    'penetrated',
+                    'masturbating',
+                    'masturbate',
+                    'horny',
+                    'orgasm',
+                    'fingering',
+                    'voluptuous',
+                    'sperm',
+                    'handjob',
+                    'gangbang',
+                    'ejaculation',
+                    'uncensored'
                      ]
 
     # If character is in prompt, filter out censored tags from prompt
