@@ -366,7 +366,24 @@ def promptFilter(data):
                     'reverse cowgirl',
                     'feet',
                     'toes',
-                    'footjob'
+                    'footjob',
+                    'vagina',
+                    'clitoris',
+                    'furry with non-furry',
+                    'spread legs',
+                    'navel',
+                    'bimbo',
+                    'fishnet',
+                    'hourglass figure',
+                    'slut',
+                    'interspecies',
+                    'hetero',
+                    'tongue',
+                    'saliva'
+                    'anal',
+                    'penetration',
+                    'anus',
+                    'erection'
                      ]
 
     # If character is in prompt, filter out censored tags from prompt
