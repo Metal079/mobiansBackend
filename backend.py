@@ -215,15 +215,6 @@ async def get_job(job_data: GetJobData):
                 logging.error(f"Exception occurred when making GET request, JOB: {job_data.job_id}. Retrying in {sleep_time} seconds...")
                 await asyncio.sleep(sleep_time)
 
-    if response.status_code != 200:
-        logging.error(f"Got status code error here")
-        # logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
-        # logging.error(f"response: {response.text}")
-        await asyncio.sleep(1)
-
-        # Try it one more time
-        response = requests.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
-
     try:
         if response.json()['status'] == 'completed':
             # Fetch images from Redis
@@ -374,14 +365,28 @@ def promptFilter(data):
                     'butt',
                     'thighhighs',
                     'lube',
-                    'lingerie'
+                    'lingerie',
+                    'bent over',
+                    'doggystyle',
+                    'sexy',
+                    'Areolae',
+                    'exhibitionism',
+                    'bottomless',
+                    'shirt lift',
+                    'no bra',
+                    'curvy',
+                    'groin',
+                    'clothes lift',
+                    'stomach',
+                    'spreading legs',
+                    'hentai'
                      ]
 
     # If character is in prompt, filter out censored tags from prompt
     if any(character in prompt.lower() for character in character_list):
         for tag in censored_tags:
             prompt = prompt.replace(tag, '')
-        negative_prompt = "nipples, sexy, breasts, " + negative_prompt
+        negative_prompt = "nipples, sexy, breasts, nude, " + negative_prompt
         logging.error(prompt)
             
     return prompt, negative_prompt
@@ -420,8 +425,6 @@ def add_watermark(image):
     # Overlay watermark on the original image
     image_with_watermark = Image.alpha_composite(image.convert("RGBA"), watermark)
     return image_with_watermark
-
-
 
 def add_image_metadata(image, request_data):
     img_io = io.BytesIO()
