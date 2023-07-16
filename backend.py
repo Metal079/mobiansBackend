@@ -164,17 +164,17 @@ async def submit_job(job_data: JobData):
     # Try using the requested API, if it fails, use the other one
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(url=f'{API_IP}/submit_job/', json=job_data.dict())
+            response = await client.post(url=f'{API_IP}/submit_job/', json=job_data.dict(), timeout=5)
         except:
             API_IP = chooseAPI('txt2img', [API_IP])
-            response = await client.post(url=f'{API_IP}/submit_job/', json=job_data.dict())
+            response = await client.post(url=f'{API_IP}/submit_job/', json=job_data.dict(), timeout=15)
 
         attempts = 0
         while response.status_code != 200 and attempts < 3:
             API_IP = chooseAPI('txt2img', [API_IP])
             print(f"got error: {response.status_code} for submit_job, api: {API_IP}")
             attempts += 1
-            response = await client.post(url=f'{API_IP}/submit_job/', json=job_data.dict())
+            response = await client.post(url=f'{API_IP}/submit_job/', json=job_data.dict(), timeout=15)
             await asyncio.sleep(1)
 
     returned_data = response.json()
@@ -203,7 +203,7 @@ async def get_job(job_data: GetJobData):
     async with httpx.AsyncClient() as client:
         for attempt in range(MAX_RETRIES):
             try:
-                response = await client.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}")
+                response = await client.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", timeout=15)
                 response.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xx
                 break  # success, no need for more retries
             except Exception as e:
@@ -226,7 +226,7 @@ async def get_job(job_data: GetJobData):
             await asyncio.sleep(1)
 
             # Try it one more time
-            response = await client.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", json=job_data.dict())
+            response = await client.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", timeout=15)
 
 
         try:
@@ -251,7 +251,7 @@ async def get_job(job_data: GetJobData):
                 if corrupted_indexes:
                     logging.info(f"Corrupted images detected for job {job_data.job_id}, resending corrupted images")
                     retry_info = JobRetryInfo(job_id=job_data.job_id, indexes=corrupted_indexes)
-                    await client.get(url=f"{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}", json=retry_info.dict())
+                    await client.get(url=f"{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}", timeout=15)
 
                 # Second pass: Fetch images, re-attempting if necessary
                 for i in range(4):
@@ -305,10 +305,11 @@ async def chooseAPI(generateType, triedAPIs=[]):
 
 async def get_queue_length(client, api):
     try:
-        response = await client.get(url=f'{api}/get_queue_length/')
+        response = await client.get(url=f'{api}/get_queue_length/', timeout=15)
         return response.json()['queue_length'], api
-    except:
-        print(f"API {api} is down")
+    except Exception as e:
+        logging.error(e)
+        logging.info(f"API {api} is down")
         return float('inf'), api  # Return a large value for the queue length if the API is down
 
 def promptFilter(data):
