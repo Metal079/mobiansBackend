@@ -352,7 +352,13 @@ def promptFilter(data):
                     'penis',
                     'blowjob',
                     'ahegao',
-                    'nude'
+                    'nude',
+                    'hips',
+                    'areola',
+                    'pantyhose',
+                    'creampie',
+                    'position',
+                    'wet'
                      ]
 
     # If character is in prompt, filter out censored tags from prompt
