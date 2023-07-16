@@ -171,7 +171,7 @@ async def submit_job(job_data: JobData):
 
         attempts = 0
         while response.status_code != 200 and attempts < 3:
-            API_IP = chooseAPI('txt2img', [API_IP])
+            API_IP = await chooseAPI('txt2img', [API_IP])
             print(f"got error: {response.status_code} for submit_job, api: {API_IP}")
             attempts += 1
             response = await client.post(url=f'{API_IP}/submit_job/', json=job_data.dict(), timeout=15)
@@ -358,14 +358,22 @@ def promptFilter(data):
                     'pantyhose',
                     'creampie',
                     'position',
-                    'wet'
+                    'wet',
+                    'autocunnilingus',
+                    'squirting',
+                    'straddling',
+                    'girl on top',
+                    'reverse cowgirl',
+                    'feet',
+                    'toes',
+                    'footjob'
                      ]
 
     # If character is in prompt, filter out censored tags from prompt
     if any(character in prompt.lower() for character in character_list):
         for tag in censored_tags:
             prompt = prompt.replace(tag, '')
-        negative_prompt = "nipples, sexy, breasts, " + negative_prompt
+        negative_prompt = "nipples, sexy, breasts, nude" + negative_prompt
         logging.error(prompt)
             
     return prompt, negative_prompt
