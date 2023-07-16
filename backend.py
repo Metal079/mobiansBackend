@@ -166,7 +166,7 @@ async def submit_job(job_data: JobData):
         try:
             response = await client.post(url=f'{API_IP}/submit_job/', json=job_data.dict(), timeout=5)
         except:
-            API_IP = chooseAPI('txt2img', [API_IP])
+            API_IP = await chooseAPI('txt2img', [API_IP])
             response = await client.post(url=f'{API_IP}/submit_job/', json=job_data.dict(), timeout=15)
 
         attempts = 0
@@ -203,7 +203,9 @@ async def get_job(job_data: GetJobData):
     async with httpx.AsyncClient() as client:
         for attempt in range(MAX_RETRIES):
             try:
-                response = await client.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", timeout=15)
+                if job_data.API_IP == 1:
+                    logging.info(f"GET request to {API_IP_List[job_data.API_IP]} for JOB: {job_data.job_id}")
+                response = await client.get(url=f"{API_IP_List[job_data.API_IP]}/get_job/{job_data.job_id}", timeout=5)
                 response.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xx
                 break  # success, no need for more retries
             except Exception as e:
@@ -305,7 +307,7 @@ async def chooseAPI(generateType, triedAPIs=[]):
 
 async def get_queue_length(client, api):
     try:
-        response = await client.get(url=f'{api}/get_queue_length/', timeout=15)
+        response = await client.get(url=f'{api}/get_queue_length/')
         return response.json()['queue_length'], api
     except Exception as e:
         logging.error(e)
@@ -358,6 +360,7 @@ def promptFilter(data):
         for tag in censored_tags:
             prompt = prompt.replace(tag, '')
         negative_prompt = "nipples, sexy, breasts, " + negative_prompt
+        logging.error(prompt)
             
     return prompt, negative_prompt
 
