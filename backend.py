@@ -281,7 +281,7 @@ async def get_job(job_data: GetJobData):
     except Exception as e:
         # logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
         # logging.error(f"response: {response.text}")
-        # logging.error(f"response.json(): {response.json()}")
+        logging.error(f"response: {response}")
         logging.error(f"Exception: {e}")
         logging.error(f"Exception happened on get_job")
 
@@ -496,6 +496,7 @@ def add_image_metadata(image, request_data):
         # if job_type != "txt2img":
         #     metadata.add_text("NOTE", "The image was not generated purely using txt2img, using the info below may not give you the same results.")
         metadata.add_text("prompt", request_data.prompt)
+        request_data.negative_prompt = request_data.negative_prompt.replace("admin", "")
         metadata.add_text("negative_prompt", request_data.negative_prompt)
         metadata.add_text("seed", str(request_data.seed))
         metadata.add_text("cfg", str(request_data.guidance_scale))
