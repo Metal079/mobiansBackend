@@ -282,7 +282,7 @@ async def get_job(job_data: GetJobData):
         # logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
         # logging.error(f"response: {response.text}")
         # logging.error(f"response.json(): {response.json()}")
-        # logging.error(f"Exception: {e}")
+        logging.error(f"Exception: {e}")
         logging.error(f"Exception happened on get_job")
 
     return JSONResponse(content=response)
@@ -303,7 +303,7 @@ async def chooseAPI(generateType, triedAPIs=[]):
             if api not in triedAPIs:
                 # task = asyncio.create_task(call_api(api, session))
                 # tasks.append(task)
-                response = requests.get(url=f'{api}/get_queue_length/')
+                response = requests.get(url=f'{api}/get_queue_length/', timeout=10)
                 API_queue_length_list.append(response.json()['queue_length'])
                 print(f"API {api} queue length: {response.json()['queue_length']}")
 
