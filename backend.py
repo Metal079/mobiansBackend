@@ -303,7 +303,7 @@ async def chooseAPI(generateType, triedAPIs=[]):
             if api not in triedAPIs:
                 # task = asyncio.create_task(call_api(api, session))
                 # tasks.append(task)
-                response = requests.get(url=f'{api}/get_queue_length/', timeout=10)
+                response = requests.get(url=f'{api}/get_queue_length/', timeout=5)
                 API_queue_length_list.append(response.json()['queue_length'])
                 print(f"API {api} queue length: {response.json()['queue_length']}")
 
