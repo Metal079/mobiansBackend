@@ -288,33 +288,39 @@ async def get_job(job_data: GetJobData):
     return JSONResponse(content=response)
 
 async def call_api(api, session):
-    async with session.get(url=f"{api}/get_queue_length/") as response:
-        return await response.text()
+    try:
+        async with session.get(url=f"{api}/get_queue_length/", timeout=5) as response:
+            return await response.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        print(f"API {api} is down. Error: {str(e)}")
+        return {'queue_length': 9999, 'api': api}
 
 # Get the queue length of each API and choose the one with the shortest queue
 async def chooseAPI(generateType, triedAPIs=[]):
     API_queue_length_list = []
     current_lowest_queue = 9999
 
-    # global session
-    # tasks = []
-    for index, api in enumerate(API_IP_List):
-        try:
-            if api not in triedAPIs:
-                # task = asyncio.create_task(call_api(api, session))
-                # tasks.append(task)
-                response = requests.get(url=f'{api}/get_queue_length/', timeout=5)
-                API_queue_length_list.append(response.json()['queue_length'])
-                print(f"API {api} queue length: {response.json()['queue_length']}")
+    global session
+    tasks = []
+    for api in API_IP_List:
+        if api not in triedAPIs:
+            task = asyncio.create_task(call_api(api, session))
+            tasks.append((api, task))
 
-                if response.json()['queue_length'] < current_lowest_queue:
-                    current_lowest_queue = response.json()['queue_length']
-                    lowest_index = index
-        except:
-            print(f"API {api} is down")
+    results = await asyncio.gather(*[task for api, task in tasks], return_exceptions=True)
+
+    for api, result in zip([api for api, task in tasks], results):
+        if isinstance(result, Exception):
+            print(f"API {api} is down. Error: {str(result)}")
             continue
 
-    # thing = await asyncio.gather(*tasks)
+        queue_length = result['queue_length']
+        API_queue_length_list.append(queue_length)
+        print(f"API {api} queue length: {queue_length}")
+
+        if queue_length < current_lowest_queue:
+            current_lowest_queue = queue_length
+            lowest_index = API_IP_List.index(api)
     
     return API_IP_List[lowest_index]
 
@@ -437,13 +443,18 @@ def promptFilter(data):
                     'handjob',
                     'gangbang',
                     'ejaculation',
-                    'uncensored'
+                    'uncensored',
+                    'Lifting Skirt',
+                    'mooning',
+                    'hindquarters',
+                    'presenting',
+                    'porn'
                      ]
 
     # If character is in prompt, filter out censored tags from prompt
     if any(character in prompt.lower() for character in character_list):
         for tag in censored_tags:
-            prompt = prompt.replace(tag, '')
+            prompt = prompt.lower().replace(tag.lower(), '')
         negative_prompt = "nipples, sexy, breasts, nude, " + negative_prompt
         logging.error(prompt)
             
