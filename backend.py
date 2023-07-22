@@ -79,6 +79,7 @@ class JobData(BaseModel):
     strength: Optional[float] = None
     job_type: str
     model: Optional[str] = None
+    fast_pass_code: Optional[str] = None
 
 @app.post("/submit_job/")
 async def submit_job(job_data: JobData):
@@ -370,7 +371,7 @@ def promptFilter(data):
                      'sex',
                      'busty',
                      'tits',
-                     'thighs',
+                     'thigh',
                      'thick',
                      'underwear',
                      'panties',
@@ -448,7 +449,15 @@ def promptFilter(data):
                     'mooning',
                     'hindquarters',
                     'presenting',
-                    'porn'
+                    'porn',
+                    'latex',
+                    'fellatio',
+                    'oral',
+                    'open legs',
+                    'spread wide',
+                    'fucked',
+                    'fucking',
+                    'g-string'
                      ]
 
     # If character is in prompt, filter out censored tags from prompt
