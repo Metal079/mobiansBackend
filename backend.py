@@ -9,9 +9,10 @@ import hashlib
 import logging
 import random
 import asyncio
+from datetime import datetime
 
 import aiohttp
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
@@ -29,14 +30,24 @@ from redis.exceptions import (
    ConnectionError,
    TimeoutError
 )
+import aioodbc
 
 logging.basicConfig(level=logging.INFO)  # Configure logging
 
-# r = redis.Redis(host='7.tcp.ngrok.io', port=21658, db=0)
 # Run 3 retries with exponential backoff strategy
 retry = Retry(ExponentialBackoff(), 3)
-r = redis.Redis(host='76.157.184.213', port=6379, db=0, retry=retry, retry_on_error=[BusyLoadingError, ConnectionError, TimeoutError])
 load_dotenv()
+REDISHOST = os.environ.get('REDISHOST')
+r = redis.Redis(host=REDISHOST, port=6379, db=0, retry=retry, retry_on_error=[BusyLoadingError, ConnectionError, TimeoutError])
+
+DBHOST = os.environ.get('DBHOST')
+DBNAME = os.environ.get('DBNAME')
+DBUSER = os.environ.get('DBUSER')
+DBPASS = os.environ.get('DBPASS')
+driver= '{ODBC Driver 17 for SQL Server}'
+# cnxn = pyodbc.connect('DRIVER='+driver+';SERVER='+server+';PORT=1433;DATABASE='+database+';UID='+username+';PWD='+ password)
+dsn = f'DRIVER={driver};SERVER={DBHOST};DATABASE={DBNAME};UID={DBUSER};PWD={DBPASS}'
+
 
 
 API_IP_List = os.environ.get('API_IP_List').split(' ')
@@ -81,8 +92,20 @@ class JobData(BaseModel):
     model: Optional[str] = None
     fast_pass_code: Optional[str] = None
 
+class ImageRequestModel(JobData):
+    fast_pass_enabled: Optional[bool] = False
+
 @app.post("/submit_job/")
 async def submit_job(job_data: JobData):
+    # Check if FastPassCode is valid and non-expired
+    fast_pass_enabled = False
+    if job_data.fast_pass_code:
+        is_valid = await validate_fastpass(job_data.fast_pass_code)
+        if is_valid:
+            fast_pass_enabled = True
+        else:
+            raise HTTPException(status_code=400, detail="Invalid or expired FastPassCode. Please fix/remove the FastPassCode and try again.")
+
     # Filter out prompts 
     job_data.prompt, job_data.negative_prompt = promptFilter(job_data)
     job_data.negative_prompt = fortify_default_negative(job_data.negative_prompt)
@@ -172,19 +195,23 @@ async def submit_job(job_data: JobData):
         encoded_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
         job_data.mask_image = encoded_image
 
+
+    # Create an instance of ImageRequestModel
+    image_request_data = ImageRequestModel(**job_data.dict(), fast_pass_enabled=fast_pass_enabled)
+
     # Try using the requested API, if it fails, use the other one
     try:
-        response = requests.post(url=f'{API_IP}/submit_job/', json=job_data.dict())
+        response = requests.post(url=f'{API_IP}/submit_job/', json=image_request_data.dict())
     except:
         API_IP = chooseAPI('txt2img', [API_IP])
-        response = requests.post(url=f'{API_IP}/submit_job/', json=job_data.dict())
+        response = requests.post(url=f'{API_IP}/submit_job/', json=image_request_data.dict())
 
     attempts = 0
     while response.status_code != 200 and attempts < 3:
         API_IP = chooseAPI('txt2img', [API_IP])
         print(f"got error: {response.status_code} for submit_job, api: {API_IP}")
         attempts += 1
-        response = requests.post(url=f'{API_IP}/submit_job/', json=job_data.dict())
+        response = requests.post(url=f'{API_IP}/submit_job/', json=image_request_data.dict())
         time.sleep(1)
 
     returned_data = response.json()
@@ -194,6 +221,29 @@ async def submit_job(job_data: JobData):
             returned_data['API_IP'] = i
 
     return JSONResponse(content=returned_data)
+
+async def validate_fastpass(fast_pass_code: str) -> bool:
+    async with aioodbc.connect(dsn=dsn) as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute("""
+                SELECT ExpirationDate
+                FROM FastPass
+                WHERE FastPassCode = ?
+            """, fast_pass_code)
+
+            row = await cursor.fetchone()
+            if not row:
+                return False
+
+            expiration_date = row[0]
+            if expiration_date is None:
+                return True
+            elif expiration_date < datetime.now():
+                return False
+
+    return True
+
+
 
 class GetJobData(BaseModel):
     job_id: str
@@ -324,25 +374,6 @@ async def chooseAPI(generateType, triedAPIs=[]):
             lowest_index = API_IP_List.index(api)
     
     return API_IP_List[lowest_index]
-
-# def chooseAPI(generateType, triedAPIs=[]):
-#     API_queue_length_list = []
-#     current_lowest_queue = 9999
-#     for index, api in enumerate(API_IP_List):
-#         try:
-#             if api not in triedAPIs:
-#                 response = requests.get(url=f'{api}/get_queue_length/')
-#                 API_queue_length_list.append(response.json()['queue_length'])
-#                 print(f"API {api} queue length: {response.json()['queue_length']}")
-
-#                 if response.json()['queue_length'] < current_lowest_queue:
-#                     current_lowest_queue = response.json()['queue_length']
-#                     lowest_index = index
-#         except:
-#             print(f"API {api} is down")
-#             continue
-    
-#     return API_IP_List[lowest_index]
 
 def promptFilter(data):
     prompt = data.prompt

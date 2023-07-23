@@ -11,3 +11,4 @@ flower
 celery
 httpx[http2]
 aiohttp[speedups]
+aioodbc
