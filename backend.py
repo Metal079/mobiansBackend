@@ -10,6 +10,9 @@ import logging
 import random
 import asyncio
 from datetime import datetime
+from io import BytesIO
+import uuid
+
 
 import aiohttp
 from fastapi import FastAPI, HTTPException
@@ -31,6 +34,8 @@ from redis.exceptions import (
    TimeoutError
 )
 import aioodbc
+from azure.storage.blob.aio import BlobServiceClient
+from azure.core.exceptions import ResourceExistsError
 
 logging.basicConfig(level=logging.INFO)  # Configure logging
 
@@ -59,7 +64,9 @@ session = None
 @app.on_event("startup")
 async def startup_event():
     global session
+    global blob_service_client
     session = aiohttp.ClientSession()
+    blob_service_client = BlobServiceClient.from_connection_string(os.getenv("AZURE_STORAGE_CONNECTION_STRING"))
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -74,9 +81,19 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
 )
 
+class ImageData(BaseModel):
+    url: Optional[str] = None
+    width: Optional[int]
+    height: Optional[int]
+    aspectRatio: Optional[str]
+    base64: str
+    UUID: Optional[str]
+    rated: Optional[bool]
+
 class JobData(BaseModel):
     prompt: str
     image: Optional[str] = None
+    image_UUID: Optional[str] = None
     mask_image: Optional[str] = None
     control_image: Optional[str] = None
     scheduler: int
@@ -91,8 +108,10 @@ class JobData(BaseModel):
     job_type: str
     model: Optional[str] = None
     fast_pass_code: Optional[str] = None
+    rating: Optional[bool] = None
 
 class ImageRequestModel(JobData):
+    image: Optional[str] = None
     fast_pass_enabled: Optional[bool] = False
 
 @app.post("/submit_job/")
@@ -133,6 +152,7 @@ async def submit_job(job_data: JobData):
             job_data.image = encoded_image
 
         # Resize image if needed
+        # NOTE THE IMAGE PROPERTY IS A BASE64 STRING EVEN THOUGH IT PROBABLY SHOULD BE AN IMAGE OBJECT
         try:
             init_image = Image.open(io.BytesIO(base64.b64decode(job_data.image.split(",", 1)[0])))
         except:
@@ -242,8 +262,6 @@ async def validate_fastpass(fast_pass_code: str) -> bool:
                 return False
 
     return True
-
-
 
 class GetJobData(BaseModel):
     job_id: str
@@ -488,7 +506,9 @@ def promptFilter(data):
                     'spread wide',
                     'fucked',
                     'fucking',
-                    'g-string'
+                    'g-string',
+                    'seductive gaze',
+                    'dress lift'
                      ]
 
     # If character is in prompt, filter out censored tags from prompt
@@ -544,13 +564,15 @@ def add_image_metadata(image, request_data):
     metadata = PngImagePlugin.PngInfo()
     try:
         # Add disclamer to metadata if job is not txt2img
-        # if job_type != "txt2img":
-        #     metadata.add_text("NOTE", "The image was not generated purely using txt2img, using the info below may not give you the same results.")
+        if request_data.job_type != "txt2img":
+            metadata.add_text("NOTE", "The image was not generated purely using txt2img, using the info below may not give you the same results.")
+
         metadata.add_text("prompt", request_data.prompt)
         request_data.negative_prompt = request_data.negative_prompt.replace("admin", "")
         metadata.add_text("negative_prompt", request_data.negative_prompt)
         metadata.add_text("seed", str(request_data.seed))
         metadata.add_text("cfg", str(request_data.guidance_scale))
+        metadata.add_text("job_type", request_data.job_type)    
     except:
         # log to text file
         logging.error(f"Error adding metadata to image")
@@ -564,3 +586,77 @@ def add_image_metadata(image, request_data):
     img_io.seek(0)
     base64_image = base64.b64encode(img_io.getvalue()).decode('utf-8')
     return base64_image
+
+async def upload_blob(blob_service_client, container_name, blob_name, data):
+    blob_client = blob_service_client.get_blob_client(container_name, blob_name)
+
+    # Check if the blob exists
+    if await blob_client.exists():
+        try:
+            # Delete the existing blob
+            await blob_client.delete_blob()
+        except Exception as e:
+            print(f"An error occurred while deleting blob {blob_name}: {e}")
+    else:
+        try:
+            # Upload the new blob
+            await blob_client.upload_blob(data)
+            return blob_client.url
+        except Exception as e:
+            print(f"An error occurred while uploading blob {blob_name}: {e}")
+
+async def delete_and_insert_image_metadata(image_details, blob_url, dsn, rating, uuid):
+    async with aioodbc.connect(dsn=dsn) as conn:
+        async with conn.cursor() as cursor:
+            # Check if the UUID already exists
+            check_query = "SELECT * FROM UserRatings WHERE FileName = ?"
+            await cursor.execute(check_query, (uuid,))
+            existing_record = await cursor.fetchone()
+
+            if existing_record:
+                # If the UUID exists, delete the existing record
+                delete_query = "DELETE FROM UserRatings WHERE FileName = ?"
+                await cursor.execute(delete_query, (uuid,))
+                return "deleted"
+
+            else:
+                # Insert a new record
+                insert_query = """
+                    INSERT INTO UserRatings (Prompt, NegativePrompt, Seed, CFG, FileName, RateDate, UserRating, JobType, AzureBlobURL)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
+                file_name = uuid
+                rate_date = datetime.now()
+                await cursor.execute(insert_query, (image_details['prompt'], image_details['negative_prompt'], image_details['seed'], image_details['cfg'], file_name, rate_date, rating, image_details['job_type'], blob_url))
+
+                await conn.commit()
+                return "inserted"
+
+@app.post("/rate_image/")
+async def rate_image(job_data: JobData):
+    # Decode base64 image and convert it to bytes
+    try:
+        image_bytes = base64.b64decode(job_data.image.split(",", 1)[0])
+    except:
+        image_bytes = base64.b64decode(job_data.image.split(",", 1)[1])
+
+    image = Image.open(BytesIO(image_bytes))
+
+    info = image.info
+
+    # Get image metadata
+    image_details = {}
+    for key, value in info.items():
+        image_details[key] = value
+
+    # Generate a random filename
+    image_name = job_data.image_UUID
+
+    # Upload to Azure Blob Storage
+    container_name = "mobiansratings"
+    blob_url = await upload_blob(blob_service_client, container_name, image_name, image_bytes)
+
+    # Insert image metadata into database
+    db_status = await delete_and_insert_image_metadata(image_details, blob_url, dsn, rating=job_data.rating, uuid=image_name)
+
+    return JSONResponse({"message": f"{db_status}"})
