@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 from dotenv import load_dotenv
 import redis
+from redis.asyncio import Redis
 from redis.backoff import ExponentialBackoff
 from redis.retry import Retry
 from redis.exceptions import (
@@ -43,7 +44,6 @@ logging.basicConfig(level=logging.INFO)  # Configure logging
 retry = Retry(ExponentialBackoff(), 3)
 load_dotenv()
 REDISHOST = os.environ.get('REDISHOST')
-r = redis.Redis(host=REDISHOST, port=6379, db=0, retry=retry, retry_on_error=[BusyLoadingError, ConnectionError, TimeoutError])
 
 DBHOST = os.environ.get('DBHOST')
 DBNAME = os.environ.get('DBNAME')
@@ -52,8 +52,6 @@ DBPASS = os.environ.get('DBPASS')
 driver= '{ODBC Driver 17 for SQL Server}'
 # cnxn = pyodbc.connect('DRIVER='+driver+';SERVER='+server+';PORT=1433;DATABASE='+database+';UID='+username+';PWD='+ password)
 dsn = f'DRIVER={driver};SERVER={DBHOST};DATABASE={DBNAME};UID={DBUSER};PWD={DBPASS}'
-
-
 
 API_IP_List = os.environ.get('API_IP_List').split(' ')
 
@@ -65,8 +63,11 @@ session = None
 async def startup_event():
     global session
     global blob_service_client
+    global r
+
     session = aiohttp.ClientSession()
     blob_service_client = BlobServiceClient.from_connection_string(os.getenv("AZURE_STORAGE_CONNECTION_STRING"))
+    r = Redis(host=REDISHOST, port=6379, db=0, retry=retry, retry_on_error=[BusyLoadingError, ConnectionError, TimeoutError]) #, decode_responses=True
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -302,50 +303,73 @@ async def get_job(job_data: GetJobData):
 
     try:
         if response['status'] == 'completed':
-            # Fetch images from Redis
-            finished_response = {'status': 'completed', 'result': []}
-            metadata_json = r.get(f"job:{job_data.job_id}:metadata")
-            metadata = JobData.parse_raw(metadata_json)
+            async with r.pipeline() as pipe:
+                # Fetch images from Redis
+                finished_response = {'status': 'completed', 'result': []}
+                metadata_json = await r.get(f"job:{job_data.job_id}:metadata") # Changed to async
+                metadata = JobData.parse_raw(metadata_json)
 
-            # First pass: Identify corrupted images
-            corrupted_indexes = []
-            for i in range(4):
-                key = f"job:{job_data.job_id}:image:{i}"
-                image_bytes = r.get(key)
-                fetched_checksum = r.get(f"job:{job_data.job_id}:image:{i}:checksum")
-                if image_bytes is not None and fetched_checksum is not None:
-                    computed_checksum = hashlib.sha256(image_bytes).hexdigest()
-                    if fetched_checksum.decode() != computed_checksum:
-                        corrupted_indexes.append(i)
+                # First pass: Identify corrupted images
+                image_keys = [f"job:{job_data.job_id}:image:{i}" for i in range(4)]
+                checksum_keys = [f"job:{job_data.job_id}:image:{i}:checksum" for i in range(4)]
 
-            # If there are corrupted images, resend them
-            if corrupted_indexes:
-                logging.info(f"Corrupted images detected for job {job_data.job_id}, resending corrupted images")
-                retry_info = JobRetryInfo(job_id=job_data.job_id, indexes=corrupted_indexes)
-                requests.get(url=f"{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}", json=retry_info.dict())
+                # Fetch images and checksums
+                for i in range(4):
+                    pipe.get(image_keys[i])
+                    pipe.get(checksum_keys[i])
+                results = await pipe.execute()
 
-            # Second pass: Fetch images, re-attempting if necessary
-            for i in range(4):
-                key = f"job:{job_data.job_id}:image:{i}"
-                attempts = 0
-                while attempts < 2:
-                    image_bytes = r.get(key)
-                    fetched_checksum = r.get(f"job:{job_data.job_id}:image:{i}:checksum")
+                # Check for corrupted images
+                corrupted_indexes = []
+                for i in range(4):
+                    image_bytes = results[2*i]
+                    fetched_checksum = results[2*i + 1]
+                    
                     if image_bytes is not None and fetched_checksum is not None:
                         computed_checksum = hashlib.sha256(image_bytes).hexdigest()
-                        if fetched_checksum.decode() == computed_checksum:
-                            image = Image.open(io.BytesIO(image_bytes))
+                        if fetched_checksum.decode() != computed_checksum:
+                            corrupted_indexes.append(i)
 
-                            # Add watermark and metadata
-                            watermarked_image = add_watermark(image.convert("RGB"))
-                            watermarked_image_base64 = add_image_metadata(watermarked_image, metadata)
-                            finished_response['result'].append(watermarked_image_base64)
-                            break  # valid image, no need for further attempts
+                # If there are corrupted images, resend them
+                if corrupted_indexes:
+                    logging.info(f"Corrupted images detected for job {job_data.job_id}, resending corrupted images")
+                    retry_info = JobRetryInfo(job_id=job_data.job_id, indexes=corrupted_indexes)
+                    requests.get(url=f"{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}", json=retry_info.dict())
+
+                # Second pass: Fetch images, re-attempting if necessary
+                attempts = 0
+                while attempts < 2:
+                    # Fetch images and checksums if corrupted images were detected
+                    if corrupted_indexes:
+                        for i in range(4):
+                            pipe.get(image_keys[i])
+                            pipe.get(checksum_keys[i])
+                        results = await pipe.execute()
+
+                    # Watermark images or error if corrupted images are still detected
+                    for i in range(4):
+                        image_bytes = results[2*i]
+                        fetched_checksum = results[2*i + 1]
+                        
+                        if image_bytes is not None and fetched_checksum is not None:
+                            computed_checksum = hashlib.sha256(image_bytes).hexdigest()
+                            if fetched_checksum.decode() == computed_checksum:
+                                image = Image.open(io.BytesIO(image_bytes))
+
+                                # Add watermark and metadata
+                                watermarked_image = add_watermark(image.convert("RGB"))
+                                watermarked_image_base64 = add_image_metadata(watermarked_image, metadata)
+                                finished_response['result'].append(watermarked_image_base64)
+                        else:
+                            logging.error(f"Corrupted image STILL detected for job {job_data.job_id}")
+                    
+                    if len(finished_response['result']) == 4:
+                        break
                     else:
-                        logging.error(f"Corrupted image STILL detected for job {job_data.job_id}")
-                    attempts += 1
+                        attempts += 1
 
-            return JSONResponse(content=finished_response)
+                return JSONResponse(content=finished_response)
+
 
     except Exception as e:
         # logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")

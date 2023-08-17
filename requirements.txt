@@ -6,7 +6,7 @@ pillow
 python-dotenv
 gunicorn
 debugpy
-redis
+redis[hiredis]
 flower
 celery
 httpx[http2]
