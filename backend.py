@@ -550,14 +550,19 @@ def promptFilter(data):
                     'micro bikini',
                     'thong',
                     'gstring',
-                    'mating'
+                    'mating',
+                    'fuck',
+                    'tentacle',
+                    'moan',
+                    'facial',
+                    'swimsuit to the side'
                      ]
 
     # If character is in prompt, filter out censored tags from prompt
     if any(character in prompt.lower() for character in character_list):
         for tag in censored_tags:
             prompt = prompt.lower().replace(tag.lower(), '')
-        negative_prompt = "nipples, sexy, breasts, nude, " + negative_prompt
+        negative_prompt = "navel, 3d, blush, sweat, swimsuit, bikini, nipples, sexy, breasts, nude, " + negative_prompt
         logging.error(prompt)
             
     return prompt, negative_prompt
@@ -717,9 +722,20 @@ async def subscribe(subscription: Subscription):
 async def send_notification():
     for subscription in subscriptions:
         try:
+            payload = {
+                "notification": {
+                    "title": "Your image is ready!",
+                    "body": "Click to view your image.",
+                    "icon": "icon.png",
+                    "vibrate": [100, 50, 100],
+                    "data": {
+                        "url": "https://mobians.ai/"
+                    }
+                }
+            }
             webpush(
                 subscription_info=subscription,
-                data=json.dumps({"message": "Your image is ready!"}),
+                data=json.dumps(payload),
                 vapid_private_key=VAPID_PRIVATE_KEY,
                 vapid_claims={
                     "sub": "mailto:your_email@example.com"
