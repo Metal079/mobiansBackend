@@ -12,10 +12,10 @@ import asyncio
 from datetime import datetime
 from io import BytesIO
 import uuid
-
+import json
 
 import aiohttp
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
@@ -37,6 +37,7 @@ from redis.exceptions import (
 import aioodbc
 from azure.storage.blob.aio import BlobServiceClient
 from azure.core.exceptions import ResourceExistsError
+from pywebpush import webpush, WebPushException
 
 logging.basicConfig(level=logging.INFO)  # Configure logging
 
@@ -54,6 +55,11 @@ driver= '{ODBC Driver 17 for SQL Server}'
 dsn = f'DRIVER={driver};SERVER={DBHOST};DATABASE={DBNAME};UID={DBUSER};PWD={DBPASS}'
 
 API_IP_List = os.environ.get('API_IP_List').split(' ')
+
+VAPID_PUBLIC_KEY = os.environ.get('VAPID_PUBLIC_KEY')
+VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY')
+VAPID_CLAIMS = os.environ.get('VAPID_CLAIMS')
+subscriptions = []  # Store your subscription objects here
 
 app = FastAPI()
 
@@ -532,7 +538,19 @@ def promptFilter(data):
                     'fucking',
                     'g-string',
                     'seductive gaze',
-                    'dress lift'
+                    'dress lift',
+                    'cleavage',
+                    'provocative',
+                    'venus body',
+                    'revealing clothes',
+                    'oppai',
+                    'milf',
+                    'wardrobe malfunction',
+                    'clothing aside',
+                    'micro bikini',
+                    'thong',
+                    'gstring',
+                    'mating'
                      ]
 
     # If character is in prompt, filter out censored tags from prompt
@@ -684,3 +702,32 @@ async def rate_image(job_data: JobData):
     db_status = await delete_and_insert_image_metadata(image_details, blob_url, dsn, rating=job_data.rating, uuid=image_name)
 
     return JSONResponse({"message": f"{db_status}"})
+
+class Subscription(BaseModel):
+    endpoint: str
+    expirationTime: Optional[str]
+    keys: dict
+
+@app.post("/subscribe")
+async def subscribe(subscription: Subscription):
+    subscriptions.append(subscription.dict())
+    return {"status": "subscribed"}
+
+@app.get("/send_notification")
+async def send_notification():
+    for subscription in subscriptions:
+        try:
+            webpush(
+                subscription_info=subscription,
+                data=json.dumps({"message": "Your image is ready!"}),
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={
+                    "sub": "mailto:your_email@example.com"
+                }
+            )
+        except WebPushException as e:
+            print("Failed to send notification:", repr(e))
+            return {"status": "failed", "detail": repr(e)}
+
+    return {"status": "sent"}
+

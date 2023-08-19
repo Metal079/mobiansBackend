@@ -13,3 +13,4 @@ httpx[http2]
 aiohttp[speedups]
 aioodbc
 azure-storage-blob
+pywebpush
