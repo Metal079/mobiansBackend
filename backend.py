@@ -3,7 +3,7 @@ import io
 import base64
 import requests
 import time
-from typing import Optional, List
+from typing import Optional, List, Dict
 import time
 import hashlib
 import logging
@@ -59,7 +59,7 @@ API_IP_List = os.environ.get('API_IP_List').split(' ')
 VAPID_PUBLIC_KEY = os.environ.get('VAPID_PUBLIC_KEY')
 VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY')
 VAPID_CLAIMS = os.environ.get('VAPID_CLAIMS')
-subscriptions = []  # Store your subscription objects here
+subscriptions: Dict[str, dict] = {}
 
 app = FastAPI()
 
@@ -555,7 +555,9 @@ def promptFilter(data):
                     'tentacle',
                     'moan',
                     'facial',
-                    'swimsuit to the side'
+                    'swimsuit to the side',
+                    'ripped dress',
+                    'giant chest'
                      ]
 
     # If character is in prompt, filter out censored tags from prompt
@@ -709,41 +711,50 @@ async def rate_image(job_data: JobData):
     return JSONResponse({"message": f"{db_status}"})
 
 class Subscription(BaseModel):
+    userId: str
     endpoint: str
     expirationTime: Optional[str]
     keys: dict
 
 @app.post("/subscribe")
 async def subscribe(subscription: Subscription):
-    subscriptions.append(subscription.dict())
+    user_id = subscription.userId
+    subscriptions[user_id] = subscription.dict()
     return {"status": "subscribed"}
 
-@app.get("/send_notification")
-async def send_notification():
-    for subscription in subscriptions:
-        try:
-            payload = {
-                "notification": {
-                    "title": "Your image is ready!",
-                    "body": "Click to view your image.",
-                    "icon": "icon.png",
-                    "vibrate": [100, 50, 100],
-                    "data": {
-                        "url": "https://mobians.ai/"
-                    }
+
+@app.get("/send_notification/{user_id}")
+async def send_notification(user_id: str):  # Change the type to str
+    # Retrieve the subscription object for the user
+    subscription = subscriptions.get(user_id)
+    if not subscription:
+        return {"status": "failed", "detail": "User not subscribed"}
+
+    try:
+        payload = {
+            "notification": {
+                "title": "Your image is ready!",
+                "body": "Click to view your image.",
+                # "icon": "icon.png",
+                "vibrate": [100, 50, 100],
+                "data": {
+                    "url": "https://mobians.ai/"
                 }
             }
-            webpush(
-                subscription_info=subscription,
-                data=json.dumps(payload),
-                vapid_private_key=VAPID_PRIVATE_KEY,
-                vapid_claims={
-                    "sub": "mailto:your_email@example.com"
-                }
-            )
-        except WebPushException as e:
-            print("Failed to send notification:", repr(e))
-            return {"status": "failed", "detail": repr(e)}
+        }
+        webpush(
+            subscription_info=subscription,
+            data=json.dumps(payload),
+            vapid_private_key=VAPID_PRIVATE_KEY,
+            vapid_claims={
+                "sub": "mailto:your_email@example.com"
+            }
+        )
+    except WebPushException as e:
+        print("Failed to send notification:", repr(e))
+        return {"status": "failed", "detail": repr(e)}
 
     return {"status": "sent"}
+
+
 
