@@ -37,7 +37,7 @@ from azure.core.exceptions import ResourceExistsError
 from pywebpush import webpush, WebPushException
 import numpy as np
 
-logging.basicConfig(level=logging.INFO)  # Configure logging
+logging.basicConfig(level=logging.ERROR)  # Configure logging
 
 # Run 3 retries with exponential backoff strategy
 retry = Retry(ExponentialBackoff(), 3)
