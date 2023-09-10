@@ -675,6 +675,16 @@ def promptFilter(data):
         "black bra",
         "aroused",
         "yuri",
+        "d-cup",
+        "skindentation",
+        "seductive",
+        "booty",
+        "big melons",
+        "testicles",
+        "bodily fluid",
+        "semen",
+        "erect",
+        "twerking"
     ]
 
     # If character is in prompt, filter out censored tags from prompt
@@ -682,7 +692,7 @@ def promptFilter(data):
         for tag in censored_tags:
             prompt = prompt.lower().replace(tag.lower(), "")
         negative_prompt = (
-            "navel, 3d, blush, sweat, swimsuit, bikini, nipples, sexy, breasts, nude, "
+            "(cleavage), navel, 3d, blush, sweat, ((underwear)), (bikini), (nipples), sex, (breasts), nude, "
             + negative_prompt
         )
         logging.error(prompt)
