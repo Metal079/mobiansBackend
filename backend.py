@@ -517,7 +517,7 @@ def promptFilter(data):
 
     censored_tags = [
         "breast",
-        "nipples",
+        "nipple",
         "pussy",
         "nsfw",
         "nudity",
@@ -684,13 +684,34 @@ def promptFilter(data):
         "bodily fluid",
         "semen",
         "erect",
-        "twerking"
+        "twerking",
+        "lactating",
+        "stockings",
+        "cowgirl posicion",
+        "vaginia",
+        "masturbation",
+        "pants pull",
+        "clothes pull",
+        "genital",
+        "ming",
+        "nudly",
+        "breeding",
+        "orgy",
+        "pinned down",
+        "thrusting",
+        "cervical",
+        "ecstasy"
     ]
 
     # If character is in prompt, filter out censored tags from prompt
     if any(character in prompt.lower() for character in character_list):
         for tag in censored_tags:
             prompt = prompt.lower().replace(tag.lower(), "")
+
+        # If prompt is changed remove the prompt "blush" from prompt
+        if prompt != data.prompt.lower():
+            prompt = prompt.replace("blush", "")
+            
         negative_prompt = (
             "(cleavage), navel, 3d, blush, sweat, ((underwear)), (bikini), (nipples), sex, (breasts), nude, "
             + negative_prompt
