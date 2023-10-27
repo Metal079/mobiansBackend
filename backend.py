@@ -36,6 +36,7 @@ from azure.storage.blob.aio import BlobServiceClient
 from azure.core.exceptions import ResourceExistsError
 from pywebpush import webpush, WebPushException
 import numpy as np
+import imagehash
 
 logging.basicConfig(level=logging.ERROR)  # Configure logging
 
@@ -49,7 +50,6 @@ DBNAME = os.environ.get("DBNAME")
 DBUSER = os.environ.get("DBUSER")
 DBPASS = os.environ.get("DBPASS")
 driver = "{ODBC Driver 17 for SQL Server}"
-# cnxn = pyodbc.connect('DRIVER='+driver+';SERVER='+server+';PORT=1433;DATABASE='+database+';UID='+username+';PWD='+ password)
 dsn = f"DRIVER={driver};SERVER={DBHOST};DATABASE={DBNAME};UID={DBUSER};PWD={DBPASS}"
 
 API_IP_List = os.environ.get("API_IP_List").split(" ")
@@ -448,6 +448,37 @@ async def get_job(job_data: GetJobData):
                         break
                     else:
                         attempts += 1
+
+
+                # Generate hashes for each image and store them in DB along with image info
+                image_hashes = []
+                for i in range(4):
+                    image = Image.open(io.BytesIO(results[2 * i]))
+                    image_hash = imagehash.crop_resistant_hash(image)
+                    image_hashes.append(str(image_hash))
+
+                # Store all 4 image hashes in DB along with image info, 1 entry per image
+                try:
+                    async with aioodbc.connect(dsn=dsn) as conn:
+                        async with conn.cursor() as cursor:
+                            for i in range(4):
+                                await cursor.execute(
+                                    """
+                                    INSERT INTO ImageInfo (ImageHash, Prompt, NegativePrompt, Seed, CFG, Model, CreateDate)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                                    """,
+                                    image_hashes[i],
+                                    metadata.prompt,
+                                    metadata.negative_prompt,
+                                    metadata.seed,
+                                    metadata.guidance_scale,
+                                    metadata.model,
+                                    datetime.now(),
+                                )
+                except:
+                    logging.error(
+                        f"Error occurred while inserting image hash info into DB, JOB: {job_data.job_id}"
+                    )
 
                 return JSONResponse(content=finished_response)
 

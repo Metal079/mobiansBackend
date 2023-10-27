@@ -7,8 +7,6 @@ python-dotenv
 gunicorn
 debugpy
 redis[hiredis]
-flower
-celery
 httpx[http2]
 aiohttp[speedups]
 aioodbc
