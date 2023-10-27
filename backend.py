@@ -13,6 +13,7 @@ from datetime import datetime
 from io import BytesIO
 import uuid
 import json
+import traceback
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Request, Body
@@ -475,13 +476,12 @@ async def get_job(job_data: GetJobData):
                                     "Sonic DiffusionV4",
                                     datetime.now(),
                                 )
-                except(e):
+                except Exception as e:
                     logging.error(
                         f"Error occurred while inserting image hash info into DB, JOB: {job_data.job_id}"
                     )
-                    logging.error(
-                        f"{e}"
-                    )
+                    logging.error(f"{e}")
+                    logging.error(traceback.format_exc())  # This will log the full traceback
 
                 return JSONResponse(content=finished_response)
 
