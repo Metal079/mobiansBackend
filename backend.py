@@ -465,7 +465,7 @@ async def get_job(job_data: GetJobData):
                             for i in range(4):
                                 await cursor.execute(
                                     """
-                                    INSERT INTO ImageInfo (ImageHash, Prompt, NegativePrompt, Seed, CFG, Model, CreateDate)
+                                    INSERT INTO ImageHashes (ImageHash, Prompt, NegativePrompt, Seed, CFG, Model, CreateDate)
                                     VALUES (?, ?, ?, ?, ?, ?, ?)
                                     """,
                                     image_hashes[i],
