@@ -13,3 +13,4 @@ aioodbc
 azure-storage-blob
 pywebpush
 numpy
+imagehash
