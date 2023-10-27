@@ -472,12 +472,15 @@ async def get_job(job_data: GetJobData):
                                     metadata.negative_prompt,
                                     metadata.seed,
                                     metadata.guidance_scale,
-                                    metadata.model,
+                                    "Sonic DiffusionV4",
                                     datetime.now(),
                                 )
-                except:
+                except(e):
                     logging.error(
                         f"Error occurred while inserting image hash info into DB, JOB: {job_data.job_id}"
+                    )
+                    logging.error(
+                        f"{e}"
                     )
 
                 return JSONResponse(content=finished_response)
