@@ -459,29 +459,29 @@ async def get_job(job_data: GetJobData):
                     image_hashes.append(str(image_hash))
 
                 # Store all 4 image hashes in DB along with image info, 1 entry per image
-                try:
-                    async with aioodbc.connect(dsn=dsn) as conn:
-                        async with conn.cursor() as cursor:
-                            for i in range(4):
-                                await cursor.execute(
-                                    """
-                                    INSERT INTO ImageHashes (Hash, Prompt, NegativePrompt, Seed, CFG, Model, CreateDate)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    str(image_hashes[i]),
-                                    metadata.prompt,
-                                    metadata.negative_prompt,
-                                    metadata.seed,
-                                    metadata.guidance_scale,
-                                    "Sonic DiffusionV4",
-                                    datetime.now(),
-                                )
-                except Exception as e:
-                    logging.error(
-                        f"Error occurred while inserting image hash info into DB, JOB: {job_data.job_id}"
-                    )
-                    logging.error(f"{e}")
-                    logging.error(traceback.format_exc())  # This will log the full traceback
+                # try:
+                #     async with aioodbc.connect(dsn=dsn) as conn:
+                #         async with conn.cursor() as cursor:
+                #             for i in range(4):
+                #                 await cursor.execute(
+                #                     """
+                #                     INSERT INTO ImageHashes (Hash, Prompt, NegativePrompt, Seed, CFG, Model, CreateDate)
+                #                     VALUES (?, ?, ?, ?, ?, ?, ?)
+                #                     """,
+                #                     str(image_hashes[i]),
+                #                     metadata.prompt,
+                #                     metadata.negative_prompt,
+                #                     metadata.seed,
+                #                     metadata.guidance_scale,
+                #                     "Sonic DiffusionV4",
+                #                     datetime.now(),
+                #                 )
+                # except Exception as e:
+                #     logging.error(
+                #         f"Error occurred while inserting image hash info into DB, JOB: {job_data.job_id}"
+                #     )
+                #     logging.error(f"{e}")
+                #     logging.error(traceback.format_exc())  # This will log the full traceback
 
                 return JSONResponse(content=finished_response)
 
