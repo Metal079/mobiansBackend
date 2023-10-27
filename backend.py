@@ -468,7 +468,7 @@ async def get_job(job_data: GetJobData):
                                     INSERT INTO ImageHashes (Hash, Prompt, NegativePrompt, Seed, CFG, Model, CreateDate)
                                     VALUES (?, ?, ?, ?, ?, ?, ?)
                                     """,
-                                    image_hashes[i],
+                                    str(image_hashes[i]),
                                     metadata.prompt,
                                     metadata.negative_prompt,
                                     metadata.seed,
