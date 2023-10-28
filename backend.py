@@ -452,13 +452,13 @@ async def get_job(job_data: GetJobData):
 
 
                 # Generate hashes for each image and store them in DB along with image info
-                image_hashes = []
-                for i in range(4):
-                    image = Image.open(io.BytesIO(results[2 * i]))
-                    image_hash = imagehash.crop_resistant_hash(image)
-                    image_hashes.append(str(image_hash))
+                # image_hashes = []
+                # for i in range(4):
+                #     image = Image.open(io.BytesIO(results[2 * i]))
+                #     image_hash = imagehash.crop_resistant_hash(image)
+                #     image_hashes.append(str(image_hash))
 
-                # Store all 4 image hashes in DB along with image info, 1 entry per image
+                # # Store all 4 image hashes in DB along with image info, 1 entry per image
                 # try:
                 #     async with aioodbc.connect(dsn=dsn) as conn:
                 #         async with conn.cursor() as cursor:
