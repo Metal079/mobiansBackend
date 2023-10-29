@@ -151,7 +151,7 @@ async def submit_job(job_data: JobData):
             )
 
     # Filter out prompts
-    job_data.prompt, job_data.negative_prompt = promptFilter(job_data)
+    job_data.prompt, job_data.negative_prompt = await promptFilter(job_data)
     job_data.negative_prompt = fortify_default_negative(job_data.negative_prompt)
 
     API_IP = await chooseAPI("txt2img")
