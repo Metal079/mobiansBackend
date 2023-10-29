@@ -51,7 +51,7 @@ DBNAME = os.environ.get("DBNAME")
 DBUSER = os.environ.get("DBUSER")
 DBPASS = os.environ.get("DBPASS")
 driver = "{ODBC Driver 17 for SQL Server}"
-dsn = f"DRIVER={driver};SERVER={DBHOST};DATABASE={DBNAME};UID={DBUSER};PWD={DBPASS}"
+dsn = f"DRIVER={driver};SERVER={DBHOST};DATABASE={DBNAME};UID={DBUSER};PWD={DBPASS};timeout=5"
 
 API_IP_List = os.environ.get("API_IP_List").split(" ")
 
@@ -452,36 +452,40 @@ async def get_job(job_data: GetJobData):
 
 
                 # Generate hashes for each image and store them in DB along with image info
-                # image_hashes = []
-                # for i in range(4):
-                #     image = Image.open(io.BytesIO(results[2 * i]))
-                #     image_hash = imagehash.crop_resistant_hash(image)
-                #     image_hashes.append(str(image_hash))
+                image_hashes = []
+                for i in range(4):
+                    image = Image.open(io.BytesIO(results[2 * i]))
+                    image_hash = imagehash.phash_simple(image)
+                    image_hashes.append(str(image_hash))
 
-                # # Store all 4 image hashes in DB along with image info, 1 entry per image
-                # try:
-                #     async with aioodbc.connect(dsn=dsn) as conn:
-                #         async with conn.cursor() as cursor:
-                #             for i in range(4):
-                #                 await cursor.execute(
-                #                     """
-                #                     INSERT INTO ImageHashes (Hash, Prompt, NegativePrompt, Seed, CFG, Model, CreateDate)
-                #                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                #                     """,
-                #                     str(image_hashes[i]),
-                #                     metadata.prompt,
-                #                     metadata.negative_prompt,
-                #                     metadata.seed,
-                #                     metadata.guidance_scale,
-                #                     "Sonic DiffusionV4",
-                #                     datetime.now(),
-                #                 )
-                # except Exception as e:
-                #     logging.error(
-                #         f"Error occurred while inserting image hash info into DB, JOB: {job_data.job_id}"
-                #     )
-                #     logging.error(f"{e}")
-                #     logging.error(traceback.format_exc())  # This will log the full traceback
+                # Store all 4 image hashes in DB along with image info, 1 entry per image
+                try:
+                    async with aioodbc.connect(dsn=dsn) as conn:
+                        async with conn.cursor() as cursor:
+                            insert_query = """
+                                INSERT INTO ImageHashes (Hash, Prompt, NegativePrompt, Seed, CFG, Model, CreateDate)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """
+                            values = [
+                                (
+                                    image_hashes[i],
+                                    metadata.prompt,
+                                    metadata.negative_prompt,
+                                    metadata.seed,
+                                    metadata.guidance_scale,
+                                    "Sonic DiffusionV4",
+                                    datetime.now(),
+                                )
+                                for i in range(4)
+                            ]
+
+                            await cursor.executemany(insert_query, values)
+                except Exception as e:
+                    logging.error(
+                        f"Error occurred while inserting image hash info into DB, JOB: {job_data.job_id}"
+                    )
+                    logging.error(f"{e}")
+                    logging.error(traceback.format_exc())  # This will log the full traceback
 
                 return JSONResponse(content=finished_response)
 
@@ -536,10 +540,32 @@ async def chooseAPI(generateType, triedAPIs=[]):
     return API_IP_List[lowest_index]
 
 
-def promptFilter(data):
+async def promptFilter(data):
     prompt = data.prompt
     negative_prompt = data.negative_prompt
 
+    # Check if user is trying to get artist style
+    artist_trigger = [
+        "drawn in the style of",
+        "in the style of"
+    ]
+
+    # If above is in prompt we grab artist list from DB and remove them if they were in the prompt
+    artist_list = []
+    try:
+        async with aioodbc.connect(dsn=dsn) as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT Phrase FROM FilteredPhrases")
+                rows = await cursor.fetchall()
+                for row in rows:
+                    artist_list.append(row[0])
+
+        # Check and remove any filtered phrases from the prompt
+        for phrase in artist_list:
+            prompt = prompt.replace(phrase, "")
+    except Exception as e:
+        print(f"Database error encountered: {e}")
+        
     character_list = [
         "cream the rabbit",
         "rosy the rascal",
