@@ -455,7 +455,7 @@ async def get_job(job_data: GetJobData):
                 image_hashes = []
                 for i in range(4):
                     image = Image.open(io.BytesIO(results[2 * i]))
-                    image_hash = imagehash.phash_simple(image)
+                    image_hash = imagehash.phash(image)
                     image_hashes.append(str(image_hash))
 
                 # Store all 4 image hashes in DB along with image info, 1 entry per image
