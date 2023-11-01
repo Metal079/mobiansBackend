@@ -544,11 +544,33 @@ async def promptFilter(data):
     prompt = data.prompt
     negative_prompt = data.negative_prompt
 
-    # Check if user is trying to get artist style
-    artist_trigger = [
-        "drawn in the style of",
-        "in the style of"
-    ]
+    # Common character mispellings
+    cream_mispelled = ["creem the rabbit", "creme the rabbit", "cram the rabbit", "crem the rabbit", "creme the rabbit", "crem the rabbit", "craem the rabbit", "creamm the rabbit"]
+    rosy_mispelled = ["rosey the rascal", "rosie the rascal", "rosi the rascal", "rosyy the rascal"]
+    charmy_mispelled = ["charmi the bee", "charmyy the bee", "charmie the bee", "charme the bee"]
+    sage_mispelled = ["sagee"]
+    marine_mispelled = ["marin the raccoon", "marina the racoon", "marinee the raccoon"]
+
+    # Up any above mispellings are in prompt, replace them with correct spelling
+    for mispelling in cream_mispelled:
+        if mispelling in prompt.lower():
+            prompt = prompt.replace(mispelling, "cream the rabbit")
+
+    for mispelling in rosy_mispelled:
+        if mispelling in prompt.lower():
+            prompt = prompt.replace(mispelling, "rosy the rascal")
+    
+    for mispelling in charmy_mispelled:
+        if mispelling in prompt.lower():
+            prompt = prompt.replace(mispelling, "charmy the bee")
+
+    for mispelling in sage_mispelled:
+        if mispelling in prompt.lower():
+            prompt = prompt.replace(mispelling, "sage")
+
+    for mispelling in marine_mispelled:
+        if mispelling in prompt.lower():
+            prompt = prompt.replace(mispelling, "marine the raccoon")
 
     # If above is in prompt we grab artist list from DB and remove them if they were in the prompt
     artist_list = []
