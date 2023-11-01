@@ -553,23 +553,23 @@ async def promptFilter(data):
 
     # Up any above mispellings are in prompt, replace them with correct spelling
     for mispelling in cream_mispelled:
-        if mispelling in prompt.lower():
+        if mispelling.lower() in prompt.lower():
             prompt = prompt.replace(mispelling, "cream the rabbit")
 
     for mispelling in rosy_mispelled:
-        if mispelling in prompt.lower():
+        if mispelling.lower() in prompt.lower():
             prompt = prompt.replace(mispelling, "rosy the rascal")
     
     for mispelling in charmy_mispelled:
-        if mispelling in prompt.lower():
+        if mispelling.lower() in prompt.lower():
             prompt = prompt.replace(mispelling, "charmy the bee")
 
     for mispelling in sage_mispelled:
-        if mispelling in prompt.lower():
+        if mispelling.lower() in prompt.lower():
             prompt = prompt.replace(mispelling, "sage")
 
     for mispelling in marine_mispelled:
-        if mispelling in prompt.lower():
+        if mispelling.lower() in prompt.lower():
             prompt = prompt.replace(mispelling, "marine the raccoon")
 
     # If above is in prompt we grab artist list from DB and remove them if they were in the prompt
