@@ -540,9 +540,10 @@ async def chooseAPI(generateType, triedAPIs=[]):
 
     return API_IP_List[lowest_index]
 
-def case_insensitive_replace(s, old, new):
-    # This function replaces 'old' with 'new' in 's', ignoring the case of 'old'
-    return re.sub(re.escape(old), lambda x: new, s, flags=re.IGNORECASE)
+def enhanced_filter(prompt, pattern, replacement):
+    # Replace spaces with \W+ to match any non-word characters between the words
+    pattern = re.sub(r" ", r"\\W+", pattern)
+    return re.sub(r'(?i)\b' + pattern + r'\b', replacement, prompt)
 
 async def promptFilter(data):
     prompt = data.prompt
@@ -550,18 +551,17 @@ async def promptFilter(data):
 
     # Common character mispellings
     corrections = {
-        "cream the rabbit": ["creem the rabbit", "creme the rabbit", "cram the rabbit", "crem the rabbit", "craem the rabbit", "creamm the rabbit", "crema the rabbit"],
+        "cream the rabbit": ["creem the rabbit", "creme the rabbit", "cram the rabbit", "crem the rabbit", "craem the rabbit", "creamm the rabbit", "crema the rabbit", "creamie the rabbit"],
         "rosy the rascal": ["rosey the rascal", "rosie the rascal", "rosi the rascal", "rosyy the rascal"],
         "charmy the bee": ["charmi the bee", "charmyy the bee", "charmie the bee", "charme the bee"],
         "sage": ["sagee"],
         "marine the raccoon": ["marin the raccoon", "marina the racoon", "marinee the raccoon"]
     }
 
-    # Up any above mispellings are in prompt, replace them with correct spelling
+    # Update any above misspellings in the prompt with correct spelling
     for correct, misspellings in corrections.items():
-        for mispelling in misspellings:
-            if mispelling.lower() in prompt.lower():
-                prompt = case_insensitive_replace(prompt, mispelling, correct)
+        for misspelling in misspellings:
+            prompt = enhanced_filter(prompt, re.escape(misspelling), correct)
 
     # If above is in prompt we grab artist list from DB and remove them if they were in the prompt
     artist_list = []
