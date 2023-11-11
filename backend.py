@@ -331,7 +331,7 @@ class JobRetryInfo(BaseModel):
 
 
 async def call_get_job(job_id: str, API_IP: str):
-    async with session.get(url=f"{API_IP}/get_job/{job_id}") as response:
+    async with session.get(url=f"{API_IP}/get_job/{job_id}", ssl=False) as response:
         return await response.json()
 
 
@@ -502,7 +502,7 @@ async def get_job(job_data: GetJobData):
 
 async def call_api(api, session):
     try:
-        async with session.get(url=f"{api}/get_queue_length/", timeout=5) as response:
+        async with session.get(url=f"{api}/get_queue_length/", timeout=5, ssl=False) as response:
             return await response.json()
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         print(f"API {api} is down. Error: {str(e)}")
