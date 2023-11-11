@@ -72,7 +72,7 @@ async def startup_event():
     global blob_service_client
     global r
 
-    session = aiohttp.ClientSession()
+    session = aiohttp.ClientSession(trust_env=True)
     blob_service_client = BlobServiceClient.from_connection_string(
         os.getenv("AZURE_STORAGE_CONNECTION_STRING")
     )
