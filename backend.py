@@ -52,7 +52,7 @@ DBNAME = os.environ.get("DBNAME")
 DBUSER = os.environ.get("DBUSER")
 DBPASS = os.environ.get("DBPASS")
 driver = "{ODBC Driver 17 for SQL Server}"
-dsn = f"DRIVER={driver};SERVER={DBHOST};DATABASE={DBNAME};UID={DBUSER};PWD={DBPASS};Encrypt=False;TrustServerCertificate=True;timeout=15"
+dsn = f"DRIVER={driver};SERVER={DBHOST};DATABASE={DBNAME};UID={DBUSER};PWD={DBPASS};timeout=15"
 
 API_IP_List = os.environ.get("API_IP_List").split(" ")
 
