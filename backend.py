@@ -20,7 +20,6 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel
-
 from dotenv import load_dotenv
 from redis.asyncio import Redis
 from redis.backoff import ExponentialBackoff
@@ -60,6 +59,10 @@ global_queue = {}  # This will store the latest queue information
 session = None
 
 
+async def create_db_pool():
+    return await asyncpg.create_pool(dsn=DATABASE_URL)
+
+
 @app.on_event("startup")
 async def startup_event():
     global session
@@ -80,10 +83,9 @@ async def startup_event():
 
     # Create a connection pool
     try:
-        app.state.db_pool = await asyncpg.create_pool(dsn=DATABASE_URL)
+        app.state.db_pool = await create_db_pool()
     except Exception as e:
-        # Handle the exception (e.g., log it, retry, exit, etc.)
-        logging.error(f"Failed to create a database pool: {e}")
+        logging.error(f"Failed to create a database pool at startup: {e}")
 
     for index, ip in enumerate(API_IP_List):
         ws_uri = f"ws://{ip}/ws/queue_length"
@@ -96,9 +98,23 @@ async def shutdown_event():
     await app.state.db_pool.close()
 
 
-async def get_connection(pool: asyncpg.Pool = Depends(lambda: app.state.db_pool)):
-    async with pool.acquire() as connection:
-        yield connection
+async def get_connection():
+    if not hasattr(app.state, "db_pool") or app.state.db_pool is None:
+        logging.info("Attempting to create a new database pool.")
+        try:
+            app.state.db_pool = await create_db_pool()
+        except Exception as e:
+            logging.error(f"Failed to create a new database pool: {e}")
+
+    try:
+        async with app.state.db_pool.acquire() as connection:
+            yield connection
+    except Exception as e:
+        logging.error(f"Error acquiring connection from pool: {e}")
+        app.state.db_pool = (
+            None  # Invalidate the pool so it will be recreated next time
+        )
+        yield None
 
 
 # Set up the CORS middleware
@@ -168,18 +184,23 @@ async def listen_for_queue_updates(uri, index):
 
 @app.post("/submit_job/")
 async def submit_job(
-    job_data: JobData, conn: asyncpg.Connection = Depends(get_connection)
+    job_data: JobData, conn: Optional[asyncpg.Connection] = Depends(get_connection)
 ):
     # Check if FastPassCode is valid and non-expired
     fast_pass_enabled = False
     if job_data.fast_pass_code:
-        is_valid = await validate_fastpass(job_data.fast_pass_code, conn)
-        if is_valid:
-            fast_pass_enabled = True
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid or expired FastPassCode. Please fix/remove the FastPassCode and try again.",
+        try:
+            is_valid = await validate_fastpass(job_data.fast_pass_code, conn)
+            if is_valid:
+                fast_pass_enabled = True
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid or expired FastPassCode. Please fix/remove the FastPassCode and try again.",
+                )
+        except:
+            logging.error(
+                "Error occurred while validating FastPassCode (DB might be down))"
             )
 
     # Filter out prompts
@@ -316,7 +337,7 @@ def decode_base64_to_image(base64_str):
 
 
 async def validate_fastpass(
-    fast_pass_code: str, conn: asyncpg.Connection = Depends(get_connection)
+    fast_pass_code: str, conn: Optional[asyncpg.Connection] = Depends(get_connection)
 ) -> bool:
     row = await conn.fetchrow(
         """
@@ -401,7 +422,7 @@ async def process_images_and_store_hashes(image_results, metadata, job_data, con
 async def get_job(
     job_data: GetJobData,
     background_tasks: BackgroundTasks,
-    conn: asyncpg.Connection = Depends(get_connection),
+    conn: Optional[asyncpg.Connection] = Depends(get_connection),
 ):
     MAX_RETRIES = 3
     MIN_DELAY = 1
@@ -562,9 +583,11 @@ async def get_queue_length_via_websocket(api_url):
 # Get the queue length of each API and choose the one with the shortest queue
 async def chooseAPI():
     lowest_queue = {None: 9999}
+    current_key = None
     for api in global_queue:
-        if global_queue[api] < lowest_queue[None]:
+        if global_queue[api] < lowest_queue[current_key]:
             lowest_queue = {api: global_queue[api]}
+            current_key = api
 
     return API_IP_List[list(lowest_queue.keys())[0]]
 
