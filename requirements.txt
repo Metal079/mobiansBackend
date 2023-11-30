@@ -1,7 +1,6 @@
 requests
 fastapi
 uvicorn[standard]
-slowapi
 pillow
 python-dotenv
 gunicorn

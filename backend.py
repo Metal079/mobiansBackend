@@ -10,7 +10,6 @@ import logging
 import random
 import asyncio
 from datetime import datetime
-from io import BytesIO
 import json
 import re
 import websockets
@@ -19,15 +18,10 @@ import aiohttp
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
+from PIL import Image
 from pydantic import BaseModel
 
-# from slowapi import Limiter, _rate_limit_exceeded_handler
-# from slowapi.util import get_remote_address
-# from slowapi.errors import RateLimitExceeded
-from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 from dotenv import load_dotenv
-import redis
 from redis.asyncio import Redis
 from redis.backoff import ExponentialBackoff
 from redis.retry import Retry
@@ -62,7 +56,7 @@ VAPID_CLAIMS = os.environ.get("VAPID_CLAIMS")
 subscriptions: Dict[str, dict] = {}
 
 app = FastAPI()
-
+global_queue = {}  # This will store the latest queue information
 session = None
 
 
@@ -91,7 +85,9 @@ async def startup_event():
         # Handle the exception (e.g., log it, retry, exit, etc.)
         logging.error(f"Failed to create a database pool: {e}")
 
-    # asyncio.run(listen_for_queue_updates("ws://server/queue"))
+    for index, ip in enumerate(API_IP_List):
+        ws_uri = f"ws://{ip}/ws/queue_length"
+        asyncio.create_task(listen_for_queue_updates(ws_uri, index))
 
 
 @app.on_event("shutdown")
@@ -152,11 +148,22 @@ class ImageRequestModel(JobData):
     fast_pass_enabled: Optional[bool] = False
 
 
-# async def listen_for_queue_updates(uri):
-#     async with websockets.connect(uri) as websocket:
-#         while True:
-#             message = await websocket.recv()
-#             print(f"Queue Update: {message}")
+async def listen_for_queue_updates(uri, index):
+    global global_queue
+    while True:
+        try:
+            async with websockets.connect(uri) as websocket:
+                while True:
+                    message = await websocket.recv()
+                    queue_info = json.loads(message)
+                    global_queue[index] = queue_info["queue_length"]
+                    # Here, you would handle the received message
+                    print(f"Queue Update for {uri}: {global_queue}")
+                    # No need to sleep because you're waiting for messages from the server
+        except Exception as e:
+            print(f"Error connecting to WebSocket at {uri}: {e}")
+            # If the connection fails, wait before trying to reconnect
+            await asyncio.sleep(1)
 
 
 @app.post("/submit_job/")
@@ -179,7 +186,7 @@ async def submit_job(
     job_data.prompt, job_data.negative_prompt = await promptFilter(job_data)
     job_data.negative_prompt = fortify_default_negative(job_data.negative_prompt)
 
-    API_IP = await chooseAPI("txt2img")
+    API_IP = await chooseAPI()
 
     # Do img2img filtering if it's an img2img request
     if job_data.job_type == "img2img" or job_data.job_type == "inpainting":
@@ -262,23 +269,23 @@ async def submit_job(
     # Try using the requested API, if it fails, use the other one
     try:
         response = requests.post(
-            url=f"{API_IP}/submit_job/", json=image_request_data.dict()
+            url=f"http://{API_IP}/submit_job/", json=image_request_data.dict()
         )
     except:
-        API_IP = chooseAPI("txt2img", [API_IP])
+        API_IP = chooseAPI()
         response = requests.post(
-            url=f"{API_IP}/submit_job/", json=image_request_data.dict()
+            url=f"http://{API_IP}/submit_job/", json=image_request_data.dict()
         )
 
     attempts = 0
     while response.status_code != 200 and attempts < 3:
-        API_IP = chooseAPI("txt2img", [API_IP])
+        API_IP = chooseAPI()
         print(f"got error: {response.status_code} for submit_job, api: {API_IP}")
         attempts += 1
         response = requests.post(
-            url=f"{API_IP}/submit_job/", json=image_request_data.dict()
+            url=f"http://{API_IP}/submit_job/", json=image_request_data.dict()
         )
-        time.sleep(1)
+        asyncio.sleep(1)
 
     returned_data = response.json()
     # Get index of API_IP in API_IP_List
@@ -343,7 +350,9 @@ class JobRetryInfo(BaseModel):
 
 
 async def call_get_job(job_id: str, API_IP: str):
-    async with session.get(url=f"{API_IP}/get_job/{job_id}", ssl=False) as response:
+    async with session.get(
+        url=f"http://{API_IP}/get_job/{job_id}", ssl=False
+    ) as response:
         return await response.json()
 
 
@@ -372,9 +381,27 @@ async def insert_image_hashes(
         await conn.executemany(insert_query, values)
 
 
+async def process_images_and_store_hashes(image_results, metadata, job_data, conn):
+    image_hashes = []
+    for i in range(4):
+        image = Image.open(io.BytesIO(image_results[2 * i]))
+        image_hash = imagehash.phash(image, 16)
+        image_hashes.append(str(image_hash))
+
+    try:
+        await insert_image_hashes(image_hashes, metadata, job_data, conn)
+    except Exception as e:
+        logging.error(
+            f"Error occurred while inserting image hash info into DB, JOB: {job_data.job_id}"
+        )
+        logging.error(str(e))
+
+
 @app.post("/get_job/")
 async def get_job(
-    job_data: GetJobData, conn: asyncpg.Connection = Depends(get_connection)
+    job_data: GetJobData,
+    background_tasks: BackgroundTasks,
+    conn: asyncpg.Connection = Depends(get_connection),
 ):
     MAX_RETRIES = 3
     MIN_DELAY = 1
@@ -448,7 +475,7 @@ async def get_job(
                         job_id=job_data.job_id, indexes=corrupted_indexes
                     )
                     requests.get(
-                        url=f"{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}",
+                        url=f"http://{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}",
                         json=retry_info.dict(),
                     )
 
@@ -491,24 +518,10 @@ async def get_job(
                         attempts += 1
 
                 # Generate hashes for each image and store them in DB along with image info
-                image_hashes = []
-                for i in range(4):
-                    image = Image.open(io.BytesIO(results[2 * i]))
-                    image_hash = imagehash.phash(image, 16)
-                    image_hashes.append(str(image_hash))
-
-                # Store all 4 image hashes in DB along with image info, 1 entry per image
-                try:
-                    await insert_image_hashes(image_hashes, metadata, job_data, conn)
-
-                except Exception as e:
-                    logging.error(
-                        f"Error occurred while inserting image hash info into DB, JOB: {job_data.job_id}"
-                    )
-                    logging.error(str(e))
-                    logging.error(
-                        traceback.format_exc()
-                    )  # This will log the full traceback
+                # Pass the results for images and other necessary data to the background task
+                background_tasks.add_task(
+                    process_images_and_store_hashes, results, metadata, job_data, conn
+                )
 
                 return JSONResponse(content=finished_response)
 
@@ -531,36 +544,29 @@ async def call_api(api, session):
         return {"queue_length": 9999, "api": api}
 
 
+async def get_queue_length_via_websocket(api_url):
+    try:
+        # Replace "ws" with "wss" for secure WebSockets over TLS/SSL
+        async with websockets.connect(api_url) as websocket:
+            # You can send a message if needed, for example, to authenticate
+            # await websocket.send('some message')
+
+            # Wait for the server to send a message and parse it as JSON
+            message = await websocket.recv()
+            return json.loads(message)  # Assuming the server sends JSON
+    except Exception as e:
+        print(f"Error connecting to WebSocket at {api_url}: {e}")
+        return {"queue_length": 9999, "api": api_url}
+
+
 # Get the queue length of each API and choose the one with the shortest queue
-async def chooseAPI(generateType, triedAPIs=[]):
-    API_queue_length_list = []
-    current_lowest_queue = 9999
+async def chooseAPI():
+    lowest_queue = {None: 9999}
+    for api in global_queue:
+        if global_queue[api] < lowest_queue[None]:
+            lowest_queue = {api: global_queue[api]}
 
-    global session
-    tasks = []
-    for api in API_IP_List:
-        if api not in triedAPIs:
-            task = asyncio.create_task(call_api(api, session))
-            tasks.append((api, task))
-
-    results = await asyncio.gather(
-        *[task for api, task in tasks], return_exceptions=True
-    )
-
-    for api, result in zip([api for api, task in tasks], results):
-        if isinstance(result, Exception):
-            print(f"API {api} is down. Error: {str(result)}")
-            continue
-
-        queue_length = result["queue_length"]
-        API_queue_length_list.append(queue_length)
-        print(f"API {api} queue length: {queue_length}")
-
-        if queue_length < current_lowest_queue:
-            current_lowest_queue = queue_length
-            lowest_index = API_IP_List.index(api)
-
-    return API_IP_List[lowest_index]
+    return API_IP_List[list(lowest_queue.keys())[0]]
 
 
 def enhanced_filter(prompt, pattern, replacement):
