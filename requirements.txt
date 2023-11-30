@@ -14,3 +14,5 @@ azure-storage-blob
 pywebpush
 numpy
 imagehash
+asyncpg
+websockets

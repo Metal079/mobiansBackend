@@ -11,14 +11,13 @@ import random
 import asyncio
 from datetime import datetime
 from io import BytesIO
-import uuid
 import json
-import traceback
 import re
+import websockets
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, Request, Body
-from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
 from pydantic import BaseModel
@@ -33,12 +32,12 @@ from redis.asyncio import Redis
 from redis.backoff import ExponentialBackoff
 from redis.retry import Retry
 from redis.exceptions import BusyLoadingError, ConnectionError, TimeoutError
-import aioodbc
-from azure.storage.blob.aio import BlobServiceClient
-from azure.core.exceptions import ResourceExistsError
 from pywebpush import webpush, WebPushException
 import numpy as np
 import imagehash
+import asyncpg
+
+from helper_functions import *
 
 logging.basicConfig(level=logging.ERROR)  # Configure logging
 
@@ -51,8 +50,9 @@ DBHOST = os.environ.get("DBHOST")
 DBNAME = os.environ.get("DBNAME")
 DBUSER = os.environ.get("DBUSER")
 DBPASS = os.environ.get("DBPASS")
-driver = "{ODBC Driver 17 for SQL Server}"
-dsn = f"DRIVER={driver};SERVER={DBHOST};DATABASE={DBNAME};UID={DBUSER};PWD={DBPASS};timeout=5"
+
+# Define your connection parameters for PostgreSQL
+DATABASE_URL = f"postgresql://{DBUSER}:{DBPASS}@{DBHOST}/{DBNAME}"
 
 API_IP_List = os.environ.get("API_IP_List").split(" ")
 
@@ -73,9 +73,9 @@ async def startup_event():
     global r
 
     session = aiohttp.ClientSession(trust_env=True)
-    blob_service_client = BlobServiceClient.from_connection_string(
-        os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-    )
+    # blob_service_client = BlobServiceClient.from_connection_string(
+    #     os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    # )
     r = Redis(
         host=REDISHOST,
         port=6379,
@@ -84,10 +84,25 @@ async def startup_event():
         retry_on_error=[BusyLoadingError, ConnectionError, TimeoutError],
     )  # , decode_responses=True
 
+    # Create a connection pool
+    try:
+        app.state.db_pool = await asyncpg.create_pool(dsn=DATABASE_URL)
+    except Exception as e:
+        # Handle the exception (e.g., log it, retry, exit, etc.)
+        logging.error(f"Failed to create a database pool: {e}")
+
+    # asyncio.run(listen_for_queue_updates("ws://server/queue"))
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await session.close()
+    await app.state.db_pool.close()
+
+
+async def get_connection(pool: asyncpg.Pool = Depends(lambda: app.state.db_pool)):
+    async with pool.acquire() as connection:
+        yield connection
 
 
 # Set up the CORS middleware
@@ -137,12 +152,21 @@ class ImageRequestModel(JobData):
     fast_pass_enabled: Optional[bool] = False
 
 
+# async def listen_for_queue_updates(uri):
+#     async with websockets.connect(uri) as websocket:
+#         while True:
+#             message = await websocket.recv()
+#             print(f"Queue Update: {message}")
+
+
 @app.post("/submit_job/")
-async def submit_job(job_data: JobData):
+async def submit_job(
+    job_data: JobData, conn: asyncpg.Connection = Depends(get_connection)
+):
     # Check if FastPassCode is valid and non-expired
     fast_pass_enabled = False
     if job_data.fast_pass_code:
-        is_valid = await validate_fastpass(job_data.fast_pass_code)
+        is_valid = await validate_fastpass(job_data.fast_pass_code, conn)
         if is_valid:
             fast_pass_enabled = True
         else:
@@ -173,7 +197,9 @@ async def submit_job(job_data: JobData):
             if "A" in job_data.mask_image.getbands():
                 # Extract the alpha channel and adjust its opacity
                 alpha_channel = job_data.mask_image.split()[-1]
-                alpha_channel = alpha_channel.point(lambda p: int(p * job_data.strength))
+                alpha_channel = alpha_channel.point(
+                    lambda p: int(p * job_data.strength)
+                )
 
             else:
                 # Create a new alpha channel based on the mask image's pixel data
@@ -194,15 +220,15 @@ async def submit_job(job_data: JobData):
 
             # Convert the PIL Image to a NumPy array
             mask_array = np.array(job_data.mask_image)
-            
+
             # Identify non-transparent pixels
             not_transparent = mask_array[:, :, 3] > 0  # Alpha channel is not 0
-            
+
             # Set those pixels to black while maintaining the alpha channel
             mask_array[not_transparent, :3] = 0  # Set R, G, B to 0
-            
+
             # Convert the NumPy array back to a PIL image
-            job_data.mask_image = Image.fromarray(mask_array, 'RGBA')
+            job_data.mask_image = Image.fromarray(mask_array, "RGBA")
 
         # Remove alpha channel from image and mask image
         job_data.image = remove_alpha_channel(job_data.image)
@@ -262,6 +288,7 @@ async def submit_job(job_data: JobData):
 
     return JSONResponse(content=returned_data)
 
+
 def decode_base64_to_image(base64_str):
     # Convert base64 string to image
     try:
@@ -280,42 +307,27 @@ def decode_base64_to_image(base64_str):
 
     return image
 
-def remove_alpha_channel(image):
-    # Convert image to RGB if it has an alpha channel
-    if image.mode == "RGBA":
-        buffer = io.BytesIO()
-        # Separate alpha channel and add white background
-        background = Image.new("RGBA", image.size, (255, 255, 255))
-        alpha_composite = Image.alpha_composite(background, image).convert("RGB")
-        alpha_composite.save(buffer, format="PNG")
-        return alpha_composite
-    else:
-        return image
 
-def is_white(pixel, tolerance=10):
-    return all(255 - tolerance <= channel <= 255 for channel in pixel[:3])
+async def validate_fastpass(
+    fast_pass_code: str, conn: asyncpg.Connection = Depends(get_connection)
+) -> bool:
+    row = await conn.fetchrow(
+        """
+        SELECT expiration_date
+        FROM fastpass
+        WHERE fastpass_code = $1
+        """,
+        fast_pass_code,
+    )
 
-async def validate_fastpass(fast_pass_code: str) -> bool:
-    async with aioodbc.connect(dsn=dsn) as conn:
-        async with conn.cursor() as cursor:
-            await cursor.execute(
-                """
-                SELECT ExpirationDate
-                FROM FastPass
-                WHERE FastPassCode = ?
-            """,
-                fast_pass_code,
-            )
+    if not row:
+        return False
 
-            row = await cursor.fetchone()
-            if not row:
-                return False
-
-            expiration_date = row[0]
-            if expiration_date is None:
-                return True
-            elif expiration_date < datetime.now():
-                return False
+    expiration_date = row["expiration_date"]
+    if expiration_date is None:
+        return True
+    elif expiration_date < datetime.now():
+        return False
 
     return True
 
@@ -335,8 +347,35 @@ async def call_get_job(job_id: str, API_IP: str):
         return await response.json()
 
 
+async def insert_image_hashes(
+    image_hashes, metadata, job_data, conn: asyncpg.Connection = Depends(get_connection)
+):
+    async with conn.transaction():  # Start a transaction
+        insert_query = """
+            INSERT INTO ImageHashes (hash, prompt, negative_prompt, seed, cfg, model, created_date)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """
+        values = [
+            (
+                image_hashes[i],
+                metadata.prompt,
+                metadata.negative_prompt,
+                metadata.seed,
+                metadata.guidance_scale,
+                "Sonic DiffusionV4",
+                datetime.now(),
+            )
+            for i in range(4)
+        ]
+
+        # Use executemany to insert multiple records
+        await conn.executemany(insert_query, values)
+
+
 @app.post("/get_job/")
-async def get_job(job_data: GetJobData):
+async def get_job(
+    job_data: GetJobData, conn: asyncpg.Connection = Depends(get_connection)
+):
     MAX_RETRIES = 3
     MIN_DELAY = 1
     MAX_DELAY = 60
@@ -451,48 +490,29 @@ async def get_job(job_data: GetJobData):
                     else:
                         attempts += 1
 
-
                 # Generate hashes for each image and store them in DB along with image info
                 image_hashes = []
                 for i in range(4):
                     image = Image.open(io.BytesIO(results[2 * i]))
-                    image_hash = imagehash.phash(image)
+                    image_hash = imagehash.phash(image, 16)
                     image_hashes.append(str(image_hash))
 
                 # Store all 4 image hashes in DB along with image info, 1 entry per image
-                # try:
-                #     async with aioodbc.connect(dsn=dsn) as conn:
-                #         async with conn.cursor() as cursor:
-                #             insert_query = """
-                #                 INSERT INTO ImageHashes (Hash, Prompt, NegativePrompt, Seed, CFG, Model, CreateDate)
-                #                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                #             """
-                #             values = [
-                #                 (
-                #                     image_hashes[i],
-                #                     metadata.prompt,
-                #                     metadata.negative_prompt,
-                #                     metadata.seed,
-                #                     metadata.guidance_scale,
-                #                     "Sonic DiffusionV4",
-                #                     datetime.now(),
-                #                 )
-                #                 for i in range(4)
-                #             ]
+                try:
+                    await insert_image_hashes(image_hashes, metadata, job_data, conn)
 
-                #             await cursor.executemany(insert_query, values)
-                # except Exception as e:
-                #     logging.error(
-                #         f"Error occurred while inserting image hash info into DB, JOB: {job_data.job_id}"
-                #     )
-                #     logging.error(f"{e}")
-                #     logging.error(traceback.format_exc())  # This will log the full traceback
+                except Exception as e:
+                    logging.error(
+                        f"Error occurred while inserting image hash info into DB, JOB: {job_data.job_id}"
+                    )
+                    logging.error(str(e))
+                    logging.error(
+                        traceback.format_exc()
+                    )  # This will log the full traceback
 
                 return JSONResponse(content=finished_response)
 
     except Exception as e:
-        # logging.error(f"got error: {response.status_code} for retrieve_job on job {job_data.job_id}, api: {API_IP_List[job_data.API_IP]}")
-        # logging.error(f"response: {response.text}")
         logging.error(f"response: {response}")
         logging.error(f"Exception: {e}")
         logging.error(f"Exception happened on get_job")
@@ -502,7 +522,9 @@ async def get_job(job_data: GetJobData):
 
 async def call_api(api, session):
     try:
-        async with session.get(url=f"{api}/get_queue_length/", timeout=5, ssl=False) as response:
+        async with session.get(
+            url=f"{api}/get_queue_length/", timeout=5, ssl=False
+        ) as response:
             return await response.json()
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         print(f"API {api} is down. Error: {str(e)}")
@@ -540,10 +562,12 @@ async def chooseAPI(generateType, triedAPIs=[]):
 
     return API_IP_List[lowest_index]
 
+
 def enhanced_filter(prompt, pattern, replacement):
     # Replace spaces with \W+ to match any non-word characters between the words
     pattern = re.sub(r" ", r"\\W+", pattern)
-    return re.sub(r'(?i)\b' + pattern + r'\b', replacement, prompt)
+    return re.sub(r"(?i)\b" + pattern + r"\b", replacement, prompt)
+
 
 async def promptFilter(data):
     prompt = data.prompt
@@ -551,11 +575,34 @@ async def promptFilter(data):
 
     # Common character mispellings
     corrections = {
-        "cream the rabbit": ["creem the rabbit", "creme the rabbit", "cram the rabbit", "crem the rabbit", "craem the rabbit", "creamm the rabbit", "crema the rabbit", "creamie the rabbit"],
-        "rosy the rascal": ["rosey the rascal", "rosie the rascal", "rosi the rascal", "rosyy the rascal"],
-        "charmy the bee": ["charmi the bee", "charmyy the bee", "charmie the bee", "charme the bee"],
+        "cream the rabbit": [
+            "creem the rabbit",
+            "creme the rabbit",
+            "cram the rabbit",
+            "crem the rabbit",
+            "craem the rabbit",
+            "creamm the rabbit",
+            "crema the rabbit",
+            "creamie the rabbit",
+        ],
+        "rosy the rascal": [
+            "rosey the rascal",
+            "rosie the rascal",
+            "rosi the rascal",
+            "rosyy the rascal",
+        ],
+        "charmy the bee": [
+            "charmi the bee",
+            "charmyy the bee",
+            "charmie the bee",
+            "charme the bee",
+        ],
         "sage": ["sagee"],
-        "marine the raccoon": ["marin the raccoon", "marina the racoon", "marinee the raccoon"]
+        "marine the raccoon": [
+            "marin the raccoon",
+            "marina the racoon",
+            "marinee the raccoon",
+        ],
     }
 
     # Update any above misspellings in the prompt with correct spelling
@@ -578,7 +625,7 @@ async def promptFilter(data):
     #         prompt = prompt.replace(phrase, "")
     # except Exception as e:
     #     print(f"Database error encountered: {e}")
-        
+
     character_list = [
         "cream the rabbit",
         "rosy the rascal",
@@ -773,7 +820,7 @@ async def promptFilter(data):
         "pinned down",
         "thrusting",
         "cervical",
-        "ecstasy"
+        "ecstasy",
     ]
 
     # If character is in prompt, filter out censored tags from prompt
@@ -784,7 +831,7 @@ async def promptFilter(data):
         # If prompt is changed remove the prompt "blush" from prompt
         if prompt != data.prompt.lower():
             prompt = prompt.replace("blush", "")
-            
+
         negative_prompt = (
             "(cleavage), navel, 3d, blush, sweat, ((underwear)), (bikini), (nipples), sex, (breasts), nude, "
             + negative_prompt
@@ -814,79 +861,23 @@ def filter_seed(data):
     return seed
 
 
-def add_watermark(image):
-    # Create watermark image
-    watermark_text = "Mobians.ai"
-    opacity = 128
-    watermark = Image.new("RGBA", image.size, (255, 255, 255, 0))
-    draw = ImageDraw.Draw(watermark)
+# async def upload_blob(blob_service_client, container_name, blob_name, data):
+#     blob_client = blob_service_client.get_blob_client(container_name, blob_name)
 
-    # Provide the correct path to the font file
-    font_file_path = r"fonts/Roboto-Medium.ttf"
-    font = ImageFont.truetype(font_file_path, 25)
-    draw.text((10, 10), watermark_text, font=font, fill=(255, 255, 255, opacity))
-
-    # Overlay watermark on the original image
-    image_with_watermark = Image.alpha_composite(image.convert("RGBA"), watermark)
-    return image_with_watermark
-
-
-def add_image_metadata(image, request_data):
-    img_io = io.BytesIO()
-
-    image_with_watermark = add_watermark(image)
-
-    # Add metadata
-    metadata = PngImagePlugin.PngInfo()
-    try:
-        # Add disclamer to metadata if job is not txt2img
-        if request_data.job_type != "txt2img":
-            metadata.add_text(
-                "NOTE",
-                "The image was not generated purely using txt2img, using the info below may not give you the same results.",
-            )
-
-        metadata.add_text("prompt", request_data.prompt)
-        request_data.negative_prompt = request_data.negative_prompt.replace("admin", "")
-        metadata.add_text("negative_prompt", request_data.negative_prompt)
-        metadata.add_text("seed", str(request_data.seed))
-        metadata.add_text("cfg", str(request_data.guidance_scale))
-        metadata.add_text("job_type", request_data.job_type)
-    except:
-        # log to text file
-        logging.error(f"Error adding metadata to image")
-        with open("error_log.txt", "a") as f:
-            f.write(f"Error adding metadata to image: {request_data}\n")
-    metadata.add_text("model", "Mobians.ai / SonicDiffusionV4")
-    metadata.add_text(
-        "Disclaimer",
-        "The image is generated by Mobians.ai. The image is not real and is generated by an AI.",
-    )
-
-    image_with_watermark.save(img_io, format="PNG", pnginfo=metadata)
-    # image_with_watermark.save(img_io, format='WEBP', quality=95)
-    img_io.seek(0)
-    base64_image = base64.b64encode(img_io.getvalue()).decode("utf-8")
-    return base64_image
-
-
-async def upload_blob(blob_service_client, container_name, blob_name, data):
-    blob_client = blob_service_client.get_blob_client(container_name, blob_name)
-
-    # Check if the blob exists
-    if await blob_client.exists():
-        try:
-            # Delete the existing blob
-            await blob_client.delete_blob()
-        except Exception as e:
-            print(f"An error occurred while deleting blob {blob_name}: {e}")
-    else:
-        try:
-            # Upload the new blob
-            await blob_client.upload_blob(data)
-            return blob_client.url
-        except Exception as e:
-            print(f"An error occurred while uploading blob {blob_name}: {e}")
+#     # Check if the blob exists
+#     if await blob_client.exists():
+#         try:
+#             # Delete the existing blob
+#             await blob_client.delete_blob()
+#         except Exception as e:
+#             print(f"An error occurred while deleting blob {blob_name}: {e}")
+#     else:
+#         try:
+#             # Upload the new blob
+#             await blob_client.upload_blob(data)
+#             return blob_client.url
+#         except Exception as e:
+#             print(f"An error occurred while uploading blob {blob_name}: {e}")
 
 
 async def delete_and_insert_image_metadata(image_details, blob_url, dsn, rating, uuid):
@@ -932,36 +923,36 @@ async def delete_and_insert_image_metadata(image_details, blob_url, dsn, rating,
 
 @app.post("/rate_image/")
 async def rate_image(job_data: JobData):
-    # Decode base64 image and convert it to bytes
-    try:
-        image_bytes = base64.b64decode(job_data.image.split(",", 1)[0])
-    except:
-        image_bytes = base64.b64decode(job_data.image.split(",", 1)[1])
+    # # Decode base64 image and convert it to bytes
+    # try:
+    #     image_bytes = base64.b64decode(job_data.image.split(",", 1)[0])
+    # except:
+    #     image_bytes = base64.b64decode(job_data.image.split(",", 1)[1])
 
-    image = Image.open(BytesIO(image_bytes))
+    # image = Image.open(BytesIO(image_bytes))
 
-    info = image.info
+    # info = image.info
 
-    # Get image metadata
-    image_details = {}
-    for key, value in info.items():
-        image_details[key] = value
+    # # Get image metadata
+    # image_details = {}
+    # for key, value in info.items():
+    #     image_details[key] = value
 
-    # Generate a random filename
-    image_name = job_data.image_UUID
+    # # Generate a random filename
+    # image_name = job_data.image_UUID
 
-    # Upload to Azure Blob Storage
-    container_name = "mobiansratings"
-    blob_url = await upload_blob(
-        blob_service_client, container_name, image_name, image_bytes
-    )
+    # # Upload to Azure Blob Storage
+    # container_name = "mobiansratings"
+    # blob_url = await upload_blob(
+    #     blob_service_client, container_name, image_name, image_bytes
+    # )
 
-    # Insert image metadata into database
-    db_status = await delete_and_insert_image_metadata(
-        image_details, blob_url, dsn, rating=job_data.rating, uuid=image_name
-    )
+    # # Insert image metadata into database
+    # db_status = await delete_and_insert_image_metadata(
+    #     image_details, blob_url, dsn, rating=job_data.rating, uuid=image_name
+    # )
 
-    return JSONResponse({"message": f"{db_status}"})
+    return JSONResponse({"message": f"we no longer use this"})
 
 
 class Subscription(BaseModel):
