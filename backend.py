@@ -288,31 +288,33 @@ async def submit_job(
     )
 
     # Try using the requested API, if it fails, use the other one
+    returned_data = None
     try:
-        response = requests.post(
-            url=f"http://{API_IP}/submit_job/", json=image_request_data.dict()
-        )
+        async with session.post(f"http://{API_IP}/submit_job/", json=image_request_data.dict()) as resp:
+            returned_data = await resp.json()
     except:
-        API_IP = chooseAPI()
-        response = requests.post(
-            url=f"http://{API_IP}/submit_job/", json=image_request_data.dict()
-        )
+        API_IP = await chooseAPI()  # Ensure chooseAPI is also async
+        async with session.post(f"http://{API_IP}/submit_job/", json=image_request_data.dict()) as resp:
+            returned_data = await resp.json()
 
-    attempts = 0
-    while response.status_code != 200 and attempts < 3:
-        API_IP = chooseAPI()
-        print(f"got error: {response.status_code} for submit_job, api: {API_IP}")
-        attempts += 1
-        response = requests.post(
-            url=f"http://{API_IP}/submit_job/", json=image_request_data.dict()
-        )
-        asyncio.sleep(1)
+    # attempts = 0
+    # while response.status != 200 and attempts < 3:
+    #     API_IP = await chooseAPI()  # Ensure chooseAPI is also async
+    #     print(f"got error: {response.status} for submit_job, api: {API_IP}")
+    #     attempts += 1
+    #     async with session.post(f"http://{API_IP}/submit_job/", json=image_request_data.dict()) as resp:
+    #         returned_data = await resp.json()
+    #     await asyncio.sleep(1)
 
-    returned_data = response.json()
     # Get index of API_IP in API_IP_List
     for i in range(len(API_IP_List)):
         if API_IP_List[i] == API_IP:
             returned_data["API_IP"] = i
+
+    if returned_data == None:
+        raise HTTPException(
+            status_code=500, detail="Error occurred while submitting job"
+        )
 
     return JSONResponse(content=returned_data)
 
