@@ -15,4 +15,3 @@ numpy
 imagehash
 asyncpg
 websockets
-tenacity
