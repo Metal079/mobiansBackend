@@ -105,16 +105,18 @@ async def get_connection():
             app.state.db_pool = await create_db_pool()
         except Exception as e:
             logging.error(f"Failed to create a new database pool: {e}")
+            yield None
 
-    try:
-        async with app.state.db_pool.acquire() as connection:
-            yield connection
-    except Exception as e:
-        logging.error(f"Error acquiring connection from pool: {e}")
-        app.state.db_pool = (
-            None  # Invalidate the pool so it will be recreated next time
-        )
-        yield None
+    if hasattr(app.state, "db_pool") and app.state.db_pool is not None:
+        try:
+            async with app.state.db_pool.acquire() as connection:
+                yield connection
+        except Exception as e:
+            logging.error(f"Error acquiring connection from pool: {e}")
+            app.state.db_pool = (
+                None  # Invalidate the pool so it will be recreated next time
+            )
+            yield None
 
 
 # Set up the CORS middleware
