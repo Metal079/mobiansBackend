@@ -60,7 +60,7 @@ session = None
 
 
 async def create_db_pool():
-    return await asyncpg.create_pool(dsn=DATABASE_URL)
+    return await asyncpg.create_pool(dsn=DATABASE_URL, max_inactive_connection_lifetime=60)
 
 
 @app.on_event("startup")
@@ -913,45 +913,45 @@ def filter_seed(data):
 #             print(f"An error occurred while uploading blob {blob_name}: {e}")
 
 
-async def delete_and_insert_image_metadata(image_details, blob_url, dsn, rating, uuid):
-    async with aioodbc.connect(dsn=dsn) as conn:
-        async with conn.cursor() as cursor:
-            # Check if the UUID already exists
-            check_query = "SELECT * FROM UserRatings WHERE FileName = ?"
-            await cursor.execute(check_query, (uuid,))
-            existing_record = await cursor.fetchone()
+# async def delete_and_insert_image_metadata(image_details, blob_url, dsn, rating, uuid):
+#     async with aioodbc.connect(dsn=dsn) as conn:
+#         async with conn.cursor() as cursor:
+#             # Check if the UUID already exists
+#             check_query = "SELECT * FROM UserRatings WHERE FileName = ?"
+#             await cursor.execute(check_query, (uuid,))
+#             existing_record = await cursor.fetchone()
 
-            if existing_record:
-                # If the UUID exists, delete the existing record
-                delete_query = "DELETE FROM UserRatings WHERE FileName = ?"
-                await cursor.execute(delete_query, (uuid,))
-                return "deleted"
+#             if existing_record:
+#                 # If the UUID exists, delete the existing record
+#                 delete_query = "DELETE FROM UserRatings WHERE FileName = ?"
+#                 await cursor.execute(delete_query, (uuid,))
+#                 return "deleted"
 
-            else:
-                # Insert a new record
-                insert_query = """
-                    INSERT INTO UserRatings (Prompt, NegativePrompt, Seed, CFG, FileName, RateDate, UserRating, JobType, AzureBlobURL)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """
-                file_name = uuid
-                rate_date = datetime.now()
-                await cursor.execute(
-                    insert_query,
-                    (
-                        image_details["prompt"],
-                        image_details["negative_prompt"],
-                        image_details["seed"],
-                        image_details["cfg"],
-                        file_name,
-                        rate_date,
-                        rating,
-                        image_details["job_type"],
-                        blob_url,
-                    ),
-                )
+#             else:
+#                 # Insert a new record
+#                 insert_query = """
+#                     INSERT INTO UserRatings (Prompt, NegativePrompt, Seed, CFG, FileName, RateDate, UserRating, JobType, AzureBlobURL)
+#                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+#                 """
+#                 file_name = uuid
+#                 rate_date = datetime.now()
+#                 await cursor.execute(
+#                     insert_query,
+#                     (
+#                         image_details["prompt"],
+#                         image_details["negative_prompt"],
+#                         image_details["seed"],
+#                         image_details["cfg"],
+#                         file_name,
+#                         rate_date,
+#                         rating,
+#                         image_details["job_type"],
+#                         blob_url,
+#                     ),
+#                 )
 
-                await conn.commit()
-                return "inserted"
+#                 await conn.commit()
+#                 return "inserted"
 
 
 @app.post("/rate_image/")
