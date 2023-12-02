@@ -6,12 +6,11 @@ python-dotenv
 gunicorn
 debugpy
 redis[hiredis]
-httpx[http2]
 aiohttp[speedups]
-aioodbc
 azure-storage-blob
 pywebpush
 numpy
 imagehash
 asyncpg
 websockets
+pyinstrument

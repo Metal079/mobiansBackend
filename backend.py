@@ -2,9 +2,7 @@ import os
 import io
 import base64
 import requests
-import time
 from typing import Optional, List, Dict
-import time
 import hashlib
 import logging
 import random
@@ -30,7 +28,14 @@ import numpy as np
 import imagehash
 import asyncpg
 
+# from pyinstrument import Profiler
+# from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+# from starlette.requests import Request
+# from starlette.responses import Response
+
 from helper_functions import *
+
+PROFILING = False  # Set this from a settings model
 
 logging.basicConfig(level=logging.ERROR)  # Configure logging
 
@@ -60,7 +65,9 @@ session = None
 
 
 async def create_db_pool():
-    return await asyncpg.create_pool(dsn=DATABASE_URL, max_inactive_connection_lifetime=60)
+    return await asyncpg.create_pool(
+        dsn=DATABASE_URL, max_inactive_connection_lifetime=30, max_size=30
+    )
 
 
 @app.on_event("startup")
@@ -98,6 +105,38 @@ async def shutdown_event():
     await app.state.db_pool.close()
 
 
+# profiler = Profiler(interval=0.001, async_mode="enabled")
+# profiler_running = False
+# last_profile_time = time.time()
+
+# # Middleware to profile requests every 5 minutes
+# class PyInstrumentMiddleWare(BaseHTTPMiddleware):
+#     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+#         global profiler_running
+#         global last_profile_time
+#         global profiler
+
+#         current_time = time.time()
+
+#         # Start profiler if not already running
+#         if not profiler_running:
+#             profiler_running = True
+#             last_profile_time = current_time
+#             profiler.start()
+
+#         response = await call_next(request)
+
+#         # Check if 5 minutes have elapsed to stop the profiler
+#         if current_time - last_profile_time > 30:  # 300 seconds = 5 minutes
+#             profiler_running = False
+#             profiler.stop()
+#             profiler.write_html("profile.html")
+#             profiler = Profiler(interval=0.001, async_mode="enabled")  # Reset profiler for next cycle
+#             last_profile_time = current_time
+
+#         return response
+
+
 async def get_connection():
     if not hasattr(app.state, "db_pool") or app.state.db_pool is None:
         logging.info("Attempting to create a new database pool.")
@@ -117,6 +156,9 @@ async def get_connection():
                 None  # Invalidate the pool so it will be recreated next time
             )
             yield None
+
+
+# app.add_middleware(PyInstrumentMiddleWare)
 
 
 # Set up the CORS middleware
@@ -292,11 +334,15 @@ async def submit_job(
     # Try using the requested API, if it fails, use the other one
     returned_data = None
     try:
-        async with session.post(f"http://{API_IP}/submit_job/", json=image_request_data.dict()) as resp:
+        async with session.post(
+            f"http://{API_IP}/submit_job/", json=image_request_data.dict()
+        ) as resp:
             returned_data = await resp.json()
     except:
         API_IP = await chooseAPI()  # Ensure chooseAPI is also async
-        async with session.post(f"http://{API_IP}/submit_job/", json=image_request_data.dict()) as resp:
+        async with session.post(
+            f"http://{API_IP}/submit_job/", json=image_request_data.dict()
+        ) as resp:
             returned_data = await resp.json()
 
     # attempts = 0
