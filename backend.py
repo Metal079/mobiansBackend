@@ -222,19 +222,24 @@ async def listen_for_queue_updates(uri, index):
                     # No need to sleep because you're waiting for messages from the server
         except Exception as e:
             print(f"Error connecting to WebSocket at {uri}: {e}")
+            global_queue[index] = 9999
             # If the connection fails, wait before trying to reconnect
             await asyncio.sleep(1)
 
 
 @app.post("/submit_job/")
 async def submit_job(
-    job_data: JobData, conn: Optional[asyncpg.Connection] = Depends(get_connection)
+    job_data: JobData,
+    background_tasks: BackgroundTasks,
+    conn: Optional[asyncpg.Connection] = Depends(get_connection),
 ):
     # Check if FastPassCode is valid and non-expired
     fast_pass_enabled = False
     if job_data.fast_pass_code:
         try:
-            is_valid = await validate_fastpass(job_data.fast_pass_code, conn)
+            is_valid = await validate_fastpass(
+                job_data.fast_pass_code, conn, background_tasks
+            )
             if is_valid:
                 fast_pass_enabled = True
             else:
@@ -242,10 +247,11 @@ async def submit_job(
                     status_code=400,
                     detail="Invalid or expired FastPassCode. Please fix/remove the FastPassCode and try again.",
                 )
-        except:
+        except Exception as e:
             logging.error(
                 "Error occurred while validating FastPassCode (DB might be down))"
             )
+            logging.error(str(e))
 
     # Filter out prompts
     job_data.prompt, job_data.negative_prompt = await promptFilter(job_data)
@@ -386,8 +392,19 @@ def decode_base64_to_image(base64_str):
     return image
 
 
+async def increment_fastpass_use_count(fast_pass_code: str, conn: asyncpg.Connection):
+    await conn.execute(
+        """
+        UPDATE fastpass
+        SET uses = uses + 1
+        WHERE fastpass_code = $1
+        """,
+        fast_pass_code,
+    )
+
+
 async def validate_fastpass(
-    fast_pass_code: str, conn: Optional[asyncpg.Connection] = Depends(get_connection)
+    fast_pass_code: str, conn: asyncpg.Connection, background_tasks: BackgroundTasks
 ) -> bool:
     row = await conn.fetchrow(
         """
@@ -403,10 +420,12 @@ async def validate_fastpass(
 
     expiration_date = row["expiration_date"]
     if expiration_date is None:
+        background_tasks.add_task(increment_fastpass_use_count, fast_pass_code, conn)
         return True
     elif expiration_date < datetime.now():
         return False
 
+    background_tasks.add_task(increment_fastpass_use_count, fast_pass_code, conn)
     return True
 
 
