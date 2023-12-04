@@ -66,7 +66,7 @@ session = None
 
 async def create_db_pool():
     return await asyncpg.create_pool(
-        dsn=DATABASE_URL, max_inactive_connection_lifetime=30, max_size=30
+        dsn=DATABASE_URL, max_inactive_connection_lifetime=15, max_size=50
     )
 
 
@@ -144,6 +144,9 @@ async def get_connection():
             app.state.db_pool = await create_db_pool()
         except Exception as e:
             logging.error(f"Failed to create a new database pool: {e}")
+            app.state.db_pool = (
+                None  # Invalidate the pool so it will be recreated next time
+            )
             yield None
 
     if hasattr(app.state, "db_pool") and app.state.db_pool is not None:
@@ -224,7 +227,7 @@ async def listen_for_queue_updates(uri, index):
             print(f"Error connecting to WebSocket at {uri}: {e}")
             global_queue[index] = 9999
             # If the connection fails, wait before trying to reconnect
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)
 
 
 @app.post("/submit_job/")
