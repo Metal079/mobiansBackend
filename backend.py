@@ -354,15 +354,6 @@ async def submit_job(
         ) as resp:
             returned_data = await resp.json()
 
-    # attempts = 0
-    # while response.status != 200 and attempts < 3:
-    #     API_IP = await chooseAPI()  # Ensure chooseAPI is also async
-    #     print(f"got error: {response.status} for submit_job, api: {API_IP}")
-    #     attempts += 1
-    #     async with session.post(f"http://{API_IP}/submit_job/", json=image_request_data.dict()) as resp:
-    #         returned_data = await resp.json()
-    #     await asyncio.sleep(1)
-
     # Get index of API_IP in API_IP_List
     for i in range(len(API_IP_List)):
         if API_IP_List[i] == API_IP:
@@ -496,9 +487,9 @@ async def get_job(
     background_tasks: BackgroundTasks,
     conn: Optional[asyncpg.Connection] = Depends(get_connection),
 ):
-    MAX_RETRIES = 3
+    MAX_RETRIES = 2
     MIN_DELAY = 1
-    MAX_DELAY = 60
+    MAX_DELAY = 3
 
     response = None
     for attempt in range(MAX_RETRIES):
@@ -635,21 +626,6 @@ async def call_api(api, session):
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         print(f"API {api} is down. Error: {str(e)}")
         return {"queue_length": 9999, "api": api}
-
-
-async def get_queue_length_via_websocket(api_url):
-    try:
-        # Replace "ws" with "wss" for secure WebSockets over TLS/SSL
-        async with websockets.connect(api_url) as websocket:
-            # You can send a message if needed, for example, to authenticate
-            # await websocket.send('some message')
-
-            # Wait for the server to send a message and parse it as JSON
-            message = await websocket.recv()
-            return json.loads(message)  # Assuming the server sends JSON
-    except Exception as e:
-        print(f"Error connecting to WebSocket at {api_url}: {e}")
-        return {"queue_length": 9999, "api": api_url}
 
 
 # Get the queue length of each API and choose the one with the shortest queue
@@ -962,97 +938,8 @@ def filter_seed(data):
     return seed
 
 
-# async def upload_blob(blob_service_client, container_name, blob_name, data):
-#     blob_client = blob_service_client.get_blob_client(container_name, blob_name)
-
-#     # Check if the blob exists
-#     if await blob_client.exists():
-#         try:
-#             # Delete the existing blob
-#             await blob_client.delete_blob()
-#         except Exception as e:
-#             print(f"An error occurred while deleting blob {blob_name}: {e}")
-#     else:
-#         try:
-#             # Upload the new blob
-#             await blob_client.upload_blob(data)
-#             return blob_client.url
-#         except Exception as e:
-#             print(f"An error occurred while uploading blob {blob_name}: {e}")
-
-
-# async def delete_and_insert_image_metadata(image_details, blob_url, dsn, rating, uuid):
-#     async with aioodbc.connect(dsn=dsn) as conn:
-#         async with conn.cursor() as cursor:
-#             # Check if the UUID already exists
-#             check_query = "SELECT * FROM UserRatings WHERE FileName = ?"
-#             await cursor.execute(check_query, (uuid,))
-#             existing_record = await cursor.fetchone()
-
-#             if existing_record:
-#                 # If the UUID exists, delete the existing record
-#                 delete_query = "DELETE FROM UserRatings WHERE FileName = ?"
-#                 await cursor.execute(delete_query, (uuid,))
-#                 return "deleted"
-
-#             else:
-#                 # Insert a new record
-#                 insert_query = """
-#                     INSERT INTO UserRatings (Prompt, NegativePrompt, Seed, CFG, FileName, RateDate, UserRating, JobType, AzureBlobURL)
-#                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-#                 """
-#                 file_name = uuid
-#                 rate_date = datetime.now()
-#                 await cursor.execute(
-#                     insert_query,
-#                     (
-#                         image_details["prompt"],
-#                         image_details["negative_prompt"],
-#                         image_details["seed"],
-#                         image_details["cfg"],
-#                         file_name,
-#                         rate_date,
-#                         rating,
-#                         image_details["job_type"],
-#                         blob_url,
-#                     ),
-#                 )
-
-#                 await conn.commit()
-#                 return "inserted"
-
-
 @app.post("/rate_image/")
 async def rate_image(job_data: JobData):
-    # # Decode base64 image and convert it to bytes
-    # try:
-    #     image_bytes = base64.b64decode(job_data.image.split(",", 1)[0])
-    # except:
-    #     image_bytes = base64.b64decode(job_data.image.split(",", 1)[1])
-
-    # image = Image.open(BytesIO(image_bytes))
-
-    # info = image.info
-
-    # # Get image metadata
-    # image_details = {}
-    # for key, value in info.items():
-    #     image_details[key] = value
-
-    # # Generate a random filename
-    # image_name = job_data.image_UUID
-
-    # # Upload to Azure Blob Storage
-    # container_name = "mobiansratings"
-    # blob_url = await upload_blob(
-    #     blob_service_client, container_name, image_name, image_bytes
-    # )
-
-    # # Insert image metadata into database
-    # db_status = await delete_and_insert_image_metadata(
-    #     image_details, blob_url, dsn, rating=job_data.rating, uuid=image_name
-    # )
-
     return JSONResponse({"message": f"we no longer use this"})
 
 
