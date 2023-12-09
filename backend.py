@@ -11,6 +11,7 @@ from datetime import datetime
 import json
 import re
 import websockets
+import time
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
@@ -26,7 +27,7 @@ from redis.exceptions import BusyLoadingError, ConnectionError, TimeoutError
 from pywebpush import webpush, WebPushException
 import numpy as np
 import imagehash
-import asyncpg
+import psycopg
 
 # from pyinstrument import Profiler
 # from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -37,7 +38,7 @@ from helper_functions import *
 
 PROFILING = False  # Set this from a settings model
 
-logging.basicConfig(level=logging.ERROR)  # Configure logging
+logging.basicConfig(level=logging.INFO)  # Configure logging
 
 # Run 3 retries with exponential backoff strategy
 retry = Retry(ExponentialBackoff(), 3)
@@ -50,7 +51,7 @@ DBUSER = os.environ.get("DBUSER")
 DBPASS = os.environ.get("DBPASS")
 
 # Define your connection parameters for PostgreSQL
-DATABASE_URL = f"postgresql://{DBUSER}:{DBPASS}@{DBHOST}/{DBNAME}"
+DSN = f"host={DBHOST} dbname='{DBNAME}' user={DBUSER} password={DBPASS}"
 
 API_IP_List = os.environ.get("API_IP_List").split(" ")
 
@@ -64,16 +65,16 @@ global_queue = {}  # This will store the latest queue information
 session = None
 
 
-async def create_db_pool():
-    return await asyncpg.create_pool(
-        dsn=DATABASE_URL, max_inactive_connection_lifetime=15, max_size=50
-    )
+# async def create_db_pool():
+#     return await asyncpg.create_pool(
+#         dsn=DATABASE_URL, max_inactive_connection_lifetime=15, max_size=50
+#     )
 
 
 @app.on_event("startup")
 async def startup_event():
     global session
-    global blob_service_client
+    # global blob_service_client
     global r
 
     session = aiohttp.ClientSession(trust_env=True)
@@ -89,10 +90,10 @@ async def startup_event():
     )  # , decode_responses=True
 
     # Create a connection pool
-    try:
-        app.state.db_pool = await create_db_pool()
-    except Exception as e:
-        logging.error(f"Failed to create a database pool at startup: {e}")
+    # try:
+    #     app.state.db_pool = await create_db_pool()
+    # except Exception as e:
+    #     logging.error(f"Failed to create a database pool at startup: {e}")
 
     for index, ip in enumerate(API_IP_List):
         ws_uri = f"ws://{ip}/ws/queue_length"
@@ -102,7 +103,7 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     await session.close()
-    await app.state.db_pool.close()
+    # await app.state.db_pool.close()
 
 
 # profiler = Profiler(interval=0.001, async_mode="enabled")
@@ -137,28 +138,28 @@ async def shutdown_event():
 #         return response
 
 
-async def get_connection():
-    if not hasattr(app.state, "db_pool") or app.state.db_pool is None:
-        logging.info("Attempting to create a new database pool.")
-        try:
-            app.state.db_pool = await create_db_pool()
-        except Exception as e:
-            logging.error(f"Failed to create a new database pool: {e}")
-            app.state.db_pool = (
-                None  # Invalidate the pool so it will be recreated next time
-            )
-            yield None
+# async def get_connection():
+#     if not hasattr(app.state, "db_pool") or app.state.db_pool is None:
+#         logging.info("Attempting to create a new database pool.")
+#         try:
+#             app.state.db_pool = await create_db_pool()
+#         except Exception as e:
+#             logging.error(f"Failed to create a new database pool: {e}")
+#             app.state.db_pool = (
+#                 None  # Invalidate the pool so it will be recreated next time
+#             )
+#             yield None
 
-    if hasattr(app.state, "db_pool") and app.state.db_pool is not None:
-        try:
-            async with app.state.db_pool.acquire() as connection:
-                yield connection
-        except Exception as e:
-            logging.error(f"Error acquiring connection from pool: {e}")
-            app.state.db_pool = (
-                None  # Invalidate the pool so it will be recreated next time
-            )
-            yield None
+#     if hasattr(app.state, "db_pool") and app.state.db_pool is not None:
+#         try:
+#             async with app.state.db_pool.acquire() as connection:
+#                 yield connection
+#         except Exception as e:
+#             logging.error(f"Error acquiring connection from pool: {e}")
+#             app.state.db_pool = (
+#                 None  # Invalidate the pool so it will be recreated next time
+#             )
+#             yield None
 
 
 # app.add_middleware(PyInstrumentMiddleWare)
@@ -227,21 +228,20 @@ async def listen_for_queue_updates(uri, index):
             print(f"Error connecting to WebSocket at {uri}: {e}")
             global_queue[index] = 9999
             # If the connection fails, wait before trying to reconnect
-            await asyncio.sleep(5)
+            await asyncio.sleep(1)
 
 
 @app.post("/submit_job/")
 async def submit_job(
     job_data: JobData,
     background_tasks: BackgroundTasks,
-    conn: Optional[asyncpg.Connection] = Depends(get_connection),
 ):
     # Check if FastPassCode is valid and non-expired
     fast_pass_enabled = False
     if job_data.fast_pass_code:
         try:
             is_valid = await validate_fastpass(
-                job_data.fast_pass_code, conn, background_tasks
+                job_data.fast_pass_code, background_tasks
             )
             if is_valid:
                 fast_pass_enabled = True
@@ -386,41 +386,75 @@ def decode_base64_to_image(base64_str):
     return image
 
 
-async def increment_fastpass_use_count(fast_pass_code: str, conn: asyncpg.Connection):
-    await conn.execute(
-        """
-        UPDATE fastpass
-        SET uses = uses + 1
-        WHERE fastpass_code = $1
-        """,
-        fast_pass_code,
-    )
+async def increment_fastpass_use_count(fast_pass_code: str):
+    # Time the function
+    start_time = time.time()
+    logging.info("Incrementing FastPassCode use count")
+
+    async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                UPDATE fastpass
+                SET uses = uses + 1
+                WHERE fastpass_code = %s
+                """,
+                (fast_pass_code,)
+            )
+
+
+    # Time the function
+    end_time = time.time()
+    logging.info("Time elapsed: " + str(end_time - start_time))
 
 
 async def validate_fastpass(
-    fast_pass_code: str, conn: asyncpg.Connection, background_tasks: BackgroundTasks
+    fast_pass_code: str, background_tasks: BackgroundTasks
 ) -> bool:
-    row = await conn.fetchrow(
-        """
-        SELECT expiration_date
-        FROM fastpass
-        WHERE fastpass_code = $1
-        """,
-        fast_pass_code,
-    )
+    # Time the function
+    start_time = time.time()
+    logging.info("Validating FastPassCode")
 
-    if not row:
-        return False
+    async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT expiration_date
+                FROM fastpass
+                WHERE fastpass_code = %s
+                """,
+                (fast_pass_code,)
+            )
 
-    expiration_date = row["expiration_date"]
-    if expiration_date is None:
-        background_tasks.add_task(increment_fastpass_use_count, fast_pass_code, conn)
-        return True
-    elif expiration_date < datetime.now():
-        return False
+            row = await acur.fetchone()
 
-    background_tasks.add_task(increment_fastpass_use_count, fast_pass_code, conn)
-    return True
+            if not row:
+                return False
+
+            expiration_date = row[0]
+            if expiration_date is None:
+                background_tasks.add_task(
+                    increment_fastpass_use_count, fast_pass_code
+                )
+                # Time the function
+                end_time = time.time()
+                logging.info("Time elapsed: " + str(end_time - start_time))
+
+                return True
+            elif expiration_date < datetime.now():
+                # Time the function
+                end_time = time.time()
+                logging.info("Time elapsed: " + str(end_time - start_time))
+
+                return False
+
+            background_tasks.add_task(increment_fastpass_use_count, fast_pass_code)
+
+            # Time the function
+            end_time = time.time()
+            logging.info("Time elapsed: " + str(end_time - start_time))
+
+            return True
 
 
 class GetJobData(BaseModel):
@@ -441,7 +475,7 @@ async def call_get_job(job_id: str, API_IP: str):
 
 
 async def insert_image_hashes(
-    image_hashes, metadata, job_data, conn: asyncpg.Connection = Depends(get_connection)
+    image_hashes, metadata, job_data
 ):
     async with conn.transaction():  # Start a transaction
         insert_query = """
@@ -485,7 +519,6 @@ async def process_images_and_store_hashes(image_results, metadata, job_data, con
 async def get_job(
     job_data: GetJobData,
     background_tasks: BackgroundTasks,
-    conn: Optional[asyncpg.Connection] = Depends(get_connection),
 ):
     MAX_RETRIES = 2
     MIN_DELAY = 1
@@ -630,14 +663,20 @@ async def call_api(api, session):
 
 # Get the queue length of each API and choose the one with the shortest queue
 async def chooseAPI():
-    lowest_queue = {None: 9999}
-    current_key = None
-    for api in global_queue:
-        if global_queue[api] < lowest_queue[current_key]:
-            lowest_queue = {api: global_queue[api]}
-            current_key = api
+    lowest_queue = 9999
+    selected_api = None
 
-    return API_IP_List[list(lowest_queue.keys())[0]]
+    for index, api in enumerate(API_IP_List):
+        queue_length = global_queue.get(index, 9999)  # Default to 9999 if API is not in global_queue
+        if queue_length < lowest_queue:
+            lowest_queue = queue_length
+            selected_api = api
+
+    if selected_api is None:
+        raise ValueError("No valid API IP found")
+
+    return selected_api
+
 
 
 def enhanced_filter(prompt, pattern, replacement):
