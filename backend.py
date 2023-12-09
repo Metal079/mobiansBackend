@@ -558,10 +558,10 @@ async def get_job(
                     retry_info = JobRetryInfo(
                         job_id=job_data.job_id, indexes=corrupted_indexes
                     )
-                    requests.get(
-                        url=f"http://{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}",
-                        json=retry_info.dict(),
-                    )
+                    # requests.get(
+                    #     url=f"http://{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}",
+                    #     json=retry_info.dict(),
+                    # )
 
                 # Second pass: Fetch images, re-attempting if necessary
                 attempts = 0
@@ -601,11 +601,11 @@ async def get_job(
                     else:
                         attempts += 1
 
-                # Generate hashes for each image and store them in DB along with image info
-                # Pass the results for images and other necessary data to the background task
-                background_tasks.add_task(
-                    process_images_and_store_hashes, results, metadata, job_data, conn
-                )
+                # # Generate hashes for each image and store them in DB along with image info
+                # # Pass the results for images and other necessary data to the background task
+                # background_tasks.add_task(
+                #     process_images_and_store_hashes, results, metadata, job_data, conn
+                # )
 
                 return JSONResponse(content=finished_response)
 
