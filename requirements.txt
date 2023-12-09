@@ -13,5 +13,4 @@ numpy
 imagehash
 asyncpg
 websockets
-pyinstrument
 psycopg[binary]
