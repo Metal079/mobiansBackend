@@ -228,7 +228,7 @@ async def listen_for_queue_updates(uri, index):
             print(f"Error connecting to WebSocket at {uri}: {e}")
             global_queue[index] = 9999
             # If the connection fails, wait before trying to reconnect
-            await asyncio.sleep(1)
+            await asyncio.sleep(3)
 
 
 @app.post("/submit_job/")
@@ -399,9 +399,8 @@ async def increment_fastpass_use_count(fast_pass_code: str):
                 SET uses = uses + 1
                 WHERE fastpass_code = %s
                 """,
-                (fast_pass_code,)
+                (fast_pass_code,),
             )
-
 
     # Time the function
     end_time = time.time()
@@ -423,7 +422,7 @@ async def validate_fastpass(
                 FROM fastpass
                 WHERE fastpass_code = %s
                 """,
-                (fast_pass_code,)
+                (fast_pass_code,),
             )
 
             row = await acur.fetchone()
@@ -433,9 +432,7 @@ async def validate_fastpass(
 
             expiration_date = row[0]
             if expiration_date is None:
-                background_tasks.add_task(
-                    increment_fastpass_use_count, fast_pass_code
-                )
+                background_tasks.add_task(increment_fastpass_use_count, fast_pass_code)
                 # Time the function
                 end_time = time.time()
                 logging.info("Time elapsed: " + str(end_time - start_time))
@@ -474,32 +471,34 @@ async def call_get_job(job_id: str, API_IP: str):
         return await response.json()
 
 
-async def insert_image_hashes(
-    image_hashes, metadata, job_data
-):
-    async with conn.transaction():  # Start a transaction
-        insert_query = """
-            INSERT INTO ImageHashes (hash, prompt, negative_prompt, seed, cfg, model, created_date)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-        """
-        values = [
-            (
-                image_hashes[i],
-                metadata.prompt,
-                metadata.negative_prompt,
-                metadata.seed,
-                metadata.guidance_scale,
-                "Sonic DiffusionV4",
-                datetime.now(),
-            )
-            for i in range(4)
-        ]
+async def insert_image_hashes(image_hashes, metadata, job_data):
+    logging.info("Inserting image hashes")
 
-        # Use executemany to insert multiple records
-        await conn.executemany(insert_query, values)
+    insert_query = """
+        INSERT INTO ImageHashes (hash, prompt, negative_prompt, seed, cfg, model, created_date)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    values = [
+        (
+            image_hashes[i],
+            metadata.prompt,
+            metadata.negative_prompt,
+            metadata.seed,
+            metadata.guidance_scale,
+            "Sonic DiffusionV4",
+            datetime.now(),
+        )
+        for i in range(4)
+    ]
+
+    async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+        async with aconn.cursor() as acur:
+            # Use executemany to insert multiple records
+            await acur.executemany(insert_query, values)
+            await aconn.commit()  # Commit the transaction
 
 
-async def process_images_and_store_hashes(image_results, metadata, job_data, conn):
+async def process_images_and_store_hashes(image_results, metadata, job_data):
     image_hashes = []
     for i in range(4):
         image = Image.open(io.BytesIO(image_results[2 * i]))
@@ -507,7 +506,7 @@ async def process_images_and_store_hashes(image_results, metadata, job_data, con
         image_hashes.append(str(image_hash))
 
     try:
-        await insert_image_hashes(image_hashes, metadata, job_data, conn)
+        await insert_image_hashes(image_hashes, metadata, job_data)
     except Exception as e:
         logging.error(
             f"Error occurred while inserting image hash info into DB, JOB: {job_data.job_id}"
@@ -634,11 +633,11 @@ async def get_job(
                     else:
                         attempts += 1
 
-                # # Generate hashes for each image and store them in DB along with image info
-                # # Pass the results for images and other necessary data to the background task
-                # background_tasks.add_task(
-                #     process_images_and_store_hashes, results, metadata, job_data, conn
-                # )
+                # Generate hashes for each image and store them in DB along with image info
+                # Pass the results for images and other necessary data to the background task
+                background_tasks.add_task(
+                    process_images_and_store_hashes, results, metadata, job_data
+                )
 
                 return JSONResponse(content=finished_response)
 
@@ -667,7 +666,9 @@ async def chooseAPI():
     selected_api = None
 
     for index, api in enumerate(API_IP_List):
-        queue_length = global_queue.get(index, 9999)  # Default to 9999 if API is not in global_queue
+        queue_length = global_queue.get(
+            index, 9999
+        )  # Default to 9999 if API is not in global_queue
         if queue_length < lowest_queue:
             lowest_queue = queue_length
             selected_api = api
@@ -676,7 +677,6 @@ async def chooseAPI():
         raise ValueError("No valid API IP found")
 
     return selected_api
-
 
 
 def enhanced_filter(prompt, pattern, replacement):
