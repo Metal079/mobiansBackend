@@ -502,7 +502,7 @@ async def process_images_and_store_hashes(image_results, metadata, job_data):
     image_hashes = []
     for i in range(4):
         image = Image.open(io.BytesIO(image_results[2 * i]))
-        image_hash = imagehash.phash_simple(image, 10)
+        image_hash = imagehash.average_hash(image, 8)
         image_hashes.append(str(image_hash))
 
     try:
