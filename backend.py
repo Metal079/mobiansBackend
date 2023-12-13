@@ -38,7 +38,7 @@ from helper_functions import *
 
 PROFILING = False  # Set this from a settings model
 
-logging.basicConfig(level=logging.INFO)  # Configure logging
+logging.basicConfig(level=logging.ERROR)  # Configure logging
 
 # Run 3 retries with exponential backoff strategy
 retry = Retry(ExponentialBackoff(), 3)
@@ -222,7 +222,7 @@ async def listen_for_queue_updates(uri, index):
                     queue_info = json.loads(message)
                     global_queue[index] = queue_info["queue_length"]
                     # Here, you would handle the received message
-                    print(f"Queue Update for {uri}: {global_queue}")
+                    # print(f"Queue Update for {uri}: {global_queue}")
                     # No need to sleep because you're waiting for messages from the server
         except Exception as e:
             print(f"Error connecting to WebSocket at {uri}: {e}")
@@ -502,7 +502,7 @@ async def process_images_and_store_hashes(image_results, metadata, job_data):
     image_hashes = []
     for i in range(4):
         image = Image.open(io.BytesIO(image_results[2 * i]))
-        image_hash = imagehash.phash(image, 16)
+        image_hash = imagehash.phash(image, 10)
         image_hashes.append(str(image_hash))
 
     try:
