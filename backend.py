@@ -266,8 +266,8 @@ async def submit_job(
     if job_data.job_type == "img2img" or job_data.job_type == "inpainting" or job_data.job_type == "upscale":
         def upscale(image):
                     width, height = image.size
-                    new_width = int(width * 1.5)
-                    new_height = int(height * 1.5)
+                    new_width = int(width * 1.75)
+                    new_height = int(height * 1.75)
                     return image.resize((new_width, new_height), Image.BICUBIC)
 
         # Convert base64 string to image to remove alpha channel if needed
