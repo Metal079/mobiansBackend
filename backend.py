@@ -263,9 +263,19 @@ async def submit_job(
     API_IP = await chooseAPI()
 
     # Do img2img filtering if it's an img2img request
-    if job_data.job_type == "img2img" or job_data.job_type == "inpainting":
+    if job_data.job_type == "img2img" or job_data.job_type == "inpainting" or job_data.job_type == "upscale":
+        def upscale(image):
+                    width, height = image.size
+                    new_width = int(width * 1.5)
+                    new_height = int(height * 1.5)
+                    return image.resize((new_width, new_height), Image.BICUBIC)
+
         # Convert base64 string to image to remove alpha channel if needed
         job_data.image = decode_base64_to_image(job_data.image)
+        # Upscale if job_type is upscale
+        if job_data.job_type == "upscale":
+            job_data.image = upscale(job_data.image)
+
         job_data.image = job_data.image.convert("RGBA")
 
         # Do the same for mask image
@@ -549,104 +559,115 @@ async def get_job(
                 )
                 await asyncio.sleep(sleep_time)
 
+    error_flag = False
     try:
         if response["status"] == "completed":
-            async with r.pipeline() as pipe:
-                # Fetch images from Redis
-                finished_response = {"status": "completed", "result": []}
-                metadata_json = await r.get(
-                    f"job:{job_data.job_id}:metadata"
-                )  # Changed to async
-                metadata = JobData.parse_raw(metadata_json)
-
-                # First pass: Identify corrupted images
-                image_keys = [f"job:{job_data.job_id}:image:{i}" for i in range(4)]
-                checksum_keys = [
-                    f"job:{job_data.job_id}:image:{i}:checksum" for i in range(4)
-                ]
-
-                # Fetch images and checksums
-                for i in range(4):
-                    pipe.get(image_keys[i])
-                    pipe.get(checksum_keys[i])
-                results = await pipe.execute()
-
-                # Check for corrupted images
-                corrupted_indexes = []
-                for i in range(4):
-                    image_bytes = results[2 * i]
-                    fetched_checksum = results[2 * i + 1]
-
-                    if image_bytes is not None and fetched_checksum is not None:
-                        computed_checksum = hashlib.sha256(image_bytes).hexdigest()
-                        if fetched_checksum.decode() != computed_checksum:
-                            corrupted_indexes.append(i)
-
-                # If there are corrupted images, resend them
-                if corrupted_indexes:
-                    logging.info(
-                        f"Corrupted images detected for job {job_data.job_id}, resending corrupted images"
-                    )
-                    retry_info = JobRetryInfo(
-                        job_id=job_data.job_id, indexes=corrupted_indexes
-                    )
-                    # requests.get(
-                    #     url=f"http://{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}",
-                    #     json=retry_info.dict(),
-                    # )
-
-                # Second pass: Fetch images, re-attempting if necessary
-                attempts = 0
-                while attempts < 2:
-                    # Fetch images and checksums if corrupted images were detected
-                    if corrupted_indexes:
-                        for i in range(4):
-                            pipe.get(image_keys[i])
-                            pipe.get(checksum_keys[i])
-                        results = await pipe.execute()
-
-                    # Watermark images or error if corrupted images are still detected
-                    for i in range(4):
-                        image_bytes = results[2 * i]
-                        fetched_checksum = results[2 * i + 1]
-
-                        if image_bytes is not None and fetched_checksum is not None:
-                            computed_checksum = hashlib.sha256(image_bytes).hexdigest()
-                            if fetched_checksum.decode() == computed_checksum:
-                                image = Image.open(io.BytesIO(image_bytes))
-
-                                # Add watermark and metadata
-                                watermarked_image = add_watermark(image.convert("RGB"))
-                                watermarked_image_base64 = add_image_metadata(
-                                    watermarked_image, metadata
-                                )
-                                finished_response["result"].append(
-                                    watermarked_image_base64
-                                )
-                        else:
-                            logging.error(
-                                f"Corrupted image STILL detected for job {job_data.job_id}"
-                            )
-
-                    if len(finished_response["result"]) == 4:
-                        break
-                    else:
-                        attempts += 1
-
-                # Generate hashes for each image and store them in DB along with image info
-                # Pass the results for images and other necessary data to the background task
-                background_tasks.add_task(
-                    process_images_and_store_hashes, results, metadata, job_data
-                )
-
-                return JSONResponse(content=finished_response)
+            return await retrieve_finished_job(job_data, background_tasks)
 
     except Exception as e:
         logging.error(f"response: {response}")
         logging.error(f"Exception: {e}")
         logging.error(f"Exception happened on get_job")
+        error_flag = True
+
+    #  Try to get the images again if theres an exception
+    if error_flag:
+        try:
+            return await retrieve_finished_job(job_data, background_tasks)
+        except Exception as e:
+            logging.error(f"Exception: {e}")
+            logging.error(f"Exception happened on retrieve_finished_job")
 
     return JSONResponse(content=response)
+
+
+async def retrieve_finished_job(
+    job_data: GetJobData,
+    background_tasks: BackgroundTasks,
+):
+    async with r.pipeline() as pipe:
+        # Fetch images from Redis
+        finished_response = {"status": "completed", "result": []}
+        metadata_json = await r.get(
+            f"job:{job_data.job_id}:metadata"
+        )  # Changed to async
+        metadata = JobData.parse_raw(metadata_json)
+
+        # First pass: Identify corrupted images
+        image_keys = [f"job:{job_data.job_id}:image:{i}" for i in range(4)]
+        checksum_keys = [f"job:{job_data.job_id}:image:{i}:checksum" for i in range(4)]
+
+        # Fetch images and checksums
+        for i in range(4):
+            pipe.get(image_keys[i])
+            pipe.get(checksum_keys[i])
+        results = await pipe.execute()
+
+        # Check for corrupted images
+        corrupted_indexes = []
+        for i in range(4):
+            image_bytes = results[2 * i]
+            fetched_checksum = results[2 * i + 1]
+
+            if image_bytes is not None and fetched_checksum is not None:
+                computed_checksum = hashlib.sha256(image_bytes).hexdigest()
+                if fetched_checksum.decode() != computed_checksum:
+                    corrupted_indexes.append(i)
+
+        # If there are corrupted images, resend them
+        if corrupted_indexes:
+            logging.info(
+                f"Corrupted images detected for job {job_data.job_id}, resending corrupted images"
+            )
+            retry_info = JobRetryInfo(job_id=job_data.job_id, indexes=corrupted_indexes)
+            # requests.get(
+            #     url=f"http://{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}",
+            #     json=retry_info.dict(),
+            # )
+
+        # Second pass: Fetch images, re-attempting if necessary
+        attempts = 0
+        while attempts < 2:
+            # Fetch images and checksums if corrupted images were detected
+            if corrupted_indexes:
+                for i in range(4):
+                    pipe.get(image_keys[i])
+                    pipe.get(checksum_keys[i])
+                results = await pipe.execute()
+
+            # Watermark images or error if corrupted images are still detected
+            for i in range(4):
+                image_bytes = results[2 * i]
+                fetched_checksum = results[2 * i + 1]
+
+                if image_bytes is not None and fetched_checksum is not None:
+                    computed_checksum = hashlib.sha256(image_bytes).hexdigest()
+                    if fetched_checksum.decode() == computed_checksum:
+                        image = Image.open(io.BytesIO(image_bytes))
+
+                        # Add watermark and metadata
+                        watermarked_image = add_watermark(image.convert("RGB"))
+                        watermarked_image_base64 = add_image_metadata(
+                            watermarked_image, metadata
+                        )
+                        finished_response["result"].append(watermarked_image_base64)
+                else:
+                    logging.error(
+                        f"Corrupted image STILL detected for job {job_data.job_id}"
+                    )
+
+            if len(finished_response["result"]) == 4:
+                break
+            else:
+                attempts += 1
+
+        # Generate hashes for each image and store them in DB along with image info
+        # Pass the results for images and other necessary data to the background task
+        background_tasks.add_task(
+            process_images_and_store_hashes, results, metadata, job_data
+        )
+
+        return JSONResponse(content=finished_response)
 
 
 async def call_api(api, session):
@@ -1024,3 +1045,91 @@ async def send_notification(user_id: str):  # Change the type to str
         return {"status": "failed", "detail": repr(e)}
 
     return {"status": "sent"}
+
+
+class DiscordAuthCode(BaseModel):
+    code: str
+
+
+@app.post("/discord_auth/")
+async def discord_auth(auth_code: DiscordAuthCode):
+    discord_token_url = "https://discord.com/api/oauth2/token"
+    client_id = os.environ.get("DISCORD_CLIENT_ID")
+    client_secret = os.environ.get("DISCORD_CLIENT_SECRET")
+    redirect_uri = os.environ.get("DISCORD_REDIRECT_URI")
+
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "authorization_code",
+        "code": auth_code.code,
+        "redirect_uri": redirect_uri,
+    }
+
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    async with session.post(discord_token_url, data=data, headers=headers) as resp:
+        if resp.status != 200:
+            raise HTTPException(
+                status_code=resp.status, detail="Error in Discord token exchange"
+            )
+        token_data = await resp.json()
+
+        access_token = token_data.get("access_token")
+
+    discord_guilds_url = "https://discord.com/api/users/@me/guilds"
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    async with session.get(discord_guilds_url, headers=headers) as guild_resp:
+        if guild_resp.status != 200:
+            raise HTTPException(
+                status_code=guild_resp.status,
+                detail="Error fetching user guilds from Discord",
+            )
+        guilds = await guild_resp.json()
+
+    # Fetch the authenticated user's information
+    access_token = token_data.get("access_token")
+    discord_user_url = "https://discord.com/api/users/@me"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    async with session.get(discord_user_url, headers=headers) as user_resp:
+        if user_resp.status != 200:
+            raise HTTPException(
+                status_code=user_resp.status,
+                detail="Error fetching user data from Discord",
+            )
+        user_data = await user_resp.json()
+        user_id = user_data["id"]  # Get the user's ID
+
+    your_guild_id = "1095514548112461924"  # Replace with your Discord server's ID
+    is_member_of_your_guild = any(guild["id"] == your_guild_id for guild in guilds)
+    role_ids_to_check = [
+        "1097363688995962982",
+        "1106031487159128116",
+        "1100272052008652922",
+    ]
+
+    has_required_role = False  # Replace with your role checking logic
+    bot_ip = os.environ.get("DISCORD_BOT_IP")
+    # Now make the request to your bot's /check_role endpoint
+    async with session.post(
+        f"http://{bot_ip}:6965/check_role",
+        json={
+            "guild_id": your_guild_id,
+            "user_id": user_id,
+            "role_ids": role_ids_to_check,
+        },
+        headers={"Authorization": "YourSecretToken"},
+    ) as response:
+        if response.status != 200:
+            raise HTTPException(
+                status_code=response.status, detail="Error communicating with the bot"
+            )
+        data = await response.json()
+        has_required_role = data["has_role"]
+
+    return {
+        "status": "success",
+        "is_member_of_your_guild": is_member_of_your_guild,
+        "has_required_role": has_required_role,
+    }
