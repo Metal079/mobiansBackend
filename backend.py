@@ -747,25 +747,25 @@ async def promptFilter(data):
         for misspelling in misspellings:
             prompt = enhanced_filter(prompt, re.escape(misspelling), correct)
 
-    # If above is in prompt we grab artist list from DB and remove them if they were in the prompt
-    artist_list = []
-    try:
-        # Connect to the database
-        async with await psycopg.AsyncConnection.connect(DSN) as aconn:
-            async with aconn.cursor() as acur:
-                # Execute the query
-                await acur.execute("SELECT Artist FROM excluded_artist")
-                rows = await acur.fetchall()
+    # # If above is in prompt we grab artist list from DB and remove them if they were in the prompt
+    # artist_list = []
+    # try:
+    #     # Connect to the database
+    #     async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+    #         async with aconn.cursor() as acur:
+    #             # Execute the query
+    #             await acur.execute("SELECT Artist FROM excluded_artist")
+    #             rows = await acur.fetchall()
 
-                # Build the artist list
-                artist_list = [row[0] for row in rows]
+    #             # Build the artist list
+    #             artist_list = [row[0] for row in rows]
 
-        # Check and remove any filtered phrases from the prompt
-        for phrase in artist_list:
-            prompt = prompt.replace(phrase, "")
+    #     # Check and remove any filtered phrases from the prompt
+    #     for phrase in artist_list:
+    #         prompt = prompt.replace(phrase, "")
 
-    except Exception as e:
-        print(f"Database error encountered: {e}")
+    # except Exception as e:
+    #     print(f"Database error encountered: {e}")
 
     character_list = [
         "cream the rabbit",
