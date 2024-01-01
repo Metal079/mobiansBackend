@@ -663,9 +663,9 @@ async def retrieve_finished_job(
 
         # Generate hashes for each image and store them in DB along with image info
         # Pass the results for images and other necessary data to the background task
-        background_tasks.add_task(
-            process_images_and_store_hashes, results, metadata, job_data
-        )
+        # background_tasks.add_task(
+        #     process_images_and_store_hashes, results, metadata, job_data
+        # )
 
         return JSONResponse(content=finished_response)
 
