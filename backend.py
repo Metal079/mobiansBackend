@@ -1,7 +1,6 @@
 import os
 import io
 import base64
-import requests
 from typing import Optional, List, Dict
 import hashlib
 import logging
@@ -14,7 +13,7 @@ import websockets
 import time
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
@@ -28,11 +27,6 @@ from pywebpush import webpush, WebPushException
 import numpy as np
 import imagehash
 import psycopg
-
-# from pyinstrument import Profiler
-# from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-# from starlette.requests import Request
-# from starlette.responses import Response
 
 from helper_functions import *
 
@@ -65,12 +59,6 @@ global_queue = {}  # This will store the latest queue information
 session = None
 
 
-# async def create_db_pool():
-#     return await asyncpg.create_pool(
-#         dsn=DATABASE_URL, max_inactive_connection_lifetime=15, max_size=50
-#     )
-
-
 @app.on_event("startup")
 async def startup_event():
     global session
@@ -78,9 +66,6 @@ async def startup_event():
     global r
 
     session = aiohttp.ClientSession(trust_env=True)
-    # blob_service_client = BlobServiceClient.from_connection_string(
-    #     os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-    # )
     r = Redis(
         host=REDISHOST,
         port=6379,
@@ -88,12 +73,6 @@ async def startup_event():
         retry=retry,
         retry_on_error=[BusyLoadingError, ConnectionError, TimeoutError],
     )  # , decode_responses=True
-
-    # Create a connection pool
-    # try:
-    #     app.state.db_pool = await create_db_pool()
-    # except Exception as e:
-    #     logging.error(f"Failed to create a database pool at startup: {e}")
 
     for index, ip in enumerate(API_IP_List):
         ws_uri = f"ws://{ip}/ws/queue_length"
@@ -104,65 +83,6 @@ async def startup_event():
 async def shutdown_event():
     await session.close()
     # await app.state.db_pool.close()
-
-
-# profiler = Profiler(interval=0.001, async_mode="enabled")
-# profiler_running = False
-# last_profile_time = time.time()
-
-# # Middleware to profile requests every 5 minutes
-# class PyInstrumentMiddleWare(BaseHTTPMiddleware):
-#     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-#         global profiler_running
-#         global last_profile_time
-#         global profiler
-
-#         current_time = time.time()
-
-#         # Start profiler if not already running
-#         if not profiler_running:
-#             profiler_running = True
-#             last_profile_time = current_time
-#             profiler.start()
-
-#         response = await call_next(request)
-
-#         # Check if 5 minutes have elapsed to stop the profiler
-#         if current_time - last_profile_time > 30:  # 300 seconds = 5 minutes
-#             profiler_running = False
-#             profiler.stop()
-#             profiler.write_html("profile.html")
-#             profiler = Profiler(interval=0.001, async_mode="enabled")  # Reset profiler for next cycle
-#             last_profile_time = current_time
-
-#         return response
-
-
-# async def get_connection():
-#     if not hasattr(app.state, "db_pool") or app.state.db_pool is None:
-#         logging.info("Attempting to create a new database pool.")
-#         try:
-#             app.state.db_pool = await create_db_pool()
-#         except Exception as e:
-#             logging.error(f"Failed to create a new database pool: {e}")
-#             app.state.db_pool = (
-#                 None  # Invalidate the pool so it will be recreated next time
-#             )
-#             yield None
-
-#     if hasattr(app.state, "db_pool") and app.state.db_pool is not None:
-#         try:
-#             async with app.state.db_pool.acquire() as connection:
-#                 yield connection
-#         except Exception as e:
-#             logging.error(f"Error acquiring connection from pool: {e}")
-#             app.state.db_pool = (
-#                 None  # Invalidate the pool so it will be recreated next time
-#             )
-#             yield None
-
-
-# app.add_middleware(PyInstrumentMiddleWare)
 
 
 # Set up the CORS middleware
@@ -225,7 +145,7 @@ async def listen_for_queue_updates(uri, index):
                     # print(f"Queue Update for {uri}: {global_queue}")
                     # No need to sleep because you're waiting for messages from the server
         except Exception as e:
-            print(f"Error connecting to WebSocket at {uri}: {e}")
+            # print(f"Error connecting to WebSocket at {uri}: {e}")
             global_queue[index] = 9999
             # If the connection fails, wait before trying to reconnect
             await asyncio.sleep(3)
@@ -263,12 +183,17 @@ async def submit_job(
     API_IP = await chooseAPI()
 
     # Do img2img filtering if it's an img2img request
-    if job_data.job_type == "img2img" or job_data.job_type == "inpainting" or job_data.job_type == "upscale":
+    if (
+        job_data.job_type == "img2img"
+        or job_data.job_type == "inpainting"
+        or job_data.job_type == "upscale"
+    ):
+
         def upscale(image):
-                    width, height = image.size
-                    new_width = int(width * 1.75)
-                    new_height = int(height * 1.75)
-                    return image.resize((new_width, new_height), Image.BICUBIC)
+            width, height = image.size
+            new_width = int(width * 2)
+            new_height = int(height * 2)
+            return image.resize((new_width, new_height), Image.LANCZOS)
 
         # Convert base64 string to image to remove alpha channel if needed
         job_data.image = decode_base64_to_image(job_data.image)
@@ -670,17 +595,6 @@ async def retrieve_finished_job(
         return JSONResponse(content=finished_response)
 
 
-async def call_api(api, session):
-    try:
-        async with session.get(
-            url=f"{api}/get_queue_length/", timeout=5, ssl=False
-        ) as response:
-            return await response.json()
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        print(f"API {api} is down. Error: {str(e)}")
-        return {"queue_length": 9999, "api": api}
-
-
 # Get the queue length of each API and choose the one with the shortest queue
 async def chooseAPI():
     lowest_queue = 9999
@@ -760,9 +674,31 @@ async def promptFilter(data):
                 # Build the artist list
                 artist_list = [row[0] for row in rows]
 
+        # Convert the entire prompt to lowercase
+        lowercase_prompt = prompt.lower()
+
         # Check and remove any filtered phrases from the prompt
         for phrase in artist_list:
-            prompt = prompt.replace(phrase, "")
+            # Convert the phrase to lowercase
+            lowercase_phrase = phrase.lower()
+
+            # Replace the lowercase phrase in the lowercase prompt
+            lowercase_prompt = lowercase_prompt.replace(lowercase_phrase, "")
+
+        # Reconstruct the original case structure of the prompt
+        # by iterating over the original prompt and the lowercase prompt
+        final_prompt = ""
+        for orig_char, lower_char in zip(prompt, lowercase_prompt):
+            if lower_char == " " and orig_char != " ":
+                # If a character is replaced by space, keep the space
+                final_prompt += " "
+            else:
+                # Otherwise, use the original character
+                final_prompt += orig_char
+
+        # Now final_prompt contains the modified prompt with original case structure
+        prompt = final_prompt
+
 
     except Exception as e:
         print(f"Database error encountered: {e}")
