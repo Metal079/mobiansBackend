@@ -1060,3 +1060,8 @@ async def discord_auth(auth_code: DiscordAuthCode):
         "is_member_of_your_guild": is_member_of_your_guild,
         "has_required_role": has_required_role,
     }
+
+# Azure health check, return 200
+@app.get("/health_check")
+async def health_check():
+    return {"status": 200}
