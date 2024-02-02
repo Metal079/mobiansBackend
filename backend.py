@@ -178,7 +178,7 @@ async def submit_job(
 
     # Filter out prompts
     job_data.prompt, job_data.negative_prompt = await promptFilter(job_data)
-    job_data.negative_prompt = fortify_default_negative(job_data.negative_prompt)
+    job_data.negative_prompt = await fortify_default_negative(job_data.negative_prompt)
 
     API_IP = await chooseAPI()
 
@@ -247,9 +247,9 @@ async def submit_job(
             job_data.mask_image = Image.fromarray(mask_array, "RGBA")
 
         # Remove alpha channel from image and mask image
-        job_data.image = remove_alpha_channel(job_data.image)
+        job_data.image = await remove_alpha_channel(job_data.image)
         if job_data.mask_image:
-            job_data.mask_image = remove_alpha_channel(job_data.mask_image)
+            job_data.mask_image = await remove_alpha_channel(job_data.mask_image)
 
         # Save resized image to a BytesIO object
         buffer = io.BytesIO()
@@ -571,8 +571,8 @@ async def retrieve_finished_job(
                         image = Image.open(io.BytesIO(image_bytes))
 
                         # Add watermark and metadata
-                        watermarked_image = add_watermark(image.convert("RGB"))
-                        watermarked_image_base64 = add_image_metadata(
+                        watermarked_image = await add_watermark(image.convert("RGB"))
+                        watermarked_image_base64 = await add_image_metadata(
                             watermarked_image, metadata
                         )
                         finished_response["result"].append(watermarked_image_base64)
@@ -614,7 +614,7 @@ async def chooseAPI():
     return selected_api
 
 
-def enhanced_filter(prompt, pattern, replacement):
+async def enhanced_filter(prompt, pattern, replacement):
     # Replace spaces with \W+ to match any non-word characters between the words
     pattern = re.sub(r" ", r"\\W+", pattern)
     return re.sub(r"(?i)\b" + pattern + r"\b", replacement, prompt)
@@ -659,7 +659,7 @@ async def promptFilter(data):
     # Update any above misspellings in the prompt with correct spelling
     for correct, misspellings in corrections.items():
         for misspelling in misspellings:
-            prompt = enhanced_filter(prompt, re.escape(misspelling), correct)
+            prompt = await enhanced_filter(prompt, re.escape(misspelling), correct)
 
     # # If above is in prompt we grab artist list from DB and remove them if they were in the prompt
     artist_list = []
@@ -918,24 +918,11 @@ async def promptFilter(data):
     return prompt, negative_prompt
 
 
-def fortify_default_negative(negative_prompt):
+async def fortify_default_negative(negative_prompt):
     if "nsfw" in negative_prompt.lower() and "nipples" not in negative_prompt.lower():
         return "nipples, pussy, breasts, " + negative_prompt
     else:
         return negative_prompt
-
-
-def filter_seed(data):
-    seed = data["seed"]
-    try:
-        if not isinstance(data["data"]["seed"], int):
-            seed = 999999
-        elif data["data"]["seed"] > 999999 | data["data"]["seed"] < 1:
-            seed = 999999
-    except:
-        seed = 1
-
-    return seed
 
 
 @app.post("/rate_image/")

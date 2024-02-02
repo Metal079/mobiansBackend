@@ -1,5 +1,6 @@
 import io
 import base64
+import logging
 
 from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
 
@@ -7,7 +8,7 @@ from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
 # ---- image manipulation -----
 
 
-def remove_alpha_channel(image):
+async def remove_alpha_channel(image):
     # Convert image to RGB if it has an alpha channel
     if image.mode == "RGBA":
         buffer = io.BytesIO()
@@ -20,11 +21,7 @@ def remove_alpha_channel(image):
         return image
 
 
-def is_white(pixel, tolerance=10):
-    return all(255 - tolerance <= channel <= 255 for channel in pixel[:3])
-
-
-def add_image_metadata(image, request_data):
+async def add_image_metadata(image, request_data):
     img_io = io.BytesIO()
 
     image_with_watermark = add_watermark(image)
@@ -63,7 +60,7 @@ def add_image_metadata(image, request_data):
     return base64_image
 
 
-def add_watermark(image):
+async def add_watermark(image):
     # Create watermark image
     watermark_text = "Mobians.ai"
     opacity = 128
