@@ -24,7 +24,7 @@ async def remove_alpha_channel(image):
 async def add_image_metadata(image, request_data):
     img_io = io.BytesIO()
 
-    image_with_watermark = add_watermark(image)
+    image_with_watermark = await add_watermark(image)
 
     # Add metadata
     metadata = PngImagePlugin.PngInfo()
