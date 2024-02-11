@@ -11,6 +11,7 @@ import json
 import re
 import websockets
 import time
+import requests
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -410,7 +411,7 @@ async def insert_image_hashes(image_hashes, metadata, job_data):
     logging.info("Inserting image hashes")
 
     insert_query = """
-        INSERT INTO ImageHashes (hash, prompt, negative_prompt, seed, cfg, model, created_date)
+        INSERT INTO hashes (hash, prompt, negative_prompt, seed, cfg, model, created_date)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
     """
     values = [
@@ -433,12 +434,22 @@ async def insert_image_hashes(image_hashes, metadata, job_data):
             await aconn.commit()  # Commit the transaction
 
 
+async def twos_complement(hexstr, bits):
+    value = int(hexstr, 16)  # convert hexadecimal to integer
+
+    # convert from unsigned number to signed number with "bits" bits
+    if value & (1 << (bits - 1)):
+        value -= 1 << bits
+    return value
+
+
 async def process_images_and_store_hashes(image_results, metadata, job_data):
     image_hashes = []
     for i in range(4):
         image = Image.open(io.BytesIO(image_results[2 * i]))
         image_hash = imagehash.average_hash(image, 8)
-        image_hashes.append(str(image_hash))
+        image_hash = await twos_complement(str(image_hash), 64)
+        image_hashes.append(image_hash)
 
     try:
         await insert_image_hashes(image_hashes, metadata, job_data)
@@ -516,7 +527,25 @@ async def retrieve_finished_job(
         metadata_json = await r.get(
             f"job:{job_data.job_id}:metadata"
         )  # Changed to async
-        metadata = JobData.parse_raw(metadata_json)
+        try:
+            metadata = JobData.model_validate_json(metadata_json)
+        except Exception as e:
+            corrupted_indexes = [0, 1, 2, 3]
+            retry_info = JobRetryInfo(job_id=job_data.job_id, indexes=corrupted_indexes)
+            resp = requests.get(
+                url=f"http://{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}",
+                json=retry_info.dict(),
+            )
+            logging.info(resp.json())
+            logging.error(f"Error occurred while fetching metadata: {e}")
+            # shiw metadata_json
+            logging.error(f"metadata_json: {metadata_json}")
+            # return JSONResponse(
+            #     status_code=500,
+            #     content={"message": "Error occurred while fetching metadata"},
+            # )
+            # ignore it
+            metadata = None
 
         # First pass: Identify corrupted images
         image_keys = [f"job:{job_data.job_id}:image:{i}" for i in range(4)]
@@ -549,6 +578,17 @@ async def retrieve_finished_job(
             #     url=f"http://{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}",
             #     json=retry_info.dict(),
             # )
+            url = (
+                f"http://{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}"
+            )
+            headers = {"Content-Type": "application/json"}
+
+            async with session.get(url, headers=retry_info.model_dump()) as user_resp:
+                if user_resp.status != 200:
+                    raise HTTPException(
+                        status_code=user_resp.status,
+                        detail="E",
+                    )
 
         # Second pass: Fetch images, re-attempting if necessary
         attempts = 0
@@ -580,11 +620,24 @@ async def retrieve_finished_job(
                     logging.error(
                         f"Corrupted image STILL detected for job {job_data.job_id}"
                     )
+                    logging.error(f"Corrupted indexes: {corrupted_indexes}")
+                    logging.error(f"Results: {results}")
 
             if len(finished_response["result"]) == 4:
                 break
             else:
                 attempts += 1
+
+        if len(finished_response["result"]) < 4 and attempts >= 2:
+            # Not all images could be processed successfully
+            error_response = {
+                "status": "error",
+                "message": "Unable to process all images due to corruption.",
+                "processed_images_count": len(finished_response["result"]),
+                "total_images_expected": 4,
+                "corrupted_indexes": corrupted_indexes,
+            }
+            return JSONResponse(status_code=400, content=error_response)
 
         # Generate hashes for each image and store them in DB along with image info
         # Pass the results for images and other necessary data to the background task
@@ -698,7 +751,6 @@ async def promptFilter(data):
 
         # Now final_prompt contains the modified prompt with original case structure
         prompt = final_prompt
-
 
     except Exception as e:
         print(f"Database error encountered: {e}")
@@ -1060,6 +1112,7 @@ async def discord_auth(auth_code: DiscordAuthCode):
         "is_member_of_your_guild": is_member_of_your_guild,
         "has_required_role": has_required_role,
     }
+
 
 # Azure health check, return 200
 @app.get("/health_check")
