@@ -13,6 +13,7 @@ import websockets
 import time
 import requests
 
+from contextlib import asynccontextmanager
 import aiohttp
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -57,6 +58,7 @@ subscriptions: Dict[str, dict] = {}
 
 app = FastAPI()
 global_queue = {}  # This will store the latest queue information
+fastpass_cache = {}  # In-memory cache for FastPass data
 session = None
 
 
@@ -75,6 +77,7 @@ async def startup_event():
         retry_on_error=[BusyLoadingError, ConnectionError, TimeoutError],
     )  # , decode_responses=True
 
+    asyncio.create_task(refresh_fastpass_cache())
     for index, ip in enumerate(API_IP_List):
         ws_uri = f"ws://{ip}/ws/queue_length"
         asyncio.create_task(listen_for_queue_updates(ws_uri, index))
@@ -150,6 +153,22 @@ async def listen_for_queue_updates(uri, index):
             global_queue[index] = 9999
             # If the connection fails, wait before trying to reconnect
             await asyncio.sleep(3)
+
+
+async def refresh_fastpass_cache():
+    while True:
+        async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute(
+                    "SELECT fastpass_code, expiration_date FROM fastpass"
+                )
+                rows = await acur.fetchall()
+
+                for row in rows:
+                    fastpass_code, expiration_date = row
+                    fastpass_cache[fastpass_code] = expiration_date
+
+        await asyncio.sleep(300)  # Refresh every 5 minutes (300 seconds)
 
 
 @app.post("/submit_job/")
@@ -346,48 +365,41 @@ async def increment_fastpass_use_count(fast_pass_code: str):
 async def validate_fastpass(
     fast_pass_code: str, background_tasks: BackgroundTasks
 ) -> bool:
-    # Time the function
-    start_time = time.time()
-    logging.info("Validating FastPassCode")
-
-    async with await psycopg.AsyncConnection.connect(DSN) as aconn:
-        async with aconn.cursor() as acur:
-            await acur.execute(
-                """
-                SELECT expiration_date
-                FROM fastpass
-                WHERE fastpass_code = %s
-                """,
-                (fast_pass_code,),
-            )
-
-            row = await acur.fetchone()
-
-            if not row:
-                return False
-
-            expiration_date = row[0]
-            if expiration_date is None:
-                background_tasks.add_task(increment_fastpass_use_count, fast_pass_code)
-                # Time the function
-                end_time = time.time()
-                logging.info("Time elapsed: " + str(end_time - start_time))
-
-                return True
-            elif expiration_date < datetime.now():
-                # Time the function
-                end_time = time.time()
-                logging.info("Time elapsed: " + str(end_time - start_time))
-
-                return False
-
+    if fast_pass_code in fastpass_cache:
+        expiration_date = fastpass_cache[fast_pass_code]
+        if expiration_date is None or expiration_date >= datetime.now():
             background_tasks.add_task(increment_fastpass_use_count, fast_pass_code)
-
-            # Time the function
-            end_time = time.time()
-            logging.info("Time elapsed: " + str(end_time - start_time))
-
             return True
+        else:
+            return False
+    else:
+        # FastPass data not found in cache, query the database
+        async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute(
+                    """
+                    SELECT expiration_date
+                    FROM fastpass
+                    WHERE fastpass_code = %s
+                    """,
+                    (fast_pass_code,),
+                )
+
+                row = await acur.fetchone()
+
+                if not row:
+                    return False
+
+                expiration_date = row[0]
+                fastpass_cache[fast_pass_code] = expiration_date  # Store in cache
+
+                if expiration_date is None or expiration_date >= datetime.now():
+                    background_tasks.add_task(
+                        increment_fastpass_use_count, fast_pass_code
+                    )
+                    return True
+                else:
+                    return False
 
 
 class GetJobData(BaseModel):
