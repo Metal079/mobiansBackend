@@ -15,8 +15,14 @@ font = ImageFont.truetype(font_file_path, 25)
 
 
 async def remove_alpha_channel(image):
+    # Convert image to RGB if it has an alpha channel
     if image.mode == "RGBA":
-        return image.convert("RGB")
+        buffer = io.BytesIO()
+        # Separate alpha channel and add white background
+        background = Image.new("RGBA", image.size, (255, 255, 255))
+        alpha_composite = Image.alpha_composite(background, image).convert("RGB")
+        alpha_composite.save(buffer, format="PNG")
+        return alpha_composite
     else:
         return image
 
