@@ -129,6 +129,7 @@ class JobData(BaseModel):
     model: Optional[str] = None
     fast_pass_code: Optional[str] = None
     rating: Optional[bool] = None
+    enableUpscale: Optional[bool] = False
 
 
 class ImageRequestModel(JobData):
@@ -203,92 +204,93 @@ async def submit_job(
     API_IP = await chooseAPI()
 
     # Do img2img filtering if it's an img2img request
-    if (
-        job_data.job_type == "img2img"
-        or job_data.job_type == "inpainting"
-        or job_data.job_type == "upscale"
-    ):
+    # if (
+    #     job_data.job_type == "img2img"
+    #     or job_data.job_type == "inpainting"
+    #     or job_data.job_type == "upscale"
+    # ):
 
-        def upscale(image):
-            width, height = image.size
-            new_width = int(width * 2)
-            new_height = int(height * 2)
-            return image.resize((new_width, new_height), Image.LANCZOS)
+    #     def upscale(image):
+    #         width, height = image.size
+    #         new_width = int(width * 1.5)
+    #         new_height = int(height * 1.5)
+    #         return image.resize((new_width, new_height), Image.NEAREST)
 
-        # Convert base64 string to image to remove alpha channel if needed
-        job_data.image = decode_base64_to_image(job_data.image)
-        # Upscale if job_type is upscale
-        if job_data.job_type == "upscale":
-            job_data.image = upscale(job_data.image)
+    #     # Convert base64 string to image to remove alpha channel if needed
+    #     job_data.image = decode_base64_to_image(job_data.image)
+    #     # Upscale if job_type is upscale
+    #     if job_data.job_type == "upscale":
+    #         job_data.image = upscale(job_data.image)
 
-        job_data.image = job_data.image.convert("RGBA")
+    #     job_data.image = job_data.image.convert("RGBA")
 
-        # Do the same for mask image
-        if job_data.mask_image:
-            job_data.mask_image = decode_base64_to_image(job_data.mask_image)
-            job_data.mask_image = job_data.mask_image.convert("RGBA")
+    #     # Do the same for mask image
+    #     if job_data.mask_image:
+    #         job_data.mask_image = decode_base64_to_image(job_data.mask_image)
+    #         job_data.mask_image = job_data.mask_image.convert("RGBA")
 
-        if job_data.color_inpaint:
-            # Check if the mask image has an alpha channel
-            if "A" in job_data.mask_image.getbands():
-                # Extract the alpha channel and adjust its opacity
-                alpha_channel = job_data.mask_image.split()[-1]
-                alpha_channel = alpha_channel.point(
-                    lambda p: int(p * job_data.strength)
-                )
+    #     if job_data.color_inpaint:
+    #         # Check if the mask image has an alpha channel
+    #         if "A" in job_data.mask_image.getbands():
+    #             # Extract the alpha channel and adjust its opacity
+    #             alpha_channel = job_data.mask_image.split()[-1]
+    #             alpha_channel = alpha_channel.point(
+    #                 lambda p: int(p * job_data.strength)
+    #             )
 
-            else:
-                # Create a new alpha channel based on the mask image's pixel data
-                # alpha_channel = ImageOps.invert(job_data.mask_image.convert("L")).point(lambda p: int(p * 0.7))
+    #         else:
+    #             # Create a new alpha channel based on the mask image's pixel data
+    #             # alpha_channel = ImageOps.invert(job_data.mask_image.convert("L")).point(lambda p: int(p * 0.7))
 
-                # Give an error
-                raise HTTPException(
-                    status_code=400, detail="The mask image must have an alpha channel."
-                )
+    #             # Give an error
+    #             raise HTTPException(
+    #                 status_code=400, detail="The mask image must have an alpha channel."
+    #             )
 
-            # Create a new mask image with the adjusted alpha channel
-            mask_with_alpha = Image.merge(
-                "RGBA", job_data.mask_image.split()[:-1] + (alpha_channel,)
-            )
+    #         # Create a new mask image with the adjusted alpha channel
+    #         mask_with_alpha = Image.merge(
+    #             "RGBA", job_data.mask_image.split()[:-1] + (alpha_channel,)
+    #         )
 
-            # Overlay the mask image onto the main image using the adjusted alpha channel
-            job_data.image.paste(mask_with_alpha, (0, 0), mask=alpha_channel)
+    #         # Overlay the mask image onto the main image using the adjusted alpha channel
+    #         job_data.image.paste(mask_with_alpha, (0, 0), mask=alpha_channel)
 
-            # Convert the PIL Image to a NumPy array
-            mask_array = np.array(job_data.mask_image)
+    #         # Convert the PIL Image to a NumPy array
+    #         mask_array = np.array(job_data.mask_image)
 
-            # Identify non-transparent pixels
-            not_transparent = mask_array[:, :, 3] > 0  # Alpha channel is not 0
+    #         # Identify non-transparent pixels
+    #         not_transparent = mask_array[:, :, 3] > 0  # Alpha channel is not 0
 
-            # Set those pixels to black while maintaining the alpha channel
-            mask_array[not_transparent, :3] = 0  # Set R, G, B to 0
+    #         # Set those pixels to black while maintaining the alpha channel
+    #         mask_array[not_transparent, :3] = 0  # Set R, G, B to 0
 
-            # Convert the NumPy array back to a PIL image
-            job_data.mask_image = Image.fromarray(mask_array, "RGBA")
+    #         # Convert the NumPy array back to a PIL image
+    #         job_data.mask_image = Image.fromarray(mask_array, "RGBA")
 
-        # Remove alpha channel from image and mask image
-        job_data.image = await remove_alpha_channel(job_data.image)
-        if job_data.mask_image:
-            job_data.mask_image = await remove_alpha_channel(job_data.mask_image)
+    #     # Remove alpha channel from image and mask image
+    #     # EDIT: MOVED TO LOCAL FUNCTION
+    #     # job_data.image = await remove_alpha_channel(job_data.image)
+    #     # if job_data.mask_image:
+    #     #     job_data.mask_image = await remove_alpha_channel(job_data.mask_image)
 
-        # Save resized image to a BytesIO object
-        buffer = io.BytesIO()
-        job_data.image.save(buffer, format="PNG")
-        buffer.seek(0)
+    #     # Save resized image to a BytesIO object
+    #     buffer = io.BytesIO()
+    #     job_data.image.save(buffer, format="PNG")
+    #     buffer.seek(0)
 
-        # Encode BytesIO object to base64
-        encoded_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
-        job_data.image = encoded_image
+    #     # Encode BytesIO object to base64
+    #     encoded_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    #     job_data.image = encoded_image
 
-        if job_data.mask_image:
-            # Save resized image to a BytesIO object
-            buffer = io.BytesIO()
-            job_data.mask_image.save(buffer, format="PNG")
-            buffer.seek(0)
+    #     if job_data.mask_image:
+    #         # Save resized image to a BytesIO object
+    #         buffer = io.BytesIO()
+    #         job_data.mask_image.save(buffer, format="PNG")
+    #         buffer.seek(0)
 
-            # Encode BytesIO object to base64
-            encoded_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
-            job_data.mask_image = encoded_image
+    #         # Encode BytesIO object to base64
+    #         encoded_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    #         job_data.mask_image = encoded_image
 
     # Create an instance of ImageRequestModel
     image_request_data = ImageRequestModel(
