@@ -625,9 +625,8 @@ async def retrieve_finished_job(
                         image = Image.open(io.BytesIO(image_bytes))
 
                         # Add watermark and metadata
-                        watermarked_image = await add_watermark(image.convert("RGB"))
                         watermarked_image_base64 = await add_image_metadata(
-                            watermarked_image, metadata
+                            image.convert("RGB"), metadata
                         )
                         finished_response["result"].append(watermarked_image_base64)
                 else:

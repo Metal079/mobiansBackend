@@ -66,7 +66,7 @@ async def add_image_metadata(image, request_data):
 
 async def add_watermark(image):
     # randomly pick between EggmanEmpire.ai or Plumbers.ai
-    options = ["JSMetal.com", "EggmanEmpire.ai", "tweetrdot.com", "y.com", "/r/SonicTheHedgehog", "Plumbers.ai", "Moon says he loves you", "Mobian.pie", "01001100"]
+    options = ["JSMetal.com", "EggmanEmpire.ai", "tweetrdot.com", "y.com", "/r/SonicTheHedgehog", "Plumbers.ai", "Moon says he loves you", "Mobian.pie", "01001100", "Sonic can see you sin", "Try Minecraft!", "Check out jscammie.com!"]
     watermark_text = random.choice(options)
 
     watermark = Image.new("RGBA", image.size, (255, 255, 255, 0))
