@@ -1,6 +1,7 @@
 import io
 import base64
 import logging
+import random
 
 from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
 
@@ -8,23 +9,23 @@ from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
 # ---- image manipulation -----
 
 # Create the watermark image and font objects outside the function
-watermark_text = "Mobians.ai"
+#watermark_text = "Mobians.ai"
 opacity = 128
 font_file_path = r"fonts/Roboto-Medium.ttf"
 font = ImageFont.truetype(font_file_path, 25)
 
 
-async def remove_alpha_channel(image):
-    # Convert image to RGB if it has an alpha channel
-    if image.mode == "RGBA":
-        buffer = io.BytesIO()
-        # Separate alpha channel and add white background
-        background = Image.new("RGBA", image.size, (255, 255, 255))
-        alpha_composite = Image.alpha_composite(background, image).convert("RGB")
-        alpha_composite.save(buffer, format="PNG")
-        return alpha_composite
-    else:
-        return image
+# async def remove_alpha_channel(image):
+#     # Convert image to RGB if it has an alpha channel
+#     if image.mode == "RGBA":
+#         buffer = io.BytesIO()
+#         # Separate alpha channel and add white background
+#         background = Image.new("RGBA", image.size, (255, 255, 255))
+#         alpha_composite = Image.alpha_composite(background, image).convert("RGB")
+#         alpha_composite.save(buffer, format="PNG")
+#         return alpha_composite
+#     else:
+#         return image
 
 
 async def add_image_metadata(image, request_data):
@@ -64,6 +65,10 @@ async def add_image_metadata(image, request_data):
 
 
 async def add_watermark(image):
+    # randomly pick between EggmanEmpire.ai or Plumbers.ai
+    options = ["JSMetal.com", "EggmanEmpire.ai", "tweetrdot.com", "y.com", "/r/SonicTheHedgehog", "Plumbers.ai", "Moon says he loves you", "Mobian.pie", "01001100"]
+    watermark_text = random.choice(options)
+
     watermark = Image.new("RGBA", image.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(watermark)
 
