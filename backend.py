@@ -6,7 +6,7 @@ import hashlib
 import logging
 import random
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import re
 import websockets
@@ -161,7 +161,7 @@ async def refresh_fastpass_cache():
         async with await psycopg.AsyncConnection.connect(DSN) as aconn:
             async with aconn.cursor() as acur:
                 await acur.execute(
-                    "SELECT fastpass_code, expiration_date FROM fastpass"
+                    "SELECT fastpass_code, expiration_date FROM fastpass_new"
                 )
                 rows = await acur.fetchall()
 
@@ -352,7 +352,7 @@ async def increment_fastpass_use_count(fast_pass_code: str):
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
-                UPDATE fastpass
+                UPDATE fastpass_new
                 SET uses = uses + 1
                 WHERE fastpass_code = %s
                 """,
@@ -363,45 +363,79 @@ async def increment_fastpass_use_count(fast_pass_code: str):
     end_time = time.time()
     logging.info("Time elapsed: " + str(end_time - start_time))
 
+async def set_fastpass_expiration_date(fast_pass_code: str, days_from_today: int):
+    # Time the function
+    start_time = time.time()
+    logging.info("Setting FastPassCode expiration date")
 
-async def validate_fastpass(
-    fast_pass_code: str, background_tasks: BackgroundTasks
-) -> bool:
-    if fast_pass_code in fastpass_cache:
-        expiration_date = fastpass_cache[fast_pass_code]
-        if expiration_date is None or expiration_date >= datetime.now():
-            background_tasks.add_task(increment_fastpass_use_count, fast_pass_code)
-            return True
-        else:
-            return False
-    else:
-        # FastPass data not found in cache, query the database
+    try:
+        # Add days to current date
+        expiration_date = datetime.now() + timedelta(days=days_from_today)
+
         async with await psycopg.AsyncConnection.connect(DSN) as aconn:
             async with aconn.cursor() as acur:
                 await acur.execute(
                     """
-                    SELECT expiration_date
-                    FROM fastpass
+                    UPDATE fastpass_new
+                    SET expiration_date = %s
                     WHERE fastpass_code = %s
                     """,
-                    (fast_pass_code,),
+                    (expiration_date, fast_pass_code),
                 )
 
-                row = await acur.fetchone()
+        # Log the time elapsed
+        end_time = time.time()
+        logging.info("Time elapsed: {:.2f} seconds".format(end_time - start_time))
+    
+    except Exception as e:
+        logging.error("Error setting expiration date: %s", e)
 
-                if not row:
-                    return False
 
-                expiration_date = row[0]
-                fastpass_cache[fast_pass_code] = expiration_date  # Store in cache
+async def validate_fastpass(
+    fast_pass_code: str, background_tasks: BackgroundTasks
+) -> bool:
+    # if fast_pass_code in fastpass_cache:
+    #     expiration_date = fastpass_cache[fast_pass_code]
+    #     if expiration_date is None or expiration_date >= datetime.now():
+    #         background_tasks.add_task(increment_fastpass_use_count, fast_pass_code)
+    #         return True
+    #     else:
+    #         return False
+    # else:
+    # FastPass data not found in cache, query the database
+    async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT expiration_date, fastpass_days
+                FROM fastpass_new
+                WHERE fastpass_code = %s
+                """,
+                (fast_pass_code,),
+            )
 
-                if expiration_date is None or expiration_date >= datetime.now():
-                    background_tasks.add_task(
-                        increment_fastpass_use_count, fast_pass_code
-                    )
-                    return True
-                else:
-                    return False
+            row = await acur.fetchone()
+
+            if not row:
+                return False
+
+            expiration_date = row[0]
+            fastpass_cache[fast_pass_code] = expiration_date  # Store in cache
+
+            # We need to set the code to expire at current date + fastpass_days
+            if expiration_date is None:
+                days_to_expire = row[1]
+                background_tasks.add_task(
+                    set_fastpass_expiration_date, fast_pass_code, days_to_expire
+                )
+
+            if expiration_date is None or expiration_date >= datetime.now():
+                background_tasks.add_task(
+                    increment_fastpass_use_count, fast_pass_code
+                )
+                return True
+            else:
+                return False
 
 
 class GetJobData(BaseModel):
