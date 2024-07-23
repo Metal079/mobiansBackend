@@ -1,19 +1,16 @@
 import os
 import io
 import base64
-from typing import Optional, List, Dict
+from typing import Optional, Dict
 import hashlib
 import logging
-import random
 import asyncio
 from datetime import datetime, timedelta
 import json
 import re
-import websockets
 import time
 import requests
 
-from contextlib import asynccontextmanager
 import aiohttp
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -26,7 +23,6 @@ from redis.backoff import ExponentialBackoff
 from redis.retry import Retry
 from redis.exceptions import BusyLoadingError, ConnectionError, TimeoutError
 from pywebpush import webpush, WebPushException
-import numpy as np
 import imagehash
 import psycopg
 
@@ -78,9 +74,6 @@ async def startup_event():
     )  # , decode_responses=True
 
     asyncio.create_task(refresh_fastpass_cache())
-    for index, ip in enumerate(API_IP_List):
-        ws_uri = f"ws://{ip}/ws/queue_length"
-        asyncio.create_task(listen_for_queue_updates(ws_uri, index))
 
 
 @app.on_event("shutdown")
@@ -129,31 +122,12 @@ class JobData(BaseModel):
     model: Optional[str] = None
     fast_pass_code: Optional[str] = None
     rating: Optional[bool] = None
-    enableUpscale: Optional[bool] = False
+    enable_upscale: Optional[bool] = False
 
 
 class ImageRequestModel(JobData):
     image: Optional[str] = None
     fast_pass_enabled: Optional[bool] = False
-
-
-async def listen_for_queue_updates(uri, index):
-    global global_queue
-    while True:
-        try:
-            async with websockets.connect(uri) as websocket:
-                while True:
-                    message = await websocket.recv()
-                    queue_info = json.loads(message)
-                    global_queue[index] = queue_info["queue_length"]
-                    # Here, you would handle the received message
-                    # print(f"Queue Update for {uri}: {global_queue}")
-                    # No need to sleep because you're waiting for messages from the server
-        except Exception as e:
-            # print(f"Error connecting to WebSocket at {uri}: {e}")
-            global_queue[index] = 9999
-            # If the connection fails, wait before trying to reconnect
-            await asyncio.sleep(3)
 
 
 async def refresh_fastpass_cache():
@@ -191,137 +165,68 @@ async def submit_job(
                     status_code=400,
                     detail="Invalid or expired FastPassCode. Please fix/remove the FastPassCode and try again.",
                 )
+        except HTTPException as e:
+            # Re-raise the HTTPException to be handled by FastAPI
+            raise e
         except Exception as e:
             logging.error(
-                "Error occurred while validating FastPassCode (DB might be down))"
+                "Error occurred while validating FastPassCode (DB might be down)"
             )
             logging.error(str(e))
+            raise HTTPException(
+                status_code=500,
+                detail="An error occurred while validating the FastPassCode. Please try again later.",
+            )
 
     # Filter out prompts
     job_data.prompt, job_data.negative_prompt = await promptFilter(job_data)
     job_data.negative_prompt = await fortify_default_negative(job_data.negative_prompt)
-
-    API_IP = await chooseAPI()
-
-    # Do img2img filtering if it's an img2img request
-    # if (
-    #     job_data.job_type == "img2img"
-    #     or job_data.job_type == "inpainting"
-    #     or job_data.job_type == "upscale"
-    # ):
-
-    #     def upscale(image):
-    #         width, height = image.size
-    #         new_width = int(width * 1.5)
-    #         new_height = int(height * 1.5)
-    #         return image.resize((new_width, new_height), Image.NEAREST)
-
-    #     # Convert base64 string to image to remove alpha channel if needed
-    #     job_data.image = decode_base64_to_image(job_data.image)
-    #     # Upscale if job_type is upscale
-    #     if job_data.job_type == "upscale":
-    #         job_data.image = upscale(job_data.image)
-
-    #     job_data.image = job_data.image.convert("RGBA")
-
-    #     # Do the same for mask image
-    #     if job_data.mask_image:
-    #         job_data.mask_image = decode_base64_to_image(job_data.mask_image)
-    #         job_data.mask_image = job_data.mask_image.convert("RGBA")
-
-    #     if job_data.color_inpaint:
-    #         # Check if the mask image has an alpha channel
-    #         if "A" in job_data.mask_image.getbands():
-    #             # Extract the alpha channel and adjust its opacity
-    #             alpha_channel = job_data.mask_image.split()[-1]
-    #             alpha_channel = alpha_channel.point(
-    #                 lambda p: int(p * job_data.strength)
-    #             )
-
-    #         else:
-    #             # Create a new alpha channel based on the mask image's pixel data
-    #             # alpha_channel = ImageOps.invert(job_data.mask_image.convert("L")).point(lambda p: int(p * 0.7))
-
-    #             # Give an error
-    #             raise HTTPException(
-    #                 status_code=400, detail="The mask image must have an alpha channel."
-    #             )
-
-    #         # Create a new mask image with the adjusted alpha channel
-    #         mask_with_alpha = Image.merge(
-    #             "RGBA", job_data.mask_image.split()[:-1] + (alpha_channel,)
-    #         )
-
-    #         # Overlay the mask image onto the main image using the adjusted alpha channel
-    #         job_data.image.paste(mask_with_alpha, (0, 0), mask=alpha_channel)
-
-    #         # Convert the PIL Image to a NumPy array
-    #         mask_array = np.array(job_data.mask_image)
-
-    #         # Identify non-transparent pixels
-    #         not_transparent = mask_array[:, :, 3] > 0  # Alpha channel is not 0
-
-    #         # Set those pixels to black while maintaining the alpha channel
-    #         mask_array[not_transparent, :3] = 0  # Set R, G, B to 0
-
-    #         # Convert the NumPy array back to a PIL image
-    #         job_data.mask_image = Image.fromarray(mask_array, "RGBA")
-
-    #     # Remove alpha channel from image and mask image
-    #     # EDIT: MOVED TO LOCAL FUNCTION
-    #     # job_data.image = await remove_alpha_channel(job_data.image)
-    #     # if job_data.mask_image:
-    #     #     job_data.mask_image = await remove_alpha_channel(job_data.mask_image)
-
-    #     # Save resized image to a BytesIO object
-    #     buffer = io.BytesIO()
-    #     job_data.image.save(buffer, format="PNG")
-    #     buffer.seek(0)
-
-    #     # Encode BytesIO object to base64
-    #     encoded_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    #     job_data.image = encoded_image
-
-    #     if job_data.mask_image:
-    #         # Save resized image to a BytesIO object
-    #         buffer = io.BytesIO()
-    #         job_data.mask_image.save(buffer, format="PNG")
-    #         buffer.seek(0)
-
-    #         # Encode BytesIO object to base64
-    #         encoded_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    #         job_data.mask_image = encoded_image
 
     # Create an instance of ImageRequestModel
     image_request_data = ImageRequestModel(
         **job_data.dict(), fast_pass_enabled=fast_pass_enabled
     )
 
-    # Try using the requested API, if it fails, use the other one
-    returned_data = None
-    try:
-        async with session.post(
-            f"http://{API_IP}/submit_job/", json=image_request_data.dict()
-        ) as resp:
-            returned_data = await resp.json()
-    except:
-        API_IP = await chooseAPI()  # Ensure chooseAPI is also async
-        async with session.post(
-            f"http://{API_IP}/submit_job/", json=image_request_data.dict()
-        ) as resp:
-            returned_data = await resp.json()
+    async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                INSERT INTO generation_queue (
+                    id, status, assigned_gpu, prompt, image, image_UUID, mask_image,
+                    color_inpaint, control_image, scheduler, steps, negative_prompt,
+                    width, height, guidance_scale, seed, batch_size, strength,
+                    job_type, model, fast_pass_code, rating, enable_upscale
+                ) VALUES (
+                    gen_random_uuid(), 'pending', NULL, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                ) RETURNING id;
+            """,
+                (
+                    image_request_data.prompt,
+                    image_request_data.image,
+                    image_request_data.image_UUID,
+                    image_request_data.mask_image,
+                    image_request_data.color_inpaint,
+                    image_request_data.control_image,
+                    image_request_data.scheduler,
+                    image_request_data.steps,
+                    image_request_data.negative_prompt,
+                    image_request_data.width,
+                    image_request_data.height,
+                    image_request_data.guidance_scale,
+                    image_request_data.seed,
+                    image_request_data.batch_size,
+                    image_request_data.strength,
+                    image_request_data.job_type,
+                    image_request_data.model,
+                    image_request_data.fast_pass_code,
+                    image_request_data.rating,
+                    image_request_data.enable_upscale,
+                ),
+            )
+            job_id = await acur.fetchone()
 
-    # Get index of API_IP in API_IP_List
-    for i in range(len(API_IP_List)):
-        if API_IP_List[i] == API_IP:
-            returned_data["API_IP"] = i
-
-    if returned_data == None:
-        raise HTTPException(
-            status_code=500, detail="Error occurred while submitting job"
-        )
-
-    return JSONResponse(content=returned_data)
+    return JSONResponse(content={"job_id": str(job_id[0])})
 
 
 def decode_base64_to_image(base64_str):
@@ -363,6 +268,7 @@ async def increment_fastpass_use_count(fast_pass_code: str):
     end_time = time.time()
     logging.info("Time elapsed: " + str(end_time - start_time))
 
+
 async def set_fastpass_expiration_date(fast_pass_code: str, days_from_today: int):
     # Time the function
     start_time = time.time()
@@ -386,7 +292,7 @@ async def set_fastpass_expiration_date(fast_pass_code: str, days_from_today: int
         # Log the time elapsed
         end_time = time.time()
         logging.info("Time elapsed: {:.2f} seconds".format(end_time - start_time))
-    
+
     except Exception as e:
         logging.error("Error setting expiration date: %s", e)
 
@@ -430,9 +336,7 @@ async def validate_fastpass(
                 )
 
             if expiration_date is None or expiration_date >= datetime.now():
-                background_tasks.add_task(
-                    increment_fastpass_use_count, fast_pass_code
-                )
+                background_tasks.add_task(increment_fastpass_use_count, fast_pass_code)
                 return True
             else:
                 return False
@@ -440,19 +344,10 @@ async def validate_fastpass(
 
 class GetJobData(BaseModel):
     job_id: str
-    API_IP: int
 
 
 class JobRetryInfo(BaseModel):
     job_id: str
-    indexes: List[int]
-
-
-async def call_get_job(job_id: str, API_IP: str):
-    async with session.get(
-        url=f"http://{API_IP}/get_job/{job_id}", ssl=False
-    ) as response:
-        return await response.json()
 
 
 async def insert_image_hashes(image_hashes, metadata, job_data):
@@ -509,60 +404,49 @@ async def process_images_and_store_hashes(image_results, metadata, job_data):
 
 
 @app.post("/get_job/")
-async def get_job(
-    job_data: GetJobData,
-    background_tasks: BackgroundTasks,
-):
-    MAX_RETRIES = 2
-    MIN_DELAY = 1
-    MAX_DELAY = 3
+async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
+    async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT status, queue_position, finished_images 
+                FROM vw_generation_queue 
+                WHERE id = %s
+            """,
+                (job_data.job_id,),
+            )
+            result = await acur.fetchone()
 
-    response = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = await call_get_job(job_data.job_id, API_IP_List[job_data.API_IP])
-            # response.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xx
-            break  # success, no need for more retries
-        except Exception as e:
-            if attempt == MAX_RETRIES - 1:  # if this was the last attempt
-                logging.error(
-                    f"Max retries exceeded when making GET request, JOB: {job_data.job_id}"
-                )
-                return JSONResponse(
-                    content={"message": "Error occurred while making GET request"},
-                    status_code=500,
-                )
-            else:
-                # Calculate next sleep time
-                sleep_time = MIN_DELAY * (2**attempt) + random.uniform(0, 1)
-                sleep_time = min(sleep_time, MAX_DELAY)
+    if not result:
+        raise HTTPException(status_code=404, detail="Job not found")
 
-                logging.error(e)
-                logging.error(
-                    f"Exception occurred when making GET request, JOB: {job_data.job_id}. Retrying in {sleep_time} seconds..."
-                )
-                await asyncio.sleep(sleep_time)
+    job_status, queue_position, finished_images = result
 
-    error_flag = False
-    try:
-        if response["status"] == "completed":
-            return await retrieve_finished_job(job_data, background_tasks)
+    if job_status == "completed":
+        
+        if finished_images:
+            finished_images = finished_images.strip('{}')
+            base64_strings = finished_images.split(',')
 
-    except Exception as e:
-        logging.error(f"response: {response}")
-        logging.error(f"Exception: {e}")
-        logging.error(f"Exception happened on get_job")
-        error_flag = True
-
-    #  Try to get the images again if theres an exception
-    if error_flag:
-        try:
-            return await retrieve_finished_job(job_data, background_tasks)
-        except Exception as e:
-            logging.error(f"Exception: {e}")
-            logging.error(f"Exception happened on retrieve_finished_job")
-
-    return JSONResponse(content=response)
+            return JSONResponse(
+                content={"status": "completed", "result": base64_strings}
+            )
+        else:
+            logging.error(
+                f"Job {job_data.job_id} marked as completed but has no finished images"
+            )
+            return JSONResponse(
+                content={
+                    "status": "error",
+                    "message": "Job completed but no images found",
+                }
+            )
+    elif job_status in ["pending", "processing"]:
+        return JSONResponse(content={"status": job_status, "queue_position": queue_position, })
+    else:
+        return JSONResponse(
+            content={"status": "error", "message": "Unknown job status"}
+        )
 
 
 async def retrieve_finished_job(
