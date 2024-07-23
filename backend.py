@@ -195,10 +195,10 @@ async def submit_job(
                     id, status, assigned_gpu, prompt, image, image_UUID, mask_image,
                     color_inpaint, control_image, scheduler, steps, negative_prompt,
                     width, height, guidance_scale, seed, batch_size, strength,
-                    job_type, model, fast_pass_code, rating, enable_upscale
+                    job_type, model, fast_pass_code, rating, enable_upscale, fast_pass_enabled
                 ) VALUES (
                     gen_random_uuid(), 'pending', NULL, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 ) RETURNING id;
             """,
                 (
@@ -222,6 +222,7 @@ async def submit_job(
                     image_request_data.fast_pass_code,
                     image_request_data.rating,
                     image_request_data.enable_upscale,
+                    fast_pass_enabled
                 ),
             )
             job_id = await acur.fetchone()
