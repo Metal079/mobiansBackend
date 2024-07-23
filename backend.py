@@ -222,7 +222,7 @@ async def submit_job(
                     image_request_data.fast_pass_code,
                     image_request_data.rating,
                     image_request_data.enable_upscale,
-                    fast_pass_enabled
+                    fast_pass_enabled,
                 ),
             )
             job_id = await acur.fetchone()
@@ -238,13 +238,13 @@ def decode_base64_to_image(base64_str):
         image = Image.open(io.BytesIO(base64.b64decode(base64_str.split(",", 1)[0])))
 
     # Resize image if needed
-    tempAspectRatio = image.width / image.height
-    if tempAspectRatio < 0.8:
-        image = image.resize((512, 768))
-    elif tempAspectRatio > 1.2:
-        image = image.resize((768, 512))
-    else:
-        image = image.resize((512, 512))
+    # tempAspectRatio = image.width / image.height
+    # if tempAspectRatio < 0.8:
+    #     image = image.resize((512, 768))
+    # elif tempAspectRatio > 1.2:
+    #     image = image.resize((768, 512))
+    # else:
+    #     image = image.resize((512, 512))
 
     return image
 
@@ -361,11 +361,11 @@ async def insert_image_hashes(image_hashes, metadata, job_data):
     values = [
         (
             image_hashes[i],
-            metadata.prompt,
-            metadata.negative_prompt,
-            metadata.seed,
-            metadata.guidance_scale,
-            "Sonic DiffusionV4",
+            metadata['prompt'],
+            metadata['negative_prompt'],
+            metadata['seed'],
+            metadata['guidance_scale'],
+            metadata['model'],
             datetime.now(),
         )
         for i in range(4)
@@ -390,7 +390,7 @@ async def twos_complement(hexstr, bits):
 async def process_images_and_store_hashes(image_results, metadata, job_data):
     image_hashes = []
     for i in range(4):
-        image = Image.open(io.BytesIO(image_results[2 * i]))
+        image = decode_base64_to_image(image_results[i])
         image_hash = imagehash.average_hash(image, 8)
         image_hash = await twos_complement(str(image_hash), 64)
         image_hashes.append(image_hash)
@@ -406,11 +406,13 @@ async def process_images_and_store_hashes(image_results, metadata, job_data):
 
 @app.post("/get_job/")
 async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
+    metadata = {}
+
     async with await psycopg.AsyncConnection.connect(DSN) as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
-                SELECT status, queue_position, finished_images 
+                SELECT status, queue_position, finished_images, prompt, negative_prompt, seed, guidance_scale, job_type, model
                 FROM vw_generation_queue 
                 WHERE id = %s
             """,
@@ -421,16 +423,43 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
     if not result:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    job_status, queue_position, finished_images = result
+    (
+        job_status,
+        queue_position,
+        finished_images,
+        metadata["prompt"],
+        metadata["negative_prompt"],
+        metadata["seed"],
+        metadata["guidance_scale"],
+        metadata["job_type"],
+        metadata["model"],
+    ) = result
 
     if job_status == "completed":
-        
+
         if finished_images:
-            finished_images = finished_images.strip('{}')
-            base64_strings = finished_images.split(',')
+            finished_images = finished_images.strip("{}")
+            base64_strings = finished_images.split(",")
+
+            # Add watermark and metadata
+            watermarked_image_base64 = []
+            for i in range(4):
+                image = decode_base64_to_image(base64_strings[i])
+                watermarked_image_base64.append(
+                    await add_image_metadata(image.convert("RGB"), metadata)
+                )
+
+            # Generate hashes for each image and store them in DB along with image info
+            # Pass the results for images and other necessary data to the background task
+            background_tasks.add_task(
+                process_images_and_store_hashes,
+                watermarked_image_base64,
+                metadata,
+                job_data,
+            )
 
             return JSONResponse(
-                content={"status": "completed", "result": base64_strings}
+                content={"status": "completed", "result": watermarked_image_base64}
             )
         else:
             logging.error(
@@ -443,7 +472,12 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
                 }
             )
     elif job_status in ["pending", "processing"]:
-        return JSONResponse(content={"status": job_status, "queue_position": queue_position, })
+        return JSONResponse(
+            content={
+                "status": job_status,
+                "queue_position": queue_position,
+            }
+        )
     else:
         return JSONResponse(
             content={"status": "error", "message": "Unknown job status"}
