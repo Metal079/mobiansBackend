@@ -14,3 +14,4 @@ imagehash
 asyncpg
 websockets
 psycopg[binary]
+psycopg_pool
