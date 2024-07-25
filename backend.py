@@ -2,14 +2,11 @@ import os
 import io
 import base64
 from typing import Optional, Dict
-import hashlib
 import logging
-import asyncio
 from datetime import datetime, timedelta
 import json
 import re
 import time
-import requests
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -18,13 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from redis.asyncio import Redis
-from redis.backoff import ExponentialBackoff
-from redis.retry import Retry
-from redis.exceptions import BusyLoadingError, ConnectionError, TimeoutError
 from pywebpush import webpush, WebPushException
 import imagehash
-import psycopg
+import psycopg_pool
 
 from helper_functions import *
 
@@ -33,9 +26,7 @@ PROFILING = False  # Set this from a settings model
 logging.basicConfig(level=logging.ERROR)  # Configure logging
 
 # Run 3 retries with exponential backoff strategy
-retry = Retry(ExponentialBackoff(), 3)
 load_dotenv()
-REDISHOST = os.environ.get("REDISHOST")
 
 DBHOST = os.environ.get("DBHOST")
 DBNAME = os.environ.get("DBNAME")
@@ -53,31 +44,39 @@ VAPID_CLAIMS = os.environ.get("VAPID_CLAIMS")
 subscriptions: Dict[str, dict] = {}
 
 app = FastAPI()
-global_queue = {}  # This will store the latest queue information
 fastpass_cache = {}  # In-memory cache for FastPass data
 session = None
+# Define db_pool as a global variable
+db_pool = None
+
+
+# Create a connection pool
+async def get_db_pool():
+    return psycopg_pool.AsyncConnectionPool(DSN, min_size=1, max_size=10)
 
 
 @app.on_event("startup")
 async def startup_event():
+    global db_pool
+    try:
+        db_pool = await get_db_pool()
+        print("Database pool initialized successfully")
+    except Exception as e:
+        print(f"Error initializing database pool: {e}")
+
     global session
-    # global blob_service_client
     global r
 
     session = aiohttp.ClientSession(trust_env=True)
-    r = Redis(
-        host=REDISHOST,
-        port=6379,
-        db=0,
-        retry=retry,
-        retry_on_error=[BusyLoadingError, ConnectionError, TimeoutError],
-    )  # , decode_responses=True
 
-    asyncio.create_task(refresh_fastpass_cache())
+    # asyncio.create_task(refresh_fastpass_cache())
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    global db_pool
+    if db_pool:
+        await db_pool.close()
     await session.close()
     # await app.state.db_pool.close()
 
@@ -130,20 +129,20 @@ class ImageRequestModel(JobData):
     fast_pass_enabled: Optional[bool] = False
 
 
-async def refresh_fastpass_cache():
-    while True:
-        async with await psycopg.AsyncConnection.connect(DSN) as aconn:
-            async with aconn.cursor() as acur:
-                await acur.execute(
-                    "SELECT fastpass_code, expiration_date FROM fastpass_new"
-                )
-                rows = await acur.fetchall()
+# async def refresh_fastpass_cache():
+#     while True:
+#         async with db_pool.connection() as aconn:
+#             async with aconn.cursor() as acur:
+#                 await acur.execute(
+#                     "SELECT fastpass_code, expiration_date FROM fastpass_new"
+#                 )
+#                 rows = await acur.fetchall()
 
-                for row in rows:
-                    fastpass_code, expiration_date = row
-                    fastpass_cache[fastpass_code] = expiration_date
+#                 for row in rows:
+#                     fastpass_code, expiration_date = row
+#                     fastpass_cache[fastpass_code] = expiration_date
 
-        await asyncio.sleep(300)  # Refresh every 5 minutes (300 seconds)
+#         await asyncio.sleep(300)  # Refresh every 5 minutes (300 seconds)
 
 
 @app.post("/submit_job/")
@@ -187,7 +186,7 @@ async def submit_job(
         **job_data.dict(), fast_pass_enabled=fast_pass_enabled
     )
 
-    async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+    async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
@@ -254,7 +253,7 @@ async def increment_fastpass_use_count(fast_pass_code: str):
     start_time = time.time()
     logging.info("Incrementing FastPassCode use count")
 
-    async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+    async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
@@ -279,7 +278,7 @@ async def set_fastpass_expiration_date(fast_pass_code: str, days_from_today: int
         # Add days to current date
         expiration_date = datetime.now() + timedelta(days=days_from_today)
 
-        async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+        async with db_pool.connection() as aconn:
             async with aconn.cursor() as acur:
                 await acur.execute(
                     """
@@ -310,7 +309,7 @@ async def validate_fastpass(
     #         return False
     # else:
     # FastPass data not found in cache, query the database
-    async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+    async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
@@ -327,7 +326,7 @@ async def validate_fastpass(
                 return False
 
             expiration_date = row[0]
-            fastpass_cache[fast_pass_code] = expiration_date  # Store in cache
+            # fastpass_cache[fast_pass_code] = expiration_date  # Store in cache
 
             # We need to set the code to expire at current date + fastpass_days
             if expiration_date is None:
@@ -361,17 +360,17 @@ async def insert_image_hashes(image_hashes, metadata, job_data):
     values = [
         (
             image_hashes[i],
-            metadata['prompt'],
-            metadata['negative_prompt'],
-            metadata['seed'],
-            metadata['guidance_scale'],
-            metadata['model'],
+            metadata["prompt"],
+            metadata["negative_prompt"],
+            metadata["seed"],
+            metadata["guidance_scale"],
+            metadata["model"],
             datetime.now(),
         )
         for i in range(4)
     ]
 
-    async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+    async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             # Use executemany to insert multiple records
             await acur.executemany(insert_query, values)
@@ -408,7 +407,7 @@ async def process_images_and_store_hashes(image_results, metadata, job_data):
 async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
     metadata = {}
 
-    async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+    async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
@@ -484,155 +483,6 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
         )
 
 
-async def retrieve_finished_job(
-    job_data: GetJobData,
-    background_tasks: BackgroundTasks,
-):
-    async with r.pipeline() as pipe:
-        # Fetch images from Redis
-        finished_response = {"status": "completed", "result": []}
-        metadata_json = await r.get(
-            f"job:{job_data.job_id}:metadata"
-        )  # Changed to async
-        try:
-            metadata = JobData.model_validate_json(metadata_json)
-        except Exception as e:
-            corrupted_indexes = [0, 1, 2, 3]
-            retry_info = JobRetryInfo(job_id=job_data.job_id, indexes=corrupted_indexes)
-            resp = requests.get(
-                url=f"http://{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}",
-                json=retry_info.dict(),
-            )
-            logging.info(resp.json())
-            logging.error(f"Error occurred while fetching metadata: {e}")
-            # shiw metadata_json
-            logging.error(f"metadata_json: {metadata_json}")
-            # return JSONResponse(
-            #     status_code=500,
-            #     content={"message": "Error occurred while fetching metadata"},
-            # )
-            # ignore it
-            metadata = None
-
-        # First pass: Identify corrupted images
-        image_keys = [f"job:{job_data.job_id}:image:{i}" for i in range(4)]
-        checksum_keys = [f"job:{job_data.job_id}:image:{i}:checksum" for i in range(4)]
-
-        # Fetch images and checksums
-        for i in range(4):
-            pipe.get(image_keys[i])
-            pipe.get(checksum_keys[i])
-        results = await pipe.execute()
-
-        # Check for corrupted images
-        corrupted_indexes = []
-        for i in range(4):
-            image_bytes = results[2 * i]
-            fetched_checksum = results[2 * i + 1]
-
-            if image_bytes is not None and fetched_checksum is not None:
-                computed_checksum = hashlib.sha256(image_bytes).hexdigest()
-                if fetched_checksum.decode() != computed_checksum:
-                    corrupted_indexes.append(i)
-
-        # If there are corrupted images, resend them
-        if corrupted_indexes:
-            logging.info(
-                f"Corrupted images detected for job {job_data.job_id}, resending corrupted images"
-            )
-            retry_info = JobRetryInfo(job_id=job_data.job_id, indexes=corrupted_indexes)
-            # requests.get(
-            #     url=f"http://{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}",
-            #     json=retry_info.dict(),
-            # )
-            url = (
-                f"http://{API_IP_List[job_data.API_IP]}/resend_images/{job_data.job_id}"
-            )
-            headers = {"Content-Type": "application/json"}
-
-            async with session.get(url, headers=retry_info.model_dump()) as user_resp:
-                if user_resp.status != 200:
-                    raise HTTPException(
-                        status_code=user_resp.status,
-                        detail="E",
-                    )
-
-        # Second pass: Fetch images, re-attempting if necessary
-        attempts = 0
-        while attempts < 2:
-            # Fetch images and checksums if corrupted images were detected
-            if corrupted_indexes:
-                for i in range(4):
-                    pipe.get(image_keys[i])
-                    pipe.get(checksum_keys[i])
-                results = await pipe.execute()
-
-            # Watermark images or error if corrupted images are still detected
-            for i in range(4):
-                image_bytes = results[2 * i]
-                fetched_checksum = results[2 * i + 1]
-
-                if image_bytes is not None and fetched_checksum is not None:
-                    computed_checksum = hashlib.sha256(image_bytes).hexdigest()
-                    if fetched_checksum.decode() == computed_checksum:
-                        image = Image.open(io.BytesIO(image_bytes))
-
-                        # Add watermark and metadata
-                        watermarked_image_base64 = await add_image_metadata(
-                            image.convert("RGB"), metadata
-                        )
-                        finished_response["result"].append(watermarked_image_base64)
-                else:
-                    logging.error(
-                        f"Corrupted image STILL detected for job {job_data.job_id}"
-                    )
-                    logging.error(f"Corrupted indexes: {corrupted_indexes}")
-                    logging.error(f"Results: {results}")
-
-            if len(finished_response["result"]) == 4:
-                break
-            else:
-                attempts += 1
-
-        if len(finished_response["result"]) < 4 and attempts >= 2:
-            # Not all images could be processed successfully
-            error_response = {
-                "status": "error",
-                "message": "Unable to process all images due to corruption.",
-                "processed_images_count": len(finished_response["result"]),
-                "total_images_expected": 4,
-                "corrupted_indexes": corrupted_indexes,
-            }
-            return JSONResponse(status_code=400, content=error_response)
-
-        # Generate hashes for each image and store them in DB along with image info
-        # Pass the results for images and other necessary data to the background task
-        background_tasks.add_task(
-            process_images_and_store_hashes, results, metadata, job_data
-        )
-
-        return JSONResponse(content=finished_response)
-
-
-# Get the queue length of each API and choose the one with the shortest queue
-async def chooseAPI():
-    lowest_queue = 9999
-    selected_api = None
-
-    for index, api in enumerate(API_IP_List):
-        queue_length = global_queue.get(
-            index, 9999
-        )  # Default to 9999 if API is not in global_queue
-        if queue_length < lowest_queue:
-            lowest_queue = queue_length
-            selected_api = api
-
-    if selected_api is None:
-        raise ValueError("No valid API IP found")
-
-    return selected_api
-
-
 async def enhanced_filter(prompt, pattern, replacement):
     # Replace spaces with \W+ to match any non-word characters between the words
     pattern = re.sub(r" ", r"\\W+", pattern)
@@ -684,7 +534,7 @@ async def promptFilter(data):
     artist_list = []
     try:
         # Connect to the database
-        async with await psycopg.AsyncConnection.connect(DSN) as aconn:
+        async with db_pool.connection() as aconn:
             async with aconn.cursor() as acur:
                 # Execute the query
                 await acur.execute("SELECT Artist FROM excluded_artist")
