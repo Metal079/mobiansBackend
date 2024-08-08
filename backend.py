@@ -122,6 +122,7 @@ class JobData(BaseModel):
     fast_pass_code: Optional[str] = None
     rating: Optional[bool] = None
     enable_upscale: Optional[bool] = False
+    is_dev_job: Optional[bool] = False
 
 
 class ImageRequestModel(JobData):
@@ -194,10 +195,10 @@ async def submit_job(
                     id, status, assigned_gpu, prompt, image, image_UUID, mask_image,
                     color_inpaint, control_image, scheduler, steps, negative_prompt,
                     width, height, guidance_scale, seed, batch_size, strength,
-                    job_type, model, fast_pass_code, rating, enable_upscale, fast_pass_enabled
+                    job_type, model, fast_pass_code, rating, enable_upscale, fast_pass_enabled, is_dev_job
                 ) VALUES (
                     gen_random_uuid(), 'pending', NULL, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 ) RETURNING id;
             """,
                 (
@@ -222,6 +223,7 @@ async def submit_job(
                     image_request_data.rating,
                     image_request_data.enable_upscale,
                     fast_pass_enabled,
+                    image_request_data.is_dev_job,
                 ),
             )
             job_id = await acur.fetchone()
