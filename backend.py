@@ -52,7 +52,7 @@ db_pool = None
 
 # Create a connection pool
 async def get_db_pool():
-    return psycopg_pool.AsyncConnectionPool(DSN, min_size=1, max_size=10)
+    return psycopg_pool.AsyncConnectionPool(DSN, min_size=1, max_size=8, timeout=30, max_lifetime=3600)
 
 
 @app.on_event("startup")
