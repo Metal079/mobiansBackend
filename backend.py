@@ -52,7 +52,7 @@ db_pool = None
 
 # Create a connection pool
 async def get_db_pool():
-    return psycopg_pool.AsyncConnectionPool(DSN, min_size=5, max_size=8, timeout=30, max_lifetime=3600, max_idle=300)
+    return psycopg_pool.AsyncConnectionPool(DSN, min_size=3, max_size=7, timeout=30, max_lifetime=3600, max_idle=300)
 
 
 @app.on_event("startup")
@@ -408,12 +408,13 @@ async def process_images_and_store_hashes(image_results, metadata, job_data):
 @app.post("/get_job/")
 async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
     metadata = {}
+    error_message = None
 
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
-                SELECT status, queue_position, finished_images, prompt, negative_prompt, seed, guidance_scale, job_type, model
+                SELECT status, queue_position, finished_images, prompt, negative_prompt, seed, guidance_scale, job_type, model, error_message
                 FROM vw_generation_queue 
                 WHERE id = %s
             """,
@@ -434,6 +435,7 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
         metadata["guidance_scale"],
         metadata["job_type"],
         metadata["model"],
+        error_message
     ) = result
 
     if job_status == "completed":
@@ -478,6 +480,10 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
                 "status": job_status,
                 "queue_position": queue_position,
             }
+        )
+    elif job_status == "failed":
+        return JSONResponse(
+            content={"status": "failed", "message": error_message}
         )
     else:
         return JSONResponse(
