@@ -11,6 +11,7 @@ import time
 import aiohttp
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel
@@ -49,6 +50,15 @@ session = None
 # Define db_pool as a global variable
 db_pool = None
 
+# Set up the CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
+
 
 # Create a connection pool
 async def get_db_pool():
@@ -80,15 +90,14 @@ async def shutdown_event():
     await session.close()
     # await app.state.db_pool.close()
 
-
-# Set up the CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
-    allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
-    allow_headers=["*"],  # Allow all headers
-)
+@app.middleware("http")
+async def add_cors_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
 
 
 class ImageData(BaseModel):
@@ -490,6 +499,27 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
             content={"status": "error", "message": "Unknown job status"}
         )
 
+@app.get("/get_loras/")
+async def get_loras():
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT * FROM lora_metadata
+                """
+            )
+            # Fetch column names
+            columns = [desc[0] for desc in acur.description]
+            # Fetch all rows
+            rows = await acur.fetchall()
+            
+            # Convert to list of dictionaries
+            result = [dict(zip(columns, row)) for row in rows]
+    
+    # Convert the result to a JSON-serializable format
+    json_compatible_result = jsonable_encoder(result)
+    
+    return JSONResponse(content=json_compatible_result)
 
 async def enhanced_filter(prompt, pattern, replacement):
     # Replace spaces with \W+ to match any non-word characters between the words
