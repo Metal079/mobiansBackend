@@ -1,7 +1,7 @@
 import os
 import io
 import base64
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Any
 import logging
 from datetime import datetime, timedelta
 import json
@@ -132,6 +132,7 @@ class JobData(BaseModel):
     rating: Optional[bool] = None
     enable_upscale: Optional[bool] = False
     is_dev_job: Optional[bool] = False
+    loras: Optional[List[Dict[str, Any]]] = None
 
 
 class ImageRequestModel(JobData):
@@ -204,10 +205,10 @@ async def submit_job(
                     id, status, assigned_gpu, prompt, image, image_UUID, mask_image,
                     color_inpaint, control_image, scheduler, steps, negative_prompt,
                     width, height, guidance_scale, seed, batch_size, strength,
-                    job_type, model, fast_pass_code, rating, enable_upscale, fast_pass_enabled, is_dev_job
+                    job_type, model, fast_pass_code, rating, enable_upscale, fast_pass_enabled, is_dev_job, loras
                 ) VALUES (
                     gen_random_uuid(), 'pending', NULL, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 ) RETURNING id;
             """,
                 (
@@ -233,9 +234,11 @@ async def submit_job(
                     image_request_data.enable_upscale,
                     fast_pass_enabled,
                     image_request_data.is_dev_job,
+                    json.dumps(image_request_data.loras)  # Convert loras to JSON
                 ),
             )
             job_id = await acur.fetchone()
+
 
     return JSONResponse(content={"job_id": str(job_id[0])})
 
@@ -506,6 +509,8 @@ async def get_loras():
             await acur.execute(
                 """
                 SELECT * FROM lora_metadata
+                WHERE image_url IS NOT NULL
+                ORDER BY uses DESC
                 """
             )
             # Fetch column names
