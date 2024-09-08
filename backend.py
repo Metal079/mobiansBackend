@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from pywebpush import webpush, WebPushException
 import imagehash
 import psycopg_pool
+from psycopg import errors
 
 from helper_functions import *
 
@@ -28,6 +29,8 @@ logging.basicConfig(level=logging.ERROR)  # Configure logging
 
 # Run 3 retries with exponential backoff strategy
 load_dotenv()
+
+API_KEY = os.environ.get("API_KEY")
 
 DBHOST = os.environ.get("DBHOST")
 DBNAME = os.environ.get("DBNAME")
@@ -242,6 +245,246 @@ async def submit_job(
 
     return JSONResponse(content={"job_id": str(job_id[0])})
 
+@app.get("/search_civitAi_loras_by_query/{query}")
+async def search_civitAi_loras_by_query(query: str):
+    civiAi_url = "https://civitai.com/api/v1/models"
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}"
+    }
+    params = {
+        "types": ["LORA", "LoCon"],
+        "sort": "Highest Rated", 
+        "period": "AllTime",
+        "limit": 30,
+        # "tag": "hentai", 
+        "query": query,
+        # "primaryFileOnly": True,
+        "nsfw ": "True",
+        "page": 1,
+        # "allowNoCredit": True,
+        # "hidden": False,
+    }
+
+    async with session.get(civiAi_url, headers=headers, params=params) as resp:
+        if resp.status != 200:
+            raise HTTPException(
+                status_code=resp.status, detail="Error in CivitAi search, ensure the query is correct"
+            )
+        data = await resp.json()
+
+    # We need to filter the data since it returns main pages that could contain several loras
+    loras = []
+    data = data['items']
+    for lora in data:
+        lora_page_info = {
+            'model_page_id': lora.get('id'),
+            'name': lora.get('name'),
+            'description': lora.get('description'),
+            'minor': lora.get('minor'),
+            'poi': lora.get('poi'),
+            'nsfw': lora.get('nsfw'),
+            'creator': lora.get('creator'),
+            'tags': lora.get('tags'),
+        }
+
+        for model in lora['modelVersions']:
+            lora_info = {
+                'model_version_id': model.get('id'),
+                'model_name': model.get('name'),
+                'base_model': model.get('baseModel'), 
+                'published_at': model.get('publishedAt'),
+                'nsfw_level': model.get('nsfwLevel'),
+                'description': model.get('description'),
+                'trained_words': model.get('trainedWords'),
+                'stats': model.get('stats'),
+                'files': model.get('files'),
+                'images': model.get('images'),
+                'donwload_url': model.get('downloadUrl'),
+            }
+
+            # Dont show if model isnt Pony or SD1.5
+            if lora_info['base_model'] not in ['Pony', 'SD 1.5']:
+                continue
+
+            # add the lora_info to the lora_page_info
+            lora_page_info['model'] = lora_info
+
+            loras.append({**lora_page_info, **lora_info})
+        pass
+
+    return JSONResponse(content=loras)
+
+@app.get("/search_civitAi_loras_by_id/{id}")
+async def search_civitAi_loras_by_id(id: str):
+    civiAi_url = f"https://civitai.com/api/v1/models/{id}"
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}"
+    }
+
+    async with session.get(civiAi_url, headers=headers) as resp:
+        if resp.status != 200:
+            raise HTTPException(
+                status_code=resp.status, detail="Error in CivitAi search, ensure the model id is correct"
+            )
+        data = await resp.json()
+
+    loras = []
+    if 'modelVersions' in data:
+        if data.get('type') != 'LORA' and data.get('type') != 'LoCon':
+            raise HTTPException(
+                status_code=422, detail="Model is not a LORA, please ensure the model you are searching for is a LORA"
+            )
+
+        lora_page_info = {
+            'model_page_id': data.get('id'),
+            'name': data.get('name'),
+            'description': data.get('description'),
+            'minor': data.get('minor'),
+            'poi': data.get('poi'),
+            'nsfw': data.get('nsfw'),
+            'creator': data.get('creator'),
+            'tags': data.get('tags'),
+        }
+
+        for model in data['modelVersions']:
+            lora_info = {
+                'model_version_id': model.get('id'),
+                'model_name': model.get('name'),
+                'base_model': model.get('baseModel'), 
+                'published_at': model.get('publishedAt'),
+                'nsfw_level': model.get('nsfwLevel'),
+                'description': model.get('description'),
+                'trained_words': model.get('trainedWords'),
+                'stats': model.get('stats'),
+                'files': model.get('files'),
+                'images': model.get('images'),
+                'donwload_url': model.get('downloadUrl'),
+            }
+
+            # Dont show if model isnt Pony or SD1.5
+            if lora_info['base_model'] not in ['Pony', 'SD 1.5']:
+                continue
+
+            # add the lora_info to the lora_page_info
+            lora_page_info['model'] = lora_info
+
+            loras.append({**lora_page_info, **lora_info})
+    else:
+        # error
+        raise HTTPException(
+                status_code=resp.status, detail="No model found"
+            )
+
+    return JSONResponse(content=loras)
+
+@app.get("/search_civitAi_loras_by_user/{username}")
+async def search_civitAi_loras_by_user(username: str):
+    civiAi_url = "https://civitai.com/api/v1/models"
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}"
+    }
+
+    params = {
+        "username": username,
+    }
+
+    async with session.get(civiAi_url, headers=headers, params=params) as resp:
+        if resp.status != 200:
+            raise HTTPException(
+                status_code=resp.status, detail="Error in CivitAi search, ensure the username is correct"
+            )
+        data = await resp.json()
+
+    # We need to filter the data since it returns main pages that could contain several loras
+    loras = []
+    data = data['items']
+    for lora in data:
+        if lora.get('type') != 'LORA' and lora.get('type') != 'LoCon':
+            continue
+
+        lora_page_info = {
+            'model_page_id': lora.get('id'),
+            'name': lora.get('name'),
+            'description': lora.get('description'),
+            'minor': lora.get('minor'),
+            'poi': lora.get('poi'),
+            'nsfw': lora.get('nsfw'),
+            'creator': lora.get('creator'),
+            'tags': lora.get('tags'),
+        }
+
+        for model in lora['modelVersions']:
+            lora_info = {
+                'model_version_id': model.get('id'),
+                'model_name': model.get('name'),
+                'base_model': model.get('baseModel'), 
+                'published_at': model.get('publishedAt'),
+                'nsfw_level': model.get('nsfwLevel'),
+                'description': model.get('description'),
+                'trained_words': model.get('trainedWords'),
+                'stats': model.get('stats'),
+                'files': model.get('files'),
+                'images': model.get('images'),
+                'donwload_url': model.get('downloadUrl'),
+            }
+
+            # Dont show if model isnt Pony or SD1.5
+            if lora_info['base_model'] not in ['Pony', 'SD 1.5']:
+                continue
+
+            # add the lora_info to the lora_page_info
+            lora_page_info['model'] = lora_info
+
+            loras.append({**lora_page_info, **lora_info})
+        pass
+
+    return JSONResponse(content=loras)
+
+
+class addLoraSuggestion(BaseModel):
+    lora_version_id: int
+    name: str
+    version: str
+    status: str
+    requestor: str
+    is_nsfw: bool
+    is_minor: bool
+    preview_image: str
+
+@app.post("/add_lora_suggestion/")
+async def add_lora_suggestion(lora_data: addLoraSuggestion):
+    # First we check if the lora is in the database already
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT * FROM lora_metadata
+                WHERE version_id = %s
+                """,
+                (lora_data.lora_version_id,),
+            )
+            row = await acur.fetchone()
+
+    if row:
+        return JSONResponse(content={"status": "error", "detail": "This lora already exists! Check out the loras tab :), if this is a mistake, report it on the discord!"}, status_code=400)
+
+    # Try to insert the suggestion into the database
+    try:
+        async with db_pool.connection() as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute(
+                    """
+                    INSERT INTO lora_suggestions (version_id, name, version, status, requestor, is_nsfw, is_minor, preview_image)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (lora_data.lora_version_id, lora_data.name, lora_data.version, lora_data.status, lora_data.requestor, lora_data.is_nsfw, lora_data.is_minor, lora_data.preview_image),
+                )
+        return JSONResponse(content={"status": "success"})
+    except errors.UniqueViolation:
+        return JSONResponse(content={"status": "error", "detail": "A suggestion for this LoRA already exists! Please be patient while its added!"}, status_code=400)
 
 def decode_base64_to_image(base64_str):
     # Convert base64 string to image
@@ -249,15 +492,6 @@ def decode_base64_to_image(base64_str):
         image = Image.open(io.BytesIO(base64.b64decode(base64_str.split(",", 1)[1])))
     except:
         image = Image.open(io.BytesIO(base64.b64decode(base64_str.split(",", 1)[0])))
-
-    # Resize image if needed
-    # tempAspectRatio = image.width / image.height
-    # if tempAspectRatio < 0.8:
-    #     image = image.resize((512, 768))
-    # elif tempAspectRatio > 1.2:
-    #     image = image.resize((768, 512))
-    # else:
-    #     image = image.resize((512, 512))
 
     return image
 
@@ -970,6 +1204,7 @@ async def discord_auth(auth_code: DiscordAuthCode):
         "status": "success",
         "is_member_of_your_guild": is_member_of_your_guild,
         "has_required_role": has_required_role,
+        "discord_user_id": user_id,
     }
 
 
