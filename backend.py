@@ -56,7 +56,7 @@ db_pool = None
 # Set up the CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://mobians.ai", "http://localhost:4200"],  # Allow all origins
+    allow_origins=["https://mobians.ai", "http://localhost:4200", "https://discord.com"],  # Allow all origins
     allow_credentials=True,
     allow_methods=["*"],  # Allow all methods
     allow_headers=["*"],  # Allow all headers
@@ -601,9 +601,14 @@ class JobRetryInfo(BaseModel):
 async def insert_image_hashes(image_hashes, metadata, job_data):
     logging.info("Inserting image hashes")
 
+    lora_text = ""
+    if metadata["loras"]:
+        for lora in metadata["loras"]:
+            lora_text += f"{lora['name']} - {lora['version']} - strength: {lora['strength']}\n"
+
     insert_query = """
-        INSERT INTO hashes (hash, prompt, negative_prompt, seed, cfg, model, created_date)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO hashes (hash, prompt, negative_prompt, seed, cfg, model, created_date, loras)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
     """
     values = [
         (
@@ -614,6 +619,7 @@ async def insert_image_hashes(image_hashes, metadata, job_data):
             metadata["guidance_scale"],
             metadata["model"],
             datetime.now(),
+            lora_text,
         )
         for i in range(4)
     ]
@@ -638,7 +644,7 @@ async def process_images_and_store_hashes(image_results, metadata, job_data):
     image_hashes = []
     for i in range(4):
         image = decode_base64_to_image(image_results[i])
-        image_hash = imagehash.average_hash(image, 8)
+        image_hash = imagehash.phash(image, 8)
         image_hash = await twos_complement(str(image_hash), 64)
         image_hashes.append(image_hash)
 
@@ -660,7 +666,7 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
-                SELECT status, queue_position, finished_images, prompt, negative_prompt, seed, guidance_scale, job_type, model, error_message
+                SELECT status, queue_position, finished_images, prompt, negative_prompt, seed, guidance_scale, job_type, model, error_message, loras
                 FROM vw_generation_queue 
                 WHERE id = %s
             """,
@@ -681,7 +687,8 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
         metadata["guidance_scale"],
         metadata["job_type"],
         metadata["model"],
-        error_message
+        error_message,
+        metadata['loras']
     ) = result
 
     if job_status == "completed":

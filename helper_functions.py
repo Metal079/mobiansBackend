@@ -49,6 +49,12 @@ async def add_image_metadata(image, request_data):
         metadata_dict["seed"] = str(request_data['seed'])
         metadata_dict["cfg"] = str(request_data['guidance_scale'])
         metadata_dict["job_type"] = request_data['job_type']
+        metadata_dict["loras"] = []
+        for lora in request_data['loras']:
+            metadata_dict["loras"].append(lora['name'] + " - " + lora['version'] + " - " + 'strength: ' + str(lora['strength']))
+
+        # Convert list to string
+        metadata_dict["loras"] = '\n'.join(metadata_dict["loras"])
     except Exception as e:
         logging.error(f"Error adding metadata to image: {e}")
         with open("error_log.txt", "a") as f:
