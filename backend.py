@@ -750,7 +750,7 @@ async def get_loras():
             await acur.execute(
                 """
                 SELECT * FROM lora_metadata
-                WHERE image_url IS NOT NULL
+                WHERE image_url IS NOT NULL and is_active = true
                 ORDER BY uses DESC
                 """
             )
