@@ -136,6 +136,7 @@ class JobData(BaseModel):
     enable_upscale: Optional[bool] = False
     is_dev_job: Optional[bool] = False
     loras: Optional[List[Dict[str, Any]]] = None
+    lossy_images: Optional[bool] = False
 
 
 class ImageRequestModel(JobData):
@@ -208,10 +209,10 @@ async def submit_job(
                     id, status, assigned_gpu, prompt, image, image_UUID, mask_image,
                     color_inpaint, control_image, scheduler, steps, negative_prompt,
                     width, height, guidance_scale, seed, batch_size, strength,
-                    job_type, model, fast_pass_code, rating, enable_upscale, fast_pass_enabled, is_dev_job, loras
+                    job_type, model, fast_pass_code, rating, enable_upscale, fast_pass_enabled, is_dev_job, loras, lossy_images
                 ) VALUES (
                     gen_random_uuid(), 'pending', NULL, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 ) RETURNING id;
             """,
                 (
@@ -237,7 +238,8 @@ async def submit_job(
                     image_request_data.enable_upscale,
                     fast_pass_enabled,
                     image_request_data.is_dev_job,
-                    json.dumps(image_request_data.loras)  # Convert loras to JSON
+                    json.dumps(image_request_data.loras),  # Convert loras to JSON
+                    image_request_data.lossy_images,
                 ),
             )
             job_id = await acur.fetchone()
@@ -607,8 +609,8 @@ async def insert_image_hashes(image_hashes, metadata, job_data):
             lora_text += f"{lora['name']} - {lora['version']} - strength: {lora['strength']}\n"
 
     insert_query = """
-        INSERT INTO hashes (hash, prompt, negative_prompt, seed, cfg, model, created_date, loras)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO hashes (hash, prompt, negative_prompt, seed, cfg, model, created_date, loras, job_id, finished_images_index)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     values = [
         (
@@ -620,6 +622,8 @@ async def insert_image_hashes(image_hashes, metadata, job_data):
             metadata["model"],
             datetime.now(),
             lora_text,
+            job_data.job_id,
+            i+1,
         )
         for i in range(4)
     ]
@@ -666,7 +670,7 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
-                SELECT status, queue_position, finished_images, prompt, negative_prompt, seed, guidance_scale, job_type, model, error_message, loras
+                SELECT status, queue_position, finished_images, prompt, negative_prompt, seed, guidance_scale, job_type, model, error_message, loras, lossy_images
                 FROM vw_generation_queue 
                 WHERE id = %s
             """,
@@ -688,7 +692,8 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
         metadata["job_type"],
         metadata["model"],
         error_message,
-        metadata['loras']
+        metadata['loras'],
+        metadata['lossy_images'],
     ) = result
 
     if job_status == "completed":
@@ -702,7 +707,7 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
             for i in range(4):
                 image = decode_base64_to_image(base64_strings[i])
                 watermarked_image_base64.append(
-                    await add_image_metadata(image.convert("RGB"), metadata)
+                    await add_image_metadata(image.convert("RGB"), metadata, lossy_image=metadata['lossy_images'])
                 )
 
             # Generate hashes for each image and store them in DB along with image info

@@ -28,7 +28,7 @@ font = ImageFont.truetype(font_file_path, 25)
 #         return image
 
 
-async def add_image_metadata(image, request_data):
+async def add_image_metadata(image, request_data, lossy_image=False):
     img_io = io.BytesIO()
     image_with_watermark = await add_watermark(image)
 
@@ -63,24 +63,53 @@ async def add_image_metadata(image, request_data):
     for key, value in metadata_dict.items():
         metadata.add_text(key, value)
 
-    image_with_watermark.save(img_io, format="PNG", pnginfo=metadata)
+    if lossy_image:
+        image_with_watermark.save(img_io, format="webp", quality=95, lossless=False, pnginfo=metadata)
+    else:
+        image_with_watermark.save(img_io, format="PNG", pnginfo=metadata)
     img_io.seek(0)
     base64_image = base64.b64encode(img_io.getvalue()).decode("utf-8")
     return base64_image
 
 
 async def add_watermark(image):
+    # Calculate image dimensions
+    image_width, image_height = image.size
+    
+    # Calculate font size as a percentage of image width
+    font_size = int(image_width * 0.05)  # 5% of the image width
+    font_size = max(font_size, 10)  # Ensure a minimum font size
+    font = ImageFont.truetype(font_file_path, font_size)
+    
+    # Create a new watermark layer
     watermark = Image.new("RGBA", image.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(watermark)
-
-    stroke_width = 2
+    
+    # Calculate position margins as a percentage of image dimensions
+    margin_x = int(image_width * 0.02)  # 1% margin from the left
+    margin_y = int(image_height * 0.01)  # 1% margin from the top
+    
+    # Adjust stroke width based on font size
+    stroke_width = max(2, int(font_size / 20))
+    
+    # Draw text with stroke for better visibility
     for dx in range(-stroke_width, stroke_width + 1):
         for dy in range(-stroke_width, stroke_width + 1):
             draw.text(
-                (10 + dx, 10 + dy), watermark_text, font=font, fill=(0, 0, 0, opacity)
+                (margin_x + dx, margin_y + dy),
+                watermark_text,
+                font=font,
+                fill=(0, 0, 0, opacity)
             )
-
-    draw.text((10, 10), watermark_text, font=font, fill=(255, 255, 255, opacity))
-
+    
+    # Draw the main watermark text
+    draw.text(
+        (margin_x, margin_y),
+        watermark_text,
+        font=font,
+        fill=(255, 255, 255, opacity)
+    )
+    
+    # Combine the watermark with the original image
     image_with_watermark = Image.alpha_composite(image.convert("RGBA"), watermark)
     return image_with_watermark
