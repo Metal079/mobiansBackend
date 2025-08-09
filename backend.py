@@ -1213,3 +1213,36 @@ async def discord_auth(auth_code: DiscordAuthCode):
 @app.get("/health_check")
 async def health_check():
     return {"status": 200}
+
+# New endpoint to cancel a pending job by ID
+@app.delete("/cancel_job/{job_id}/")
+async def cancel_job(job_id: str):
+    """Cancel a job by deleting it from the queue if it is still pending."""
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            # Attempt to delete only if job is still pending
+            await acur.execute(
+                """
+                DELETE FROM generation_queue
+                WHERE id = %s AND status = 'pending'
+                RETURNING id;
+                """,
+                (job_id,),
+            )
+            deleted = await acur.fetchone()
+            if deleted:
+                await aconn.commit()
+                return JSONResponse(content={"status": "success", "job_id": job_id})
+
+            # If not deleted, check if it exists and report why it can't be cancelled
+            await acur.execute(
+                """
+                SELECT status FROM vw_generation_queue WHERE id = %s;
+                """,
+                (job_id,),
+            )
+            row = await acur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Job not found")
+            else:
+                raise HTTPException(status_code=409, detail=f"Cannot cancel job in status '{row[0]}'")
