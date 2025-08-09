@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import json
 import re
 import time
+import math
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -56,7 +57,7 @@ db_pool = None
 # Set up the CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://mobians.ai", "http://localhost:4200", "https://discord.com"],  # Allow all origins
+    allow_origins=["*"],  # Allow all origins
     allow_credentials=True,
     allow_methods=["*"],  # Allow all methods
     allow_headers=["*"],  # Allow all headers
@@ -65,7 +66,7 @@ app.add_middleware(
 
 # Create a connection pool
 async def get_db_pool():
-    return psycopg_pool.AsyncConnectionPool(DSN, min_size=3, max_size=7, timeout=30, max_lifetime=3600, max_idle=300)
+    return psycopg_pool.AsyncConnectionPool(DSN, min_size=3, max_size=5, timeout=30, max_lifetime=3600, max_idle=300)
 
 
 @app.on_event("startup")
@@ -142,22 +143,6 @@ class JobData(BaseModel):
 class ImageRequestModel(JobData):
     image: Optional[str] = None
     fast_pass_enabled: Optional[bool] = False
-
-
-# async def refresh_fastpass_cache():
-#     while True:
-#         async with db_pool.connection() as aconn:
-#             async with aconn.cursor() as acur:
-#                 await acur.execute(
-#                     "SELECT fastpass_code, expiration_date FROM fastpass_new"
-#                 )
-#                 rows = await acur.fetchall()
-
-#                 for row in rows:
-#                     fastpass_code, expiration_date = row
-#                     fastpass_cache[fastpass_code] = expiration_date
-
-#         await asyncio.sleep(300)  # Refresh every 5 minutes (300 seconds)
 
 
 @app.post("/submit_job/")
@@ -305,8 +290,8 @@ async def search_civitAi_loras_by_query(query: str):
                 'donwload_url': model.get('downloadUrl'),
             }
 
-            # Dont show if model isnt Pony or SD1.5
-            if lora_info['base_model'] not in ['Pony', 'SD 1.5']:
+            # Dont show if model isnt Pony, SD1.5, or Illustrious
+            if lora_info['base_model'] not in ['Pony', 'SD 1.5', 'Illustrious']:
                 continue
 
             # add the lora_info to the lora_page_info
@@ -365,8 +350,8 @@ async def search_civitAi_loras_by_id(id: str):
                 'donwload_url': model.get('downloadUrl'),
             }
 
-            # Dont show if model isnt Pony or SD1.5
-            if lora_info['base_model'] not in ['Pony', 'SD 1.5']:
+            # Dont show if model isnt Pony, SD1.5, or Illustrious
+            if lora_info['base_model'] not in ['Pony', 'SD 1.5', 'Illustrious']:
                 continue
 
             # add the lora_info to the lora_page_info
@@ -433,8 +418,8 @@ async def search_civitAi_loras_by_user(username: str):
                 'donwload_url': model.get('downloadUrl'),
             }
 
-            # Dont show if model isnt Pony or SD1.5
-            if lora_info['base_model'] not in ['Pony', 'SD 1.5']:
+            # Dont show if model isnt Pony, SD1.5, or Illustrious
+            if lora_info['base_model'] not in ['Pony', 'SD 1.5', 'Illustrious']:
                 continue
 
             # add the lora_info to the lora_page_info
@@ -733,10 +718,14 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
                 }
             )
     elif job_status in ["pending", "processing"]:
+        # Use helper_functions cache to compute ETA
+        jobs_per_sec = await get_jobs_per_sec(db_pool)
+        eta_seconds = compute_eta_seconds(queue_position, jobs_per_sec)
         return JSONResponse(
             content={
                 "status": job_status,
                 "queue_position": queue_position,
+                "eta": eta_seconds,
             }
         )
     elif job_status == "failed":
