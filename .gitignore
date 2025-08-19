@@ -1,3 +1,5 @@
 *__pycache__
 *venv
 .env
+dockerfile
+create_docker_container.txt
