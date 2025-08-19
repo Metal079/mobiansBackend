@@ -2,6 +2,9 @@ import io
 import base64
 import logging
 import random
+import time
+import math
+from typing import Optional, Dict
 
 from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
 
@@ -113,3 +116,56 @@ async def add_watermark(image):
     # Combine the watermark with the original image
     image_with_watermark = Image.alpha_composite(image.convert("RGBA"), watermark)
     return image_with_watermark
+
+
+# ---- throughput/ETA helpers -----
+THROUGHPUT_CACHE_TTL_SEC = 30  # refresh at most every 30s
+EWMA_ALPHA = 0.6  # smoothing factor for rate updates
+throughput_cache: Dict[str, Optional[float]] = {"last_refresh": None, "jobs_per_sec": None}
+
+
+async def refresh_throughput_cache(db_pool) -> float:
+    """Refresh cached jobs/sec using DB function public.get_last_10_minutes_total_completed()."""
+    count_last_10_min = 0
+    try:
+        async with db_pool.connection() as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute("SELECT public.get_last_10_minutes_total_completed();")
+                row = await acur.fetchone()
+                if row is not None and row[0] is not None:
+                    count_last_10_min = float(row[0])
+    except Exception as e:
+        logging.error(f"Failed to refresh throughput cache: {e}")
+
+    window_seconds = 600.0
+    raw_rate = (count_last_10_min / window_seconds) if window_seconds > 0 else 0.0
+
+    prev = throughput_cache.get("jobs_per_sec") or 0.0
+    # Apply EWMA smoothing; avoid snapping to zero immediately when there is a lull
+    if raw_rate == 0.0 and prev > 0.0:
+        smoothed = prev * 0.95  # gentle decay when no jobs completed in window
+    else:
+        smoothed = EWMA_ALPHA * raw_rate + (1.0 - EWMA_ALPHA) * prev
+
+    smoothed = max(smoothed, 0.0)
+    throughput_cache["jobs_per_sec"] = smoothed
+    throughput_cache["last_refresh"] = time.time()
+    return smoothed
+
+
+async def get_jobs_per_sec(db_pool) -> float:
+    """Return cached jobs/sec, refreshing if TTL expired."""
+    last = throughput_cache.get("last_refresh")
+    if last is None or (time.time() - last) > THROUGHPUT_CACHE_TTL_SEC:
+        rate = await refresh_throughput_cache(db_pool)
+    else:
+        rate = throughput_cache.get("jobs_per_sec") or 0.0
+    return rate
+
+
+def compute_eta_seconds(queue_position: Optional[int], jobs_per_sec: float) -> Optional[int]:
+    if queue_position is None:
+        return None
+    if jobs_per_sec <= 0:
+        return None
+    return int(math.ceil(max(queue_position, 0) / jobs_per_sec))
