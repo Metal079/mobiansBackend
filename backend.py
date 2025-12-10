@@ -1,6 +1,8 @@
 import os
 import io
 import base64
+import sys
+import asyncio
 from typing import Optional, Dict, List, Any
 import logging
 from datetime import datetime, timedelta
@@ -8,12 +10,18 @@ import json
 import re
 import time
 import math
+import secrets
+
+# Fix for Windows - psycopg async requires SelectorEventLoop
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from PIL import Image
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -48,7 +56,54 @@ VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY")
 VAPID_CLAIMS = os.environ.get("VAPID_CLAIMS")
 subscriptions: Dict[str, dict] = {}
 
+# Credit costs by model type
+CREDIT_COSTS = {
+    "SD 1.5": 2,      # sonicDiffusionV4
+    "Pony": 5,        #  autismMix, (SDXL-based)
+    "Illustrious": 5  # novaFurryXL_V8B (SDXL-based), novaMobianXL_v10
+}
+
+# Credit packages for purchase
+CREDIT_PACKAGES = {
+    "starter": {
+        "id": "starter",
+        "name": "Starter Pack",
+        "price_usd": 5.00,
+        "credits": 500,
+        "description": "500 credits - Great for trying out priority queue"
+    },
+    "popular": {
+        "id": "popular",
+        "name": "Popular Pack",
+        "price_usd": 10.00,
+        "credits": 1150,
+        "description": "1,150 credits - 15% bonus!"
+    },
+    "best_value": {
+        "id": "best_value",
+        "name": "Best Value Pack",
+        "price_usd": 25.00,
+        "credits": 3125,
+        "description": "3,125 credits - 25% bonus!"
+    }
+}
+
+# PayPal configuration
+PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
+PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET")
+PAYPAL_MODE = os.environ.get("PAYPAL_MODE", "sandbox")  # "sandbox" or "live"
+PAYPAL_API_BASE = "https://api-m.sandbox.paypal.com" if PAYPAL_MODE == "sandbox" else "https://api-m.paypal.com"
+
+# Map model names to their base types
+MODEL_BASE_TYPES = {
+    "sonicDiffusionV4": "SD 1.5",
+    "autismMix": "Pony",
+    "novaMobianXL_v10": "Illustrious",
+    "novaFurryXL_V8B": "Illustrious"
+}
+
 app = FastAPI()
+security = HTTPBearer(auto_error=False)
 fastpass_cache = {}  # In-memory cache for FastPass data
 session = None
 # Define db_pool as a global variable
@@ -96,12 +151,261 @@ async def shutdown_event():
 
 @app.middleware("http")
 async def add_cors_headers(request, call_next):
+    # Handle preflight OPTIONS request
+    if request.method == "OPTIONS":
+        response = JSONResponse(content=None, status_code=200)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        return response
+    
     response = await call_next(request)
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Allow-Methods"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
+
+
+# Exception handler to ensure CORS headers on errors
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    response = JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
+
+# Generic exception handler for unhandled errors
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    response = JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)}
+    )
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
+
+# ============================================
+# SESSION TOKEN AUTHENTICATION
+# ============================================
+
+def generate_session_token() -> str:
+    """Generate a secure random session token."""
+    return secrets.token_urlsafe(32)
+
+
+async def create_session_token(user_id: str) -> str:
+    """Create and store a session token for a user in the database."""
+    token = generate_session_token()
+    expires_at = datetime.utcnow() + timedelta(days=30)
+    
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            # Insert or update the session token
+            await acur.execute(
+                """
+                INSERT INTO user_sessions (user_id, token, expires_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET token = %s, expires_at = %s, created_at = NOW()
+                """,
+                (user_id, token, expires_at, token, expires_at)
+            )
+    return token
+
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Optional[dict]:
+    """
+    Dependency to get the current user from session token.
+    Returns None if no valid token is provided (allows anonymous access).
+    """
+    if not credentials:
+        print("DEBUG: No credentials provided")
+        return None
+    
+    token = credentials.credentials
+    print(f"DEBUG: Token received: {token[:20]}..." if token and len(token) > 20 else f"DEBUG: Token: {token}")
+    if not token:
+        return None
+    
+    try:
+        async with db_pool.connection() as aconn:
+            async with aconn.cursor() as acur:
+                # Look up the session token and get user data in one query
+                await acur.execute(
+                    """
+                    SELECT u.id, u.discord_user_id, u.google_user_id, u.email, u.username, 
+                           u.display_name, u.avatar_url, u.credits, u.last_daily_bonus, 
+                           u.daily_bonus_streak, u.is_banned
+                    FROM users u
+                    JOIN user_sessions s ON u.id = s.user_id
+                    WHERE s.token = %s AND s.expires_at > NOW()
+                    """,
+                    (token,)
+                )
+                row = await acur.fetchone()
+                print(f"DEBUG: Query result row: {row}")
+                if not row:
+                    return None
+                
+                return {
+                    "user_id": str(row[0]),
+                    "discord_user_id": row[1],
+                    "google_user_id": row[2],
+                    "email": row[3],
+                    "username": row[4],
+                    "display_name": row[5],
+                    "avatar_url": row[6],
+                    "credits": row[7],
+                    "last_daily_bonus": row[8].isoformat() if row[8] else None,
+                    "daily_bonus_streak": row[9],
+                    "is_banned": row[10]
+                }
+    except Exception as e:
+        logging.error(f"Error fetching user: {e}")
+        return None
+
+
+async def require_auth(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """
+    Dependency that requires authentication - raises 401 if not authenticated.
+    """
+    user = await get_current_user(credentials)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if user.get("is_banned"):
+        raise HTTPException(status_code=403, detail="Account is banned")
+    return user
+
+
+async def upsert_user(
+    discord_user_id: str = None,
+    google_user_id: str = None,
+    email: str = None,
+    username: str = None,
+    display_name: str = None,
+    avatar_url: str = None
+) -> dict:
+    """
+    Create or update a user. Returns user data with token.
+    - If user exists (by discord_user_id or google_user_id), update their info
+    - If new user, create with 100 bonus credits
+    - Handles account linking (adding google to existing discord account, etc.)
+    """
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            # First, try to find existing user by either OAuth ID
+            existing_user = None
+            
+            if discord_user_id:
+                await acur.execute(
+                    "SELECT id, credits, last_daily_bonus, daily_bonus_streak FROM users WHERE discord_user_id = %s",
+                    (discord_user_id,)
+                )
+                existing_user = await acur.fetchone()
+            
+            if not existing_user and google_user_id:
+                await acur.execute(
+                    "SELECT id, credits, last_daily_bonus, daily_bonus_streak FROM users WHERE google_user_id = %s",
+                    (google_user_id,)
+                )
+                existing_user = await acur.fetchone()
+            
+            if existing_user:
+                # Update existing user
+                user_id = existing_user[0]
+                credits = existing_user[1]
+                last_daily_bonus = existing_user[2]
+                daily_bonus_streak = existing_user[3]
+                
+                # Build update query dynamically to handle linking
+                updates = ["last_login_at = NOW()"]
+                params = []
+                
+                if discord_user_id:
+                    updates.append("discord_user_id = COALESCE(discord_user_id, %s)")
+                    params.append(discord_user_id)
+                if google_user_id:
+                    updates.append("google_user_id = COALESCE(google_user_id, %s)")
+                    params.append(google_user_id)
+                if email:
+                    updates.append("email = COALESCE(%s, email)")
+                    params.append(email)
+                if display_name:
+                    updates.append("display_name = %s")
+                    params.append(display_name)
+                if avatar_url:
+                    updates.append("avatar_url = %s")
+                    params.append(avatar_url)
+                
+                params.append(user_id)
+                
+                await acur.execute(
+                    f"UPDATE users SET {', '.join(updates)} WHERE id = %s",
+                    tuple(params)
+                )
+                
+                is_new_user = False
+            else:
+                # Create new user with signup bonus
+                await acur.execute(
+                    """
+                    INSERT INTO users (discord_user_id, google_user_id, email, username, display_name, avatar_url, credits, last_login_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, 100, NOW())
+                    RETURNING id, credits
+                    """,
+                    (discord_user_id, google_user_id, email, username, display_name, avatar_url)
+                )
+                result = await acur.fetchone()
+                user_id = result[0]
+                credits = result[1]
+                last_daily_bonus = None
+                daily_bonus_streak = 0
+                
+                # Record signup bonus transaction
+                await acur.execute(
+                    """
+                    INSERT INTO credit_transactions (user_id, amount, balance_after, transaction_type, description)
+                    VALUES (%s, 100, 100, 'signup_bonus', 'Welcome bonus - 100 free credits!')
+                    """,
+                    (user_id,)
+                )
+                
+                is_new_user = True
+            
+            # Generate session token and store in database
+            token = await create_session_token(str(user_id))
+            
+            return {
+                "user_id": str(user_id),
+                "discord_user_id": discord_user_id,
+                "google_user_id": google_user_id,
+                "email": email,
+                "username": username,
+                "display_name": display_name,
+                "avatar_url": avatar_url,
+                "credits": credits,
+                "last_daily_bonus": last_daily_bonus.isoformat() if last_daily_bonus else None,
+                "daily_bonus_streak": daily_bonus_streak,
+                "token": token,
+                "is_new_user": is_new_user
+            }
+
+
+def get_credit_cost(model: str) -> int:
+    """Get the credit cost for a given model."""
+    base_type = MODEL_BASE_TYPES.get(model, "SD 1.5")
+    return CREDIT_COSTS.get(base_type, 2)
 
 
 class ImageData(BaseModel):
@@ -138,20 +442,51 @@ class JobData(BaseModel):
     is_dev_job: Optional[bool] = False
     loras: Optional[List[Dict[str, Any]]] = None
     lossy_images: Optional[bool] = False
+    # New fields for credit system
+    queue_type: Optional[str] = "free"  # "free" or "priority"
 
 
 class ImageRequestModel(JobData):
     image: Optional[str] = None
     fast_pass_enabled: Optional[bool] = False
+    user_id: Optional[str] = None
+    credit_cost: Optional[int] = 0
 
 
 @app.post("/submit_job/")
 async def submit_job(
     job_data: JobData,
     background_tasks: BackgroundTasks,
+    user: Optional[dict] = Depends(get_current_user),
 ):
-    # Check if FastPassCode is valid and non-expired
-    fast_pass_enabled = False
+    # Determine queue type and credit cost
+    queue_type = job_data.queue_type or "free"
+    credit_cost = 0
+    user_id = None
+    
+    # If user wants priority queue, they must be authenticated and have credits
+    if queue_type == "priority":
+        if not user:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required for priority queue. Please log in or use the free queue."
+            )
+        
+        user_id = user["user_id"]
+        credit_cost = get_credit_cost(job_data.model or "sonicDiffusionV4")
+        
+        if user["credits"] < credit_cost:
+            raise HTTPException(
+                status_code=402,
+                detail=f"Insufficient credits. You need {credit_cost} credits but have {user['credits']}. Use the free queue or purchase more credits."
+            )
+    elif user:
+        # Free queue but user is logged in - track the user_id anyway
+        user_id = user["user_id"]
+    
+    # Check if FastPassCode is valid and non-expired (legacy system - overrides queue_type)
+    # fast_pass_enabled is used by the queue view to determine priority order
+    fast_pass_enabled = (queue_type == "priority")
     if job_data.fast_pass_code:
         try:
             is_valid = await validate_fastpass(
@@ -159,13 +494,14 @@ async def submit_job(
             )
             if is_valid:
                 fast_pass_enabled = True
+                queue_type = "priority"  # FastPass gives priority
+                credit_cost = 0  # FastPass is free
             else:
                 raise HTTPException(
                     status_code=400,
                     detail="Invalid or expired FastPassCode. Please fix/remove the FastPassCode and try again.",
                 )
         except HTTPException as e:
-            # Re-raise the HTTPException to be handled by FastAPI
             raise e
         except Exception as e:
             logging.error(
@@ -183,21 +519,43 @@ async def submit_job(
 
     # Create an instance of ImageRequestModel
     image_request_data = ImageRequestModel(
-        **job_data.dict(), fast_pass_enabled=fast_pass_enabled
+        **job_data.dict(), 
+        fast_pass_enabled=fast_pass_enabled,
+        user_id=user_id,
+        credit_cost=credit_cost
     )
 
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
+            # If priority queue with credits, deduct first (atomic with job creation)
+            if queue_type == "priority" and credit_cost > 0 and user_id:
+                # Deduct credits
+                await acur.execute(
+                    "SELECT * FROM deduct_credits(%s, %s, %s, NULL, %s)",
+                    (user_id, credit_cost, f"generation_{MODEL_BASE_TYPES.get(job_data.model, 'SD 1.5').lower().replace(' ', '')}", 
+                     f"Priority generation - {job_data.model}")
+                )
+                deduct_result = await acur.fetchone()
+                if not deduct_result or not deduct_result[0]:
+                    raise HTTPException(
+                        status_code=402,
+                        detail=f"Failed to deduct credits: {deduct_result[2] if deduct_result else 'Unknown error'}"
+                    )
+                new_balance = deduct_result[1]
+            else:
+                new_balance = user["credits"] if user else None
+            
             await acur.execute(
                 """
                 INSERT INTO generation_queue (
                     id, status, assigned_gpu, prompt, image, image_UUID, mask_image,
                     color_inpaint, control_image, scheduler, steps, negative_prompt,
                     width, height, guidance_scale, seed, batch_size, strength,
-                    job_type, model, fast_pass_code, rating, enable_upscale, fast_pass_enabled, is_dev_job, loras, lossy_images
+                    job_type, model, fast_pass_code, rating, enable_upscale, fast_pass_enabled, 
+                    is_dev_job, loras, lossy_images, user_id, queue_type, credit_cost
                 ) VALUES (
                     gen_random_uuid(), 'pending', NULL, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 ) RETURNING id;
             """,
                 (
@@ -225,12 +583,34 @@ async def submit_job(
                     image_request_data.is_dev_job,
                     json.dumps(image_request_data.loras),  # Convert loras to JSON
                     image_request_data.lossy_images,
+                    user_id,
+                    queue_type,
+                    credit_cost,
                 ),
             )
             job_id = await acur.fetchone()
+            
+            # Update the credit transaction with job_id if credits were deducted
+            if queue_type == "priority" and credit_cost > 0 and user_id:
+                await acur.execute(
+                    """
+                    UPDATE credit_transactions 
+                    SET job_id = %s 
+                    WHERE id = (
+                        SELECT id FROM credit_transactions 
+                        WHERE user_id = %s AND job_id IS NULL 
+                        ORDER BY created_at DESC LIMIT 1
+                    )
+                    """,
+                    (job_id[0], user_id)
+                )
 
-
-    return JSONResponse(content={"job_id": str(job_id[0])})
+    response_data = {"job_id": str(job_id[0]), "queue_type": queue_type}
+    if credit_cost > 0:
+        response_data["credits_used"] = credit_cost
+        response_data["credits_remaining"] = new_balance
+    
+    return JSONResponse(content=response_data)
 
 @app.get("/search_civitAi_loras_by_query/{query}")
 async def search_civitAi_loras_by_query(query: str):
@@ -1122,6 +1502,8 @@ async def send_notification(user_id: str):  # Change the type to str
 
 class DiscordAuthCode(BaseModel):
     code: str
+    redirect_uri: Optional[str] = None
+    link: Optional[bool] = False  # Allow link parameter from frontend
 
 
 @app.post("/discord_auth/")
@@ -1129,7 +1511,13 @@ async def discord_auth(auth_code: DiscordAuthCode):
     discord_token_url = "https://discord.com/api/oauth2/token"
     client_id = os.environ.get("DISCORD_CLIENT_ID")
     client_secret = os.environ.get("DISCORD_CLIENT_SECRET")
-    redirect_uri = os.environ.get("DISCORD_REDIRECT_URI")
+    redirect_uri = auth_code.redirect_uri or os.environ.get("DISCORD_REDIRECT_URI")
+
+    if not client_id or not client_secret or not redirect_uri:
+        raise HTTPException(
+            status_code=500,
+            detail="Discord OAuth not fully configured on server",
+        )
 
     data = {
         "client_id": client_id,
@@ -1141,38 +1529,48 @@ async def discord_auth(auth_code: DiscordAuthCode):
 
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
-    async with session.post(discord_token_url, data=data, headers=headers) as resp:
-        if resp.status != 200:
-            raise HTTPException(
-                status_code=resp.status, detail="Error in Discord token exchange"
-            )
-        token_data = await resp.json()
+    # Use a fresh session without trust_env to avoid proxy issues
+    try:
+        async with aiohttp.ClientSession() as oauth_session:
+            async with oauth_session.post(discord_token_url, data=data, headers=headers) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logging.error(f"Discord token exchange failed: {resp.status} - {error_text}")
+                    raise HTTPException(
+                        status_code=resp.status, detail=f"Error in Discord token exchange: {error_text}"
+                    )
+                token_data = await resp.json()
+                access_token = token_data.get("access_token")
 
-        access_token = token_data.get("access_token")
+            discord_guilds_url = "https://discord.com/api/users/@me/guilds"
+            auth_headers = {"Authorization": f"Bearer {access_token}"}
 
-    discord_guilds_url = "https://discord.com/api/users/@me/guilds"
-    headers = {"Authorization": f"Bearer {access_token}"}
+            async with oauth_session.get(discord_guilds_url, headers=auth_headers) as guild_resp:
+                if guild_resp.status != 200:
+                    raise HTTPException(
+                        status_code=guild_resp.status,
+                        detail="Error fetching user guilds from Discord",
+                    )
+                guilds = await guild_resp.json()
 
-    async with session.get(discord_guilds_url, headers=headers) as guild_resp:
-        if guild_resp.status != 200:
-            raise HTTPException(
-                status_code=guild_resp.status,
-                detail="Error fetching user guilds from Discord",
-            )
-        guilds = await guild_resp.json()
+            # Fetch the authenticated user's information
+            discord_user_url = "https://discord.com/api/users/@me"
+            async with oauth_session.get(discord_user_url, headers=auth_headers) as user_resp:
+                if user_resp.status != 200:
+                    raise HTTPException(
+                        status_code=user_resp.status,
+                        detail="Error fetching user data from Discord",
+                    )
+                user_data = await user_resp.json()
+    except aiohttp.ClientError as e:
+        logging.error(f"Discord API connection error: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to connect to Discord API: {str(e)}"
+        )
 
-    # Fetch the authenticated user's information
-    access_token = token_data.get("access_token")
-    discord_user_url = "https://discord.com/api/users/@me"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    async with session.get(discord_user_url, headers=headers) as user_resp:
-        if user_resp.status != 200:
-            raise HTTPException(
-                status_code=user_resp.status,
-                detail="Error fetching user data from Discord",
-            )
-        user_data = await user_resp.json()
-        user_id = user_data["id"]  # Get the user's ID
+    user_id = user_data.get("id")  # Get the user's ID
+    username = user_data.get("username")
+    global_name = user_data.get("global_name")
 
     your_guild_id = "1095514548112461924"  # Replace with your Discord server's ID
     is_member_of_your_guild = any(guild["id"] == your_guild_id for guild in guilds)
@@ -1182,30 +1580,705 @@ async def discord_auth(auth_code: DiscordAuthCode):
         "1100272052008652922",
     ]
 
-    has_required_role = False  # Replace with your role checking logic
+    has_required_role = False
     bot_ip = os.environ.get("DISCORD_BOT_IP")
-    # Now make the request to your bot's /check_role endpoint
-    async with session.post(
-        f"http://{bot_ip}:6965/check_role",
-        json={
-            "guild_id": your_guild_id,
-            "user_id": user_id,
-            "role_ids": role_ids_to_check,
-        },
-        headers={"Authorization": "YourSecretToken"},
-    ) as response:
-        if response.status != 200:
-            raise HTTPException(
-                status_code=response.status, detail="Error communicating with the bot"
-            )
-        data = await response.json()
-        has_required_role = data["has_role"]
+    # Optionally query bot for role check; don't fail login if bot is unavailable
+    if bot_ip and user_id:
+        try:
+            async with session.post(
+                f"http://{bot_ip}:6965/check_role",
+                json={
+                    "guild_id": your_guild_id,
+                    "user_id": user_id,
+                    "role_ids": role_ids_to_check,
+                },
+                headers={"Authorization": "YourSecretToken"},
+            ) as bot_resp:
+                if bot_resp.status == 200:
+                    bot_data = await bot_resp.json()
+                    has_required_role = bool(bot_data.get("has_role"))
+        except Exception as e:
+            logging.error(f"Bot role check failed: {e}")
+
+    # Build Discord avatar URL
+    avatar_hash = user_data.get("avatar")
+    avatar_url = None
+    if avatar_hash:
+        avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png"
+
+    # Create or update user in database and get JWT token
+    try:
+        user_record = await upsert_user(
+            discord_user_id=user_id,
+            username=username,
+            display_name=global_name or username,
+            avatar_url=avatar_url
+        )
+    except Exception as e:
+        logging.error(f"Error upserting user: {e}")
+        # Fall back to returning basic info without credits
+        return {
+            "status": "success",
+            "is_member_of_your_guild": is_member_of_your_guild,
+            "has_required_role": has_required_role,
+            "discord_user_id": user_id,
+            "username": username,
+            "display_name": global_name or username,
+        }
 
     return {
         "status": "success",
         "is_member_of_your_guild": is_member_of_your_guild,
         "has_required_role": has_required_role,
         "discord_user_id": user_id,
+        "username": username,
+        "display_name": global_name or username,
+        "avatar_url": avatar_url,
+        # New fields for credits system
+        "user_id": user_record["user_id"],
+        "credits": user_record["credits"],
+        "token": user_record["token"],
+        "last_daily_bonus": user_record["last_daily_bonus"],
+        "daily_bonus_streak": user_record["daily_bonus_streak"],
+        "is_new_user": user_record["is_new_user"],
+    }
+
+
+class GoogleAuthCode(BaseModel):
+    code: str
+    redirect_uri: Optional[str] = None
+    link: Optional[bool] = False  # Allow link parameter from frontend
+
+
+@app.post("/google_auth/")
+async def google_auth(auth_code: GoogleAuthCode):
+    token_url = "https://oauth2.googleapis.com/token"
+    client_id = os.environ.get("GOOGLE_CLIENT_ID")
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+    redirect_uri = auth_code.redirect_uri or os.environ.get("GOOGLE_REDIRECT_URI")
+
+    if not client_id or not client_secret or not redirect_uri:
+        raise HTTPException(status_code=500, detail="Google OAuth not configured on server")
+
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "authorization_code",
+        "code": auth_code.code,
+        "redirect_uri": redirect_uri,
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    try:
+        async with aiohttp.ClientSession() as oauth_session:
+            async with oauth_session.post(token_url, data=data, headers=headers) as resp:
+                if resp.status != 200:
+                    detail = await resp.text()
+                    logging.error(f"Google token exchange failed: {resp.status} - {detail}")
+                    raise HTTPException(status_code=resp.status, detail=f"Error in Google token exchange: {detail}")
+                token_data = await resp.json()
+
+            access_token = token_data.get("access_token")
+            if not access_token:
+                raise HTTPException(status_code=400, detail="Missing access_token in Google response")
+
+            userinfo_url = "https://openidconnect.googleapis.com/v1/userinfo"
+            auth_headers = {"Authorization": f"Bearer {access_token}"}
+            async with oauth_session.get(userinfo_url, headers=auth_headers) as user_resp:
+                if user_resp.status != 200:
+                    raise HTTPException(status_code=user_resp.status, detail="Error fetching Google userinfo")
+                user_data = await user_resp.json()
+    except aiohttp.ClientError as e:
+        logging.error(f"Google API connection error: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to connect to Google API: {str(e)}"
+        )
+
+    # Create or update user in database and get JWT token
+    try:
+        user_record = await upsert_user(
+            google_user_id=user_data.get("sub"),
+            email=user_data.get("email"),
+            username=user_data.get("email"),
+            display_name=user_data.get("name") or user_data.get("email"),
+            avatar_url=user_data.get("picture")
+        )
+    except Exception as e:
+        logging.error(f"Error upserting user: {e}")
+        # Fall back to returning basic info without credits
+        return {
+            "status": "success",
+            "google_user_id": user_data.get("sub"),
+            "email": user_data.get("email"),
+            "username": user_data.get("email"),
+            "display_name": user_data.get("name") or user_data.get("email"),
+            "picture": user_data.get("picture"),
+        }
+
+    # user_data contains fields like: sub, email, email_verified, name, given_name, family_name, picture
+    return {
+        "status": "success",
+        "google_user_id": user_data.get("sub"),
+        "email": user_data.get("email"),
+        "username": user_data.get("email"),
+        "display_name": user_data.get("name") or user_data.get("email"),
+        "picture": user_data.get("picture"),
+        # New fields for credits system
+        "user_id": user_record["user_id"],
+        "credits": user_record["credits"],
+        "token": user_record["token"],
+        "last_daily_bonus": user_record["last_daily_bonus"],
+        "daily_bonus_streak": user_record["daily_bonus_streak"],
+        "is_new_user": user_record["is_new_user"],
+    }
+
+
+# ============================================
+# CREDIT MANAGEMENT ENDPOINTS
+# ============================================
+
+@app.get("/user/me")
+async def get_current_user_info(user: dict = Depends(require_auth)):
+    """Get the current authenticated user's information including credits."""
+    return {
+        "status": "success",
+        "user": user
+    }
+
+
+@app.get("/user/credits")
+async def get_user_credits(user: dict = Depends(require_auth)):
+    """Get the current user's credit balance and recent transactions."""
+    user_id = user["user_id"]
+    
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            # Get recent transactions
+            await acur.execute(
+                """
+                SELECT id, amount, balance_after, transaction_type, description, created_at
+                FROM credit_transactions
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT 20
+                """,
+                (user_id,)
+            )
+            rows = await acur.fetchall()
+            
+            transactions = [
+                {
+                    "id": str(row[0]),
+                    "amount": row[1],
+                    "balance_after": row[2],
+                    "type": row[3],
+                    "description": row[4],
+                    "created_at": row[5].isoformat() if row[5] else None
+                }
+                for row in rows
+            ]
+    
+    # Check if daily bonus can be claimed using the DB's current_date to avoid timezone drift
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                "SELECT (last_daily_bonus IS NULL OR last_daily_bonus <> CURRENT_DATE) AS can_claim_daily FROM users WHERE id = %s",
+                (user_id,)
+            )
+            row = await acur.fetchone()
+            can_claim_daily = bool(row[0]) if row else False
+    
+    return {
+        "status": "success",
+        "credits": user["credits"],
+        "can_claim_daily_bonus": can_claim_daily,
+        "daily_bonus_streak": user["daily_bonus_streak"],
+        "transactions": transactions
+    }
+
+
+@app.post("/user/credits/daily")
+async def claim_daily_bonus(user: dict = Depends(require_auth)):
+    """Claim the daily 15 credit bonus."""
+    user_id = user["user_id"]
+    
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            # Call the stored function
+            await acur.execute(
+                "SELECT * FROM claim_daily_bonus(%s)",
+                (user_id,)
+            )
+            result = await acur.fetchone()
+            
+            if result:
+                success, credits_awarded, new_balance, streak, message = result
+                
+                if success:
+                    return {
+                        "status": "success",
+                        "message": message,
+                        "credits_awarded": credits_awarded,
+                        "new_balance": new_balance,
+                        "streak": streak
+                    }
+                else:
+                    raise HTTPException(status_code=400, detail=message)
+            else:
+                raise HTTPException(status_code=500, detail="Failed to claim daily bonus")
+
+
+@app.get("/credits/cost/{model}")
+async def get_model_credit_cost(model: str):
+    """Get the credit cost for a specific model. Public endpoint."""
+    cost = get_credit_cost(model)
+    base_type = MODEL_BASE_TYPES.get(model, "SD 1.5")
+    
+    return {
+        "model": model,
+        "base_type": base_type,
+        "credit_cost": cost
+    }
+
+
+@app.get("/credits/costs")
+async def get_all_credit_costs():
+    """Get credit costs for all models. Public endpoint."""
+    return {
+        "costs": CREDIT_COSTS,
+        "models": MODEL_BASE_TYPES
+    }
+
+
+# ============================================
+# PAYPAL PAYMENT ENDPOINTS
+# ============================================
+
+async def get_paypal_access_token() -> str:
+    """Get PayPal OAuth access token."""
+    if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
+        raise HTTPException(status_code=503, detail="PayPal not configured")
+    
+    auth = aiohttp.BasicAuth(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET)
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    data = "grant_type=client_credentials"
+    
+    async with aiohttp.ClientSession() as pp_session:
+        async with pp_session.post(
+            f"{PAYPAL_API_BASE}/v1/oauth2/token",
+            auth=auth,
+            headers=headers,
+            data=data
+        ) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                logging.error(f"PayPal auth failed: {error_text}")
+                raise HTTPException(status_code=503, detail="PayPal authentication failed")
+            token_data = await resp.json()
+            return token_data["access_token"]
+
+
+@app.get("/credit-packages")
+async def get_credit_packages():
+    """Get available credit packages for purchase. Public endpoint."""
+    return {
+        "packages": list(CREDIT_PACKAGES.values()),
+        "paypal_client_id": PAYPAL_CLIENT_ID,
+        "paypal_mode": PAYPAL_MODE
+    }
+
+
+class CreateOrderRequest(BaseModel):
+    package_id: str
+
+
+@app.post("/paypal/create-order")
+async def paypal_create_order(request: CreateOrderRequest, user: dict = Depends(require_auth)):
+    """Create a PayPal order for a credit package."""
+    package = CREDIT_PACKAGES.get(request.package_id)
+    if not package:
+        raise HTTPException(status_code=400, detail="Invalid package ID")
+    
+    access_token = await get_paypal_access_token()
+    
+    order_data = {
+        "intent": "CAPTURE",
+        "purchase_units": [{
+            "reference_id": f"{user['user_id']}_{request.package_id}_{int(time.time())}",
+            "description": package["description"],
+            "amount": {
+                "currency_code": "USD",
+                "value": f"{package['price_usd']:.2f}"
+            },
+            "custom_id": json.dumps({
+                "user_id": user["user_id"],
+                "package_id": request.package_id,
+                "credits": package["credits"]
+            })
+        }]
+    }
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {access_token}"
+    }
+    
+    async with aiohttp.ClientSession() as pp_session:
+        async with pp_session.post(
+            f"{PAYPAL_API_BASE}/v2/checkout/orders",
+            headers=headers,
+            json=order_data
+        ) as resp:
+            if resp.status not in (200, 201):
+                error_text = await resp.text()
+                logging.error(f"PayPal create order failed: {error_text}")
+                raise HTTPException(status_code=500, detail="Failed to create PayPal order")
+            order = await resp.json()
+            
+            return {
+                "order_id": order["id"],
+                "status": order["status"]
+            }
+
+
+class CaptureOrderRequest(BaseModel):
+    order_id: str
+
+
+@app.post("/paypal/capture-order")
+async def paypal_capture_order(request: CaptureOrderRequest, user: dict = Depends(require_auth)):
+    """Capture a PayPal order after user approval and credit the user's account."""
+    access_token = await get_paypal_access_token()
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {access_token}"
+    }
+    
+    async with aiohttp.ClientSession() as pp_session:
+        # Capture the order
+        async with pp_session.post(
+            f"{PAYPAL_API_BASE}/v2/checkout/orders/{request.order_id}/capture",
+            headers=headers
+        ) as resp:
+            if resp.status not in (200, 201):
+                error_text = await resp.text()
+                logging.error(f"PayPal capture failed: {error_text}")
+                raise HTTPException(status_code=500, detail="Failed to capture PayPal order")
+            
+            capture_data = await resp.json()
+            
+            if capture_data["status"] != "COMPLETED":
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Order not completed. Status: {capture_data['status']}"
+                )
+            
+            # Extract custom data from the purchase unit
+            purchase_unit = capture_data["purchase_units"][0]
+            custom_data = json.loads(purchase_unit.get("payments", {}).get("captures", [{}])[0].get("custom_id", "{}"))
+            
+            # If custom_id is not in captures, try the purchase unit level
+            if not custom_data:
+                custom_data = json.loads(purchase_unit.get("custom_id", "{}"))
+            
+            # Verify the user matches
+            if custom_data.get("user_id") != user["user_id"]:
+                logging.error(f"User mismatch: order user {custom_data.get('user_id')} != auth user {user['user_id']}")
+                raise HTTPException(status_code=403, detail="Order does not belong to this user")
+            
+            package_id = custom_data.get("package_id")
+            credits_to_add = custom_data.get("credits", 0)
+            
+            if not credits_to_add:
+                package = CREDIT_PACKAGES.get(package_id)
+                if package:
+                    credits_to_add = package["credits"]
+            
+            # Get PayPal transaction ID for reference
+            paypal_capture_id = purchase_unit.get("payments", {}).get("captures", [{}])[0].get("id", request.order_id)
+            
+            # Add credits to user's account
+            async with db_pool.connection() as aconn:
+                async with aconn.cursor() as acur:
+                    # Check if this order was already processed (idempotency)
+                    await acur.execute(
+                        "SELECT id FROM credit_transactions WHERE payment_reference = %s",
+                        (paypal_capture_id,)
+                    )
+                    existing = await acur.fetchone()
+                    if existing:
+                        # Already processed, return success without double-crediting
+                        await acur.execute(
+                            "SELECT credits FROM users WHERE id = %s",
+                            (user["user_id"],)
+                        )
+                        current_credits = (await acur.fetchone())[0]
+                        return {
+                            "status": "success",
+                            "message": "Order already processed",
+                            "credits_added": credits_to_add,
+                            "new_balance": current_credits
+                        }
+                    
+                    # Add credits
+                    await acur.execute(
+                        """
+                        UPDATE users SET credits = credits + %s WHERE id = %s
+                        RETURNING credits
+                        """,
+                        (credits_to_add, user["user_id"])
+                    )
+                    new_balance = (await acur.fetchone())[0]
+                    
+                    # Record transaction
+                    await acur.execute(
+                        """
+                        INSERT INTO credit_transactions 
+                        (user_id, amount, balance_after, transaction_type, description, payment_provider, payment_reference)
+                        VALUES (%s, %s, %s, 'purchase', %s, 'paypal', %s)
+                        """,
+                        (
+                            user["user_id"],
+                            credits_to_add,
+                            new_balance,
+                            f"Purchased {CREDIT_PACKAGES.get(package_id, {}).get('name', 'Credit Pack')}",
+                            paypal_capture_id
+                        )
+                    )
+                    
+                    await aconn.commit()
+            
+            return {
+                "status": "success",
+                "message": f"Successfully added {credits_to_add} credits!",
+                "credits_added": credits_to_add,
+                "new_balance": new_balance,
+                "package": CREDIT_PACKAGES.get(package_id, {}).get("name")
+            }
+
+
+# ============================================
+# ADMIN ENDPOINTS
+# ============================================
+
+# Discord role IDs for admin/mod access
+ADMIN_ROLE_IDS = [
+    "1097363688995962982",
+    "1106031487159128116",
+    "1100272052008652922",
+]
+
+
+async def require_admin(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """
+    Dependency that requires admin/mod privileges.
+    Checks Discord role via bot or database flag.
+    """
+    user = await get_current_user(credentials)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if user.get("is_banned"):
+        raise HTTPException(status_code=403, detail="Account is banned")
+    
+    # Check if user has admin role - first check database, then Discord bot
+    discord_user_id = user.get("discord_user_id")
+    if not discord_user_id:
+        raise HTTPException(status_code=403, detail="Admin access requires Discord login")
+    
+    # Query bot for role check
+    bot_ip = os.environ.get("DISCORD_BOT_IP")
+    your_guild_id = "1095514548112461924"
+    
+    if not bot_ip:
+        raise HTTPException(status_code=503, detail="Admin verification unavailable")
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://{bot_ip}:6965/check_role",
+                json={
+                    "guild_id": your_guild_id,
+                    "user_id": discord_user_id,
+                    "role_ids": ADMIN_ROLE_IDS,
+                },
+                headers={"Authorization": "YourSecretToken"},
+            ) as bot_resp:
+                if bot_resp.status == 200:
+                    bot_data = await bot_resp.json()
+                    if bot_data.get("has_role"):
+                        return user
+    except Exception as e:
+        logging.error(f"Bot role check failed: {e}")
+        raise HTTPException(status_code=503, detail="Admin verification failed")
+    
+    raise HTTPException(status_code=403, detail="Admin access denied")
+
+
+@app.get("/get_lora_suggestions/")
+async def get_lora_suggestions(user: dict = Depends(require_admin)):
+    """Get all pending LoRA suggestions. Admin only."""
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT version_id, name, version, status, requestor, 
+                       is_nsfw, is_minor, preview_image
+                FROM lora_suggestions
+                WHERE status = 'pending'
+                ORDER BY name
+                """
+            )
+            columns = [desc[0] for desc in acur.description]
+            rows = await acur.fetchall()
+            # Add 'id' field for frontend compatibility (use version_id)
+            result = []
+            for row in rows:
+                row_dict = dict(zip(columns, row))
+                row_dict['id'] = row_dict['version_id']  # Use version_id as id
+                row_dict['submitted_by'] = row_dict.get('requestor', '')
+                row_dict['image_url'] = row_dict.get('preview_image', '')
+                result.append(row_dict)
+    
+    json_compatible_result = jsonable_encoder(result)
+    return JSONResponse(content=json_compatible_result)
+
+
+class LoraToggleRequest(BaseModel):
+    is_active: Optional[bool] = None
+    is_nsfw: Optional[bool] = None
+
+
+@app.patch("/admin/lora/{lora_name}")
+async def admin_update_lora(lora_name: str, data: LoraToggleRequest, user: dict = Depends(require_admin)):
+    """Update a LoRA's active or NSFW status. Admin only."""
+    updates = []
+    params = []
+    
+    if data.is_active is not None:
+        updates.append("is_active = %s")
+        params.append(data.is_active)
+    
+    if data.is_nsfw is not None:
+        updates.append("is_nsfw = %s")
+        params.append(data.is_nsfw)
+    
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    
+    params.append(lora_name)
+    
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                f"""
+                UPDATE lora_metadata
+                SET {', '.join(updates)}
+                WHERE name = %s
+                RETURNING name, is_active, is_nsfw
+                """,
+                tuple(params)
+            )
+            row = await acur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="LoRA not found")
+            
+            await aconn.commit()
+    
+    return {
+        "status": "success",
+        "lora": {
+            "name": row[0],
+            "is_active": row[1],
+            "is_nsfw": row[2]
+        }
+    }
+
+
+@app.post("/admin/suggestion/{suggestion_id}/approve")
+async def admin_approve_suggestion(suggestion_id: int, user: dict = Depends(require_admin)):
+    """Approve a LoRA suggestion and add it to the metadata table. Admin only."""
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            # Get the suggestion (use version_id as the identifier)
+            await acur.execute(
+                """
+                SELECT version_id, name, version, is_nsfw, is_minor, preview_image
+                FROM lora_suggestions
+                WHERE version_id = %s AND status = 'pending'
+                """,
+                (suggestion_id,)
+            )
+            suggestion = await acur.fetchone()
+            if not suggestion:
+                raise HTTPException(status_code=404, detail="Suggestion not found or already processed")
+            
+            version_id, name, version, is_nsfw, is_minor, preview_image = suggestion
+            
+            # Check if LoRA already exists
+            await acur.execute(
+                "SELECT name FROM lora_metadata WHERE version_id = %s",
+                (version_id,)
+            )
+            existing = await acur.fetchone()
+            if existing:
+                # Mark suggestion as duplicate
+                await acur.execute(
+                    "UPDATE lora_suggestions SET status = 'duplicate' WHERE version_id = %s",
+                    (suggestion_id,)
+                )
+                await aconn.commit()
+                raise HTTPException(status_code=409, detail="LoRA already exists in database")
+            
+            # Insert into lora_metadata
+            await acur.execute(
+                """
+                INSERT INTO lora_metadata (version_id, name, version, is_nsfw, is_active, image_url, uses)
+                VALUES (%s, %s, %s, %s, true, %s, 0)
+                ON CONFLICT (version_id) DO NOTHING
+                RETURNING name
+                """,
+                (version_id, name, version, is_nsfw, preview_image)
+            )
+            inserted = await acur.fetchone()
+            
+            # Update suggestion status
+            await acur.execute(
+                "UPDATE lora_suggestions SET status = 'approved' WHERE version_id = %s",
+                (suggestion_id,)
+            )
+            
+            await aconn.commit()
+    
+    return {
+        "status": "success",
+        "message": f"LoRA '{name}' approved and added to database"
+    }
+
+
+@app.post("/admin/suggestion/{suggestion_id}/reject")
+async def admin_reject_suggestion(suggestion_id: int, user: dict = Depends(require_admin)):
+    """Reject a LoRA suggestion. Admin only."""
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                UPDATE lora_suggestions
+                SET status = 'rejected'
+                WHERE version_id = %s AND status = 'pending'
+                RETURNING version_id, name
+                """,
+                (suggestion_id,)
+            )
+            row = await acur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Suggestion not found or already processed")
+            
+            await aconn.commit()
+    
+    return {
+        "status": "success",
+        "message": f"Suggestion '{row[1]}' rejected"
     }
 
 
@@ -1220,19 +2293,36 @@ async def cancel_job(job_id: str):
     """Cancel a job by deleting it from the queue if it is still pending."""
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
-            # Attempt to delete only if job is still pending
+            # Attempt to delete only if job is still pending, and get user/credit info for refund
             await acur.execute(
                 """
                 DELETE FROM generation_queue
                 WHERE id = %s AND status = 'pending'
-                RETURNING id;
+                RETURNING id, user_id, queue_type, credit_cost;
                 """,
                 (job_id,),
             )
             deleted = await acur.fetchone()
             if deleted:
+                job_id_deleted, user_id, queue_type, credit_cost = deleted
+                
+                # Refund credits if this was a priority job with credits deducted
+                credits_refunded = 0
+                if queue_type == "priority" and credit_cost > 0 and user_id:
+                    await acur.execute(
+                        "SELECT * FROM refund_credits(%s, %s, %s, %s)",
+                        (user_id, credit_cost, job_id_deleted, "Generation cancelled by user")
+                    )
+                    refund_result = await acur.fetchone()
+                    if refund_result and refund_result[0]:  # success = True
+                        credits_refunded = credit_cost
+                
                 await aconn.commit()
-                return JSONResponse(content={"status": "success", "job_id": job_id})
+                return JSONResponse(content={
+                    "status": "success", 
+                    "job_id": job_id,
+                    "credits_refunded": credits_refunded
+                })
 
             # If not deleted, check if it exists and report why it can't be cancelled
             await acur.execute(
