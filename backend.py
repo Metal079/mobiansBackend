@@ -2068,8 +2068,6 @@ async def paypal_capture_order(request: CaptureOrderRequest, user: dict = Depend
 
 # Discord role IDs for admin/mod access
 ADMIN_ROLE_IDS = [
-    "1097363688995962982",
-    "1106031487159128116",
     "1100272052008652922",
 ]
 

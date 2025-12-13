@@ -3,3 +3,4 @@
 .env
 dockerfile
 create_docker_container.txt
+.env.prod
