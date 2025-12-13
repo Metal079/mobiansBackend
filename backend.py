@@ -221,6 +221,7 @@ async def create_session_token(user_id: str) -> str:
                 """,
                 (user_id, token, expires_at, token, expires_at)
             )
+            await aconn.commit()
     return token
 
 
