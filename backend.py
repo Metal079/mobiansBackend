@@ -825,6 +825,7 @@ class addLoraSuggestion(BaseModel):
     is_nsfw: bool
     is_minor: bool
     preview_image: str
+    base_model: Optional[str] = None
 
 @app.post("/add_lora_suggestion/")
 async def add_lora_suggestion(lora_data: addLoraSuggestion):
@@ -849,10 +850,10 @@ async def add_lora_suggestion(lora_data: addLoraSuggestion):
             async with aconn.cursor() as acur:
                 await acur.execute(
                     """
-                    INSERT INTO lora_suggestions (version_id, name, version, status, requestor, is_nsfw, is_minor, preview_image)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO lora_suggestions (version_id, name, version, status, requestor, is_nsfw, is_minor, preview_image, base_model)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (lora_data.lora_version_id, lora_data.name, lora_data.version, lora_data.status, lora_data.requestor, lora_data.is_nsfw, lora_data.is_minor, lora_data.preview_image),
+                    (lora_data.lora_version_id, lora_data.name, lora_data.version, lora_data.status, lora_data.requestor, lora_data.is_nsfw, lora_data.is_minor, lora_data.preview_image, lora_data.base_model),
                 )
         return JSONResponse(content={"status": "success"})
     except errors.UniqueViolation:
@@ -2126,7 +2127,7 @@ async def get_lora_suggestions(user: dict = Depends(require_admin)):
             await acur.execute(
                 """
                 SELECT version_id, name, version, status, requestor, 
-                       is_nsfw, is_minor, preview_image
+                       is_nsfw, is_minor, preview_image, base_model
                 FROM lora_suggestions
                 WHERE status = 'pending'
                 ORDER BY name
@@ -2150,11 +2151,12 @@ async def get_lora_suggestions(user: dict = Depends(require_admin)):
 class LoraToggleRequest(BaseModel):
     is_active: Optional[bool] = None
     is_nsfw: Optional[bool] = None
+    name: Optional[str] = None
 
 
 @app.patch("/admin/lora/{lora_name}")
 async def admin_update_lora(lora_name: str, data: LoraToggleRequest, user: dict = Depends(require_admin)):
-    """Update a LoRA's active or NSFW status. Admin only."""
+    """Update a LoRA's active, NSFW status, or name. Admin only."""
     updates = []
     params = []
     
@@ -2165,6 +2167,10 @@ async def admin_update_lora(lora_name: str, data: LoraToggleRequest, user: dict 
     if data.is_nsfw is not None:
         updates.append("is_nsfw = %s")
         params.append(data.is_nsfw)
+    
+    if data.name is not None:
+        updates.append("name = %s")
+        params.append(data.name)
     
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
