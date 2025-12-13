@@ -230,20 +230,40 @@ def generate_session_token() -> str:
 
 
 async def create_session_token(user_id: str) -> str:
-    """Create and store a session token for a user in the database."""
+    """Create and store a session token for a user in the database.
+    
+    Allows multiple sessions per user (different devices/browsers).
+    Old expired sessions are cleaned up periodically.
+    """
     token = generate_session_token()
     expires_at = datetime.utcnow() + timedelta(days=30)
     
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
-            # Insert or update the session token
+            # Insert a new session token (allowing multiple per user)
             await acur.execute(
                 """
                 INSERT INTO user_sessions (user_id, token, expires_at)
                 VALUES (%s, %s, %s)
-                ON CONFLICT (user_id) DO UPDATE SET token = %s, expires_at = %s, created_at = NOW()
                 """,
-                (user_id, token, expires_at, token, expires_at)
+                (user_id, token, expires_at)
+            )
+            
+            # Clean up old expired sessions for this user (keep last 10 active ones)
+            await acur.execute(
+                """
+                DELETE FROM user_sessions 
+                WHERE user_id = %s AND (
+                    expires_at < NOW() 
+                    OR id NOT IN (
+                        SELECT id FROM user_sessions 
+                        WHERE user_id = %s AND expires_at > NOW()
+                        ORDER BY created_at DESC 
+                        LIMIT 10
+                    )
+                )
+                """,
+                (user_id, user_id)
             )
             await aconn.commit()
     return token
