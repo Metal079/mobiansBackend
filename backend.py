@@ -139,6 +139,30 @@ async def startup_event():
     session = aiohttp.ClientSession(trust_env=True)
 
     # asyncio.create_task(refresh_fastpass_cache())
+    
+    # Start orphaned job cleanup background task
+    asyncio.create_task(orphaned_job_cleanup_task())
+
+
+async def orphaned_job_cleanup_task():
+    """Background task that periodically cleans up orphaned jobs and refunds credits."""
+    # Wait a bit before first run to let the app fully start
+    await asyncio.sleep(60)
+    
+    while True:
+        try:
+            async with db_pool.connection() as aconn:
+                async with aconn.cursor() as acur:
+                    # Call the cleanup function (cleans jobs older than 1 hour)
+                    await acur.execute("SELECT * FROM cleanup_orphaned_jobs(1)")
+                    result = await acur.fetchone()
+                    if result and (result[0] > 0 or result[1] > 0):
+                        logging.info(f"Orphaned job cleanup: {result[0]} jobs cleaned, {result[1]} credits refunded")
+        except Exception as e:
+            logging.error(f"Error in orphaned job cleanup task: {e}")
+        
+        # Run every 15 minutes
+        await asyncio.sleep(900)
 
 
 @app.on_event("shutdown")
@@ -1036,14 +1060,19 @@ async def process_images_and_store_hashes(image_results, metadata, job_data):
 async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
     metadata = {}
     error_message = None
+    refund_info = None  # Will be populated if a refund is issued
 
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
+            # Query both view (for queue_position) and base table (for credit/refund info)
             await acur.execute(
                 """
-                SELECT status, queue_position, finished_images, prompt, negative_prompt, seed, guidance_scale, job_type, model, error_message, loras, lossy_images
-                FROM vw_generation_queue 
-                WHERE id = %s
+                SELECT v.status, v.queue_position, v.finished_images, v.prompt, v.negative_prompt, 
+                       v.seed, v.guidance_scale, v.job_type, v.model, v.error_message, v.loras, v.lossy_images,
+                       g.user_id, g.credit_cost, COALESCE(g.refunded, FALSE) as refunded
+                FROM vw_generation_queue v
+                JOIN generation_queue g ON v.id = g.id
+                WHERE v.id = %s
             """,
                 (job_data.job_id,),
             )
@@ -1065,7 +1094,35 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
         error_message,
         metadata['loras'],
         metadata['lossy_images'],
+        job_user_id,
+        job_credit_cost,
+        job_refunded,
     ) = result
+
+    # Helper function to issue refund if eligible
+    async def try_refund(reason: str) -> dict | None:
+        """Attempt to refund credits for this job. Returns refund info or None."""
+        if job_refunded or job_credit_cost <= 0 or not job_user_id:
+            return None
+        
+        try:
+            async with db_pool.connection() as refund_conn:
+                async with refund_conn.cursor() as refund_cur:
+                    await refund_cur.execute(
+                        "SELECT * FROM safe_refund_credits(%s, %s)",
+                        (job_data.job_id, reason)
+                    )
+                    refund_result = await refund_cur.fetchone()
+                    if refund_result and refund_result[0]:  # success = True
+                        logging.info(f"Refunded {refund_result[2]} credits for job {job_data.job_id}: {reason}")
+                        return {
+                            "credits_refunded": refund_result[2],
+                            "new_balance": refund_result[1],
+                            "reason": reason
+                        }
+        except Exception as e:
+            logging.error(f"Failed to refund credits for job {job_data.job_id}: {e}")
+        return None
 
     if job_status == "completed":
 
@@ -1097,12 +1154,15 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
             logging.error(
                 f"Job {job_data.job_id} marked as completed but has no finished images"
             )
-            return JSONResponse(
-                content={
-                    "status": "error",
-                    "message": "Job completed but no images found",
-                }
-            )
+            # Issue refund for completed job with no images
+            refund_info = await try_refund("Job completed but no images generated")
+            response_content = {
+                "status": "error",
+                "message": "Job completed but no images found. Your credits have been refunded." if refund_info else "Job completed but no images found",
+            }
+            if refund_info:
+                response_content["refund"] = refund_info
+            return JSONResponse(content=response_content)
     elif job_status in ["pending", "processing"]:
         # Use helper_functions cache to compute ETA
         jobs_per_sec = await get_jobs_per_sec(db_pool)
@@ -1115,22 +1175,38 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
             }
         )
     elif job_status == "failed":
-        return JSONResponse(
-            content={"status": "failed", "message": error_message}
-        )
+        # Issue refund for failed jobs
+        refund_info = await try_refund(f"Generation failed: {error_message or 'Unknown error'}")
+        response_content = {
+            "status": "failed", 
+            "message": error_message
+        }
+        if refund_info:
+            response_content["refund"] = refund_info
+            response_content["message"] = f"{error_message or 'Generation failed'}. Your credits have been refunded."
+        return JSONResponse(content=response_content)
     else:
         return JSONResponse(
             content={"status": "error", "message": "Unknown job status"}
         )
 
 @app.get("/get_loras/")
-async def get_loras():
+async def get_loras(status: str = "active"):
+    status_norm = (status or "active").strip().lower()
+    if status_norm == "inactive":
+        where_clause = "WHERE image_url IS NOT NULL and is_active = false"
+    elif status_norm == "all":
+        where_clause = "WHERE image_url IS NOT NULL"
+    else:
+        # Default to active
+        where_clause = "WHERE image_url IS NOT NULL and is_active = true"
+
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
-                """
+                f"""
                 SELECT * FROM lora_metadata
-                WHERE image_url IS NOT NULL and is_active = true
+                {where_clause}
                 ORDER BY uses DESC
                 """
             )
