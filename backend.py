@@ -2230,9 +2230,9 @@ class LoraToggleRequest(BaseModel):
     name: Optional[str] = None
 
 
-@app.patch("/admin/lora/{lora_name}")
-async def admin_update_lora(lora_name: str, data: LoraToggleRequest, user: dict = Depends(require_admin)):
-    """Update a LoRA's active, NSFW status, or name. Admin only."""
+@app.patch("/admin/lora/{lora_id}")
+async def admin_update_lora(lora_id: int, data: LoraToggleRequest, user: dict = Depends(require_admin)):
+    """Update a LoRA's active, NSFW status, or name by id. Admin only."""
     updates = []
     params = []
     
@@ -2251,7 +2251,7 @@ async def admin_update_lora(lora_name: str, data: LoraToggleRequest, user: dict 
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
     
-    params.append(lora_name)
+    params.append(lora_id)
     
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
@@ -2259,8 +2259,8 @@ async def admin_update_lora(lora_name: str, data: LoraToggleRequest, user: dict 
                 f"""
                 UPDATE lora_metadata
                 SET {', '.join(updates)}
-                WHERE name = %s
-                RETURNING name, is_active, is_nsfw
+                WHERE id = %s
+                RETURNING id, name, is_active, is_nsfw
                 """,
                 tuple(params)
             )
@@ -2273,9 +2273,10 @@ async def admin_update_lora(lora_name: str, data: LoraToggleRequest, user: dict 
     return {
         "status": "success",
         "lora": {
-            "name": row[0],
-            "is_active": row[1],
-            "is_nsfw": row[2]
+            "id": row[0],
+            "name": row[1],
+            "is_active": row[2],
+            "is_nsfw": row[3]
         }
     }
 
