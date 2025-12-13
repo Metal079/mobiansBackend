@@ -383,6 +383,10 @@ async def upsert_user(
                 
                 is_new_user = True
             
+            # Commit the user creation/update before creating session token
+            # This is required because create_session_token uses a separate connection
+            await aconn.commit()
+            
             # Generate session token and store in database
             token = await create_session_token(str(user_id))
             
@@ -2197,7 +2201,7 @@ async def admin_update_lora(lora_name: str, data: LoraToggleRequest, user: dict 
 
 @app.post("/admin/suggestion/{suggestion_id}/approve")
 async def admin_approve_suggestion(suggestion_id: int, user: dict = Depends(require_admin)):
-    """Approve a LoRA suggestion and add it to the metadata table. Admin only."""
+    """Approve a LoRA suggestion so it can be downloaded by the downloader service. Admin only."""
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             # Get the suggestion (use version_id as the identifier)
@@ -2215,7 +2219,7 @@ async def admin_approve_suggestion(suggestion_id: int, user: dict = Depends(requ
             
             version_id, name, version, is_nsfw, is_minor, preview_image = suggestion
             
-            # Check if LoRA already exists
+            # Check if LoRA already exists in metadata
             await acur.execute(
                 "SELECT name FROM lora_metadata WHERE version_id = %s",
                 (version_id,)
@@ -2230,21 +2234,9 @@ async def admin_approve_suggestion(suggestion_id: int, user: dict = Depends(requ
                 await aconn.commit()
                 raise HTTPException(status_code=409, detail="LoRA already exists in database")
             
-            # Insert into lora_metadata
+            # Update suggestion status to 'approved' - the downloader service will handle the rest
             await acur.execute(
-                """
-                INSERT INTO lora_metadata (version_id, name, version, is_nsfw, is_active, image_url, uses)
-                VALUES (%s, %s, %s, %s, true, %s, 0)
-                ON CONFLICT (version_id) DO NOTHING
-                RETURNING name
-                """,
-                (version_id, name, version, is_nsfw, preview_image)
-            )
-            inserted = await acur.fetchone()
-            
-            # Update suggestion status
-            await acur.execute(
-                "UPDATE lora_suggestions SET status = 'approved' WHERE version_id = %s",
+                "UPDATE lora_suggestions SET status = 'approved', last_updated_date = NOW() WHERE version_id = %s",
                 (suggestion_id,)
             )
             
@@ -2252,7 +2244,7 @@ async def admin_approve_suggestion(suggestion_id: int, user: dict = Depends(requ
     
     return {
         "status": "success",
-        "message": f"LoRA '{name}' approved and added to database"
+        "message": f"LoRA '{name}' approved and queued for download"
     }
 
 
@@ -2280,6 +2272,122 @@ async def admin_reject_suggestion(suggestion_id: int, user: dict = Depends(requi
         "status": "success",
         "message": f"Suggestion '{row[1]}' rejected"
     }
+
+
+# ============================================
+# DOWNLOADER STATUS ENDPOINTS
+# ============================================
+
+DOWNLOADER_SERVICE_URL = os.environ.get("DOWNLOADER_SERVICE_URL", "http://localhost:9002")
+
+
+@app.get("/admin/downloader-status")
+async def get_downloader_status(user: dict = Depends(require_admin)):
+    """Get the current status of the LoRA downloader service. Admin only."""
+    try:
+        async with db_pool.connection() as aconn:
+            async with aconn.cursor() as acur:
+                # Check if anything is currently downloading
+                await acur.execute("""
+                    SELECT name, version, last_updated_date
+                    FROM lora_suggestions
+                    WHERE status = 'downloading'
+                    LIMIT 1
+                """)
+                downloading = await acur.fetchone()
+                
+                # Count approved (pending download)
+                await acur.execute("""
+                    SELECT COUNT(*) FROM lora_suggestions WHERE status = 'approved'
+                """)
+                approved_count = (await acur.fetchone())[0]
+                
+                # Get last processed
+                await acur.execute("""
+                    SELECT name, version, status, error_message, last_updated_date
+                    FROM lora_suggestions
+                    WHERE status IN ('downloaded', 'failed')
+                    ORDER BY last_updated_date DESC
+                    LIMIT 1
+                """)
+                last_processed = await acur.fetchone()
+                
+                if downloading:
+                    return {
+                        "status": "downloading",
+                        "current_lora": f"{downloading[0]} v{downloading[1]}",
+                        "updated_at": downloading[2].isoformat() if downloading[2] else None,
+                        "approved_count": approved_count,
+                        "last_processed": None
+                    }
+                else:
+                    return {
+                        "status": "idle",
+                        "current_lora": None,
+                        "approved_count": approved_count,
+                        "last_processed": {
+                            "name": f"{last_processed[0]} v{last_processed[1]}" if last_processed else None,
+                            "status": last_processed[2] if last_processed else None,
+                            "error_message": last_processed[3] if last_processed else None,
+                            "updated_at": last_processed[4].isoformat() if last_processed and last_processed[4] else None
+                        } if last_processed else None,
+                        "updated_at": last_processed[4].isoformat() if last_processed and last_processed[4] else None
+                    }
+    except Exception as e:
+        logging.error(f"Error fetching downloader status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/download-history")
+async def get_download_history(limit: int = 20, user: dict = Depends(require_admin)):
+    """Get recent download history from lora_suggestions. Admin only."""
+    try:
+        async with db_pool.connection() as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute("""
+                    SELECT name, version, status, error_message, version_id, last_updated_date
+                    FROM lora_suggestions
+                    WHERE status IN ('downloaded', 'failed', 'downloading')
+                    ORDER BY last_updated_date DESC
+                    LIMIT %s
+                """, (limit,))
+                rows = await acur.fetchall()
+                
+                history = [{
+                    "lora_name": row[0],
+                    "version": row[1],
+                    "status": row[2],
+                    "error_message": row[3],
+                    "version_id": row[4],
+                    "downloaded_at": row[5].isoformat() if row[5] else None
+                } for row in rows]
+                
+                return history
+    except Exception as e:
+        logging.error(f"Error fetching download history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/trigger-download")
+async def trigger_download(user: dict = Depends(require_admin)):
+    """Trigger the downloader service to check for new approved LoRAs. Admin only."""
+    try:
+        async with aiohttp.ClientSession() as trigger_session:
+            async with trigger_session.post(f"{DOWNLOADER_SERVICE_URL}/trigger", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    return {"status": "success", "message": result.get("message", "Download triggered")}
+                elif resp.status == 409:
+                    result = await resp.json()
+                    return {"status": "busy", "message": result.get("message", "Download already in progress")}
+                else:
+                    raise HTTPException(status_code=resp.status, detail="Failed to trigger download")
+    except aiohttp.ClientError as e:
+        logging.error(f"Error triggering downloader: {e}")
+        raise HTTPException(
+            status_code=503, 
+            detail="Downloader service is not reachable. Make sure lora_downloader_service.py is running."
+        )
 
 
 # Azure health check, return 200
