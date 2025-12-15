@@ -1687,8 +1687,6 @@ async def discord_auth(auth_code: DiscordAuthCode):
     your_guild_id = "1095514548112461924"  # Replace with your Discord server's ID
     is_member_of_your_guild = any(guild["id"] == your_guild_id for guild in guilds)
     role_ids_to_check = [
-        "1097363688995962982",
-        "1106031487159128116",
         "1100272052008652922",
     ]
 
