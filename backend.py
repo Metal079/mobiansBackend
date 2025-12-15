@@ -58,9 +58,16 @@ subscriptions: Dict[str, dict] = {}
 
 # Credit costs by model type
 CREDIT_COSTS = {
-    "SD 1.5": 2,      # sonicDiffusionV4
-    "Pony": 5,        #  autismMix, (SDXL-based)
-    "Illustrious": 5  # novaFurryXL_V8B (SDXL-based), novaMobianXL_v10
+    "SD 1.5": 5,       # sonicDiffusionV4
+    "Pony": 10,        # autismMix (SDXL-based)
+    "Illustrious": 10  # novaFurryXL_V8B (SDXL-based), novaMobianXL_v10
+}
+
+# Additional cost per LoRA by model type
+LORA_CREDIT_COSTS = {
+    "SD 1.5": 1,
+    "Pony": 2,
+    "Illustrious": 2,
 }
 
 # Credit packages for purchase
@@ -69,22 +76,22 @@ CREDIT_PACKAGES = {
         "id": "starter",
         "name": "Starter Pack",
         "price_usd": 5.00,
-        "credits": 500,
-        "description": "500 credits - Great for trying out priority queue"
+        "credits": 1500,
+        "description": "1500 credits - Great for trying out priority queue"
     },
     "popular": {
         "id": "popular",
         "name": "Popular Pack",
         "price_usd": 10.00,
-        "credits": 1150,
-        "description": "1,150 credits - 15% bonus!"
+        "credits": 3500,
+        "description": "3,500 credits - 17% bonus!"
     },
     "best_value": {
         "id": "best_value",
         "name": "Best Value Pack",
         "price_usd": 25.00,
-        "credits": 3125,
-        "description": "3,125 credits - 25% bonus!"
+        "credits": 10000,
+        "description": "10,000 credits - 33% bonus!"
     }
 }
 
@@ -451,10 +458,13 @@ async def upsert_user(
             }
 
 
-def get_credit_cost(model: str) -> int:
-    """Get the credit cost for a given model."""
+def get_credit_cost(model: str, loras: Optional[List[Dict[str, Any]]] = None) -> int:
+    """Get the credit cost for a given model and optional LoRAs."""
     base_type = MODEL_BASE_TYPES.get(model, "SD 1.5")
-    return CREDIT_COSTS.get(base_type, 2)
+    base_cost = CREDIT_COSTS.get(base_type, CREDIT_COSTS.get("SD 1.5", 0))
+    lora_count = len(loras) if isinstance(loras, list) else 0
+    per_lora_cost = LORA_CREDIT_COSTS.get(base_type, 0)
+    return base_cost + (lora_count * per_lora_cost)
 
 
 class ImageData(BaseModel):
@@ -522,7 +532,7 @@ async def submit_job(
             )
         
         user_id = user["user_id"]
-        credit_cost = get_credit_cost(job_data.model or "sonicDiffusionV4")
+        credit_cost = get_credit_cost(job_data.model or "sonicDiffusionV4", job_data.loras)
         
         if user["credits"] < credit_cost:
             raise HTTPException(
@@ -1901,7 +1911,7 @@ async def get_user_credits(user: dict = Depends(require_auth)):
 
 @app.post("/user/credits/daily")
 async def claim_daily_bonus(user: dict = Depends(require_auth)):
-    """Claim the daily 15 credit bonus."""
+    """Claim the daily credit bonus."""
     user_id = user["user_id"]
     
     async with db_pool.connection() as aconn:
@@ -1935,11 +1945,13 @@ async def get_model_credit_cost(model: str):
     """Get the credit cost for a specific model. Public endpoint."""
     cost = get_credit_cost(model)
     base_type = MODEL_BASE_TYPES.get(model, "SD 1.5")
+    per_lora_cost = LORA_CREDIT_COSTS.get(base_type, 0)
     
     return {
         "model": model,
         "base_type": base_type,
-        "credit_cost": cost
+        "credit_cost": cost,
+        "per_lora_credit_cost": per_lora_cost,
     }
 
 
@@ -1948,6 +1960,7 @@ async def get_all_credit_costs():
     """Get credit costs for all models. Public endpoint."""
     return {
         "costs": CREDIT_COSTS,
+        "lora_costs": LORA_CREDIT_COSTS,
         "models": MODEL_BASE_TYPES
     }
 
