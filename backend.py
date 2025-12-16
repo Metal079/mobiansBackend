@@ -60,7 +60,7 @@ subscriptions: Dict[str, dict] = {}
 CREDIT_COSTS = {
     "SD 1.5": 5,       # sonicDiffusionV4
     "Pony": 10,        # autismMix (SDXL-based)
-    "Illustrious": 10  # novaFurryXL_V8B (SDXL-based), novaMobianXL_v10
+    "Illustrious": 10  # novaFurryXL_ilV140 (SDXL-based), novaMobianXL_v10
 }
 
 # Additional cost per LoRA by model type
@@ -109,7 +109,8 @@ MODEL_BASE_TYPES = {
     "sonicDiffusionV4": "SD 1.5",
     "autismMix": "Pony",
     "novaMobianXL_v10": "Illustrious",
-    "novaFurryXL_V8B": "Illustrious"
+    "novaFurryXL_V8B": "Illustrious",
+    "novaFurryXL_ilV140": "Illustrious"
 }
 
 app = FastAPI()
