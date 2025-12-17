@@ -109,9 +109,31 @@ MODEL_BASE_TYPES = {
     "sonicDiffusionV4": "SD 1.5",
     "autismMix": "Pony",
     "novaMobianXL_v10": "Illustrious",
-    "novaFurryXL_V8B": "Illustrious",
     "novaFurryXL_ilV140": "Illustrious"
 }
+
+DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "novaMobianXL_v10")
+
+
+def normalize_model_id(model: Optional[str]) -> str:
+    """Return a valid model id for generation.
+
+    Clients can send stale/renamed model ids (e.g., from localStorage). To prevent
+    jobs from getting stuck in the queue, coerce missing/unknown values to a safe
+    default that exists in MODEL_BASE_TYPES.
+    """
+    available = list(MODEL_BASE_TYPES.keys())
+    fallback = DEFAULT_MODEL_ID if DEFAULT_MODEL_ID in MODEL_BASE_TYPES else (available[0] if available else "novaMobianXL_v10")
+
+    if not model:
+        return fallback
+
+    if model in MODEL_BASE_TYPES:
+        return model
+
+    lower_map = {k.lower(): k for k in available}
+    mapped = lower_map.get(model.lower())
+    return mapped or fallback
 
 app = FastAPI()
 security = HTTPBearer(auto_error=False)
@@ -528,6 +550,9 @@ async def submit_job(
     background_tasks: BackgroundTasks,
     user: Optional[dict] = Depends(get_current_user),
 ):
+    # Ensure model is always valid even if clients send stale/renamed ids.
+    job_data.model = normalize_model_id(job_data.model)
+
     # Determine queue type and credit cost
     queue_type = job_data.queue_type or "free"
     credit_cost = 0
