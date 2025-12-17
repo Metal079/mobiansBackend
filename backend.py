@@ -138,6 +138,7 @@ def normalize_model_id(model: Optional[str]) -> str:
 app = FastAPI()
 security = HTTPBearer(auto_error=False)
 fastpass_cache = {}  # In-memory cache for FastPass data
+civitai_link_cache: Dict[int, str] = {}
 session = None
 # Define db_pool as a global variable
 db_pool = None
@@ -2295,6 +2296,48 @@ async def require_admin(credentials: HTTPAuthorizationCredentials = Depends(secu
         raise HTTPException(status_code=503, detail="Admin verification failed")
     
     raise HTTPException(status_code=403, detail="Admin access denied")
+
+
+async def resolve_civitai_model_link(version_id: int) -> str:
+    """Resolve a CivitAI model page URL from a model version id."""
+    cached = civitai_link_cache.get(version_id)
+    if cached:
+        return cached
+
+    if not session:
+        raise HTTPException(status_code=503, detail="CivitAI resolver unavailable")
+
+    url = f"https://civitai.com/api/v1/model-versions/{version_id}"
+    headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to resolve CivitAI version {version_id}: HTTP {resp.status}",
+                )
+            data = await resp.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error resolving CivitAI link for version {version_id}: {e}")
+        raise HTTPException(status_code=502, detail="Failed to resolve CivitAI link")
+
+    model_id = data.get("modelId") or (data.get("model") or {}).get("id")
+    if not model_id:
+        raise HTTPException(status_code=502, detail="CivitAI response missing modelId")
+
+    resolved = f"https://civitai.com/models/{model_id}?modelVersionId={version_id}"
+    civitai_link_cache[version_id] = resolved
+    return resolved
+
+
+@app.get("/admin/civitai-link/{version_id}")
+async def get_admin_civitai_link(version_id: int, user: dict = Depends(require_admin)):
+    """Return the correct CivitAI model page URL for a model version id. Admin only."""
+    url = await resolve_civitai_model_link(version_id)
+    return {"url": url}
 
 
 @app.get("/get_lora_suggestions/")
