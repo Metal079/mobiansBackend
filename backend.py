@@ -1910,21 +1910,45 @@ async def get_user_credits(user: dict = Depends(require_auth)):
                 for row in rows
             ]
     
-    # Check if daily bonus can be claimed using the DB's current_date to avoid timezone drift
+    # Check daily bonus state using the DB's current_date to avoid timezone drift
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
-                "SELECT (last_daily_bonus IS NULL OR last_daily_bonus <> CURRENT_DATE) AS can_claim_daily FROM users WHERE id = %s",
+                """
+                SELECT
+                    (last_daily_bonus IS NULL OR last_daily_bonus <> CURRENT_DATE) AS can_claim_daily,
+                    last_daily_bonus,
+                    daily_bonus_streak,
+                    CASE
+                        WHEN last_daily_bonus = CURRENT_DATE OR last_daily_bonus = CURRENT_DATE - 1
+                            THEN LEAST(30 + daily_bonus_streak * 10, 50)
+                        ELSE 30
+                    END AS next_daily_bonus,
+                    CASE
+                        WHEN last_daily_bonus = CURRENT_DATE OR last_daily_bonus = CURRENT_DATE - 1
+                            THEN daily_bonus_streak + 1
+                        ELSE 1
+                    END AS next_daily_streak
+                FROM users
+                WHERE id = %s
+                """,
                 (user_id,)
             )
             row = await acur.fetchone()
             can_claim_daily = bool(row[0]) if row else False
-    
+            last_daily_bonus = row[1].isoformat() if row and row[1] else None
+            daily_bonus_streak = int(row[2]) if row and row[2] is not None else user.get("daily_bonus_streak", 0)
+            next_daily_bonus = int(row[3]) if row and row[3] is not None else 30
+            next_daily_streak = int(row[4]) if row and row[4] is not None else 1
+
     return {
         "status": "success",
         "credits": user["credits"],
         "can_claim_daily_bonus": can_claim_daily,
-        "daily_bonus_streak": user["daily_bonus_streak"],
+        "daily_bonus_streak": daily_bonus_streak,
+        "last_daily_bonus": last_daily_bonus,
+        "next_daily_bonus": next_daily_bonus,
+        "next_daily_bonus_streak": next_daily_streak,
         "transactions": transactions
     }
 
