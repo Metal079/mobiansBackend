@@ -40,6 +40,7 @@ logging.basicConfig(level=logging.ERROR)  # Configure logging
 load_dotenv()
 
 API_KEY = os.environ.get("API_KEY")
+CIVITAI_API_KEY = os.environ.get("CIVITAI_API_KEY")
 
 DBHOST = os.environ.get("DBHOST")
 DBNAME = os.environ.get("DBNAME")
@@ -720,30 +721,40 @@ async def submit_job(
     return JSONResponse(content=response_data)
 
 @app.get("/search_civitAi_loras_by_query/{query}")
-async def search_civitAi_loras_by_query(query: str):
+async def search_civitAi_loras_by_query(query: str, show_nsfw: bool = False):
     civiAi_url = "https://civitai.com/api/v1/models"
 
-    headers = {
-        "Authorization": f"Bearer {API_KEY}"
-    }
+    headers: Dict[str, str] = {}
+    if CIVITAI_API_KEY:
+        headers["Authorization"] = f"Bearer {CIVITAI_API_KEY}"
     params = {
-        "types": ["LORA", "LoCon"],
+        # CivitAI expects `types=LORA` in the query string.
+        # Passing a list can serialize to repeated params (`types=LORA&types=...`) which the API may reject.
+        "types": "LORA",
         "sort": "Highest Rated", 
         "period": "AllTime",
         "limit": 30,
         # "tag": "hentai", 
         "query": query,
         # "primaryFileOnly": True,
-        "nsfw ": "True",
-        "page": 1,
+        # If you want safer-only results, set nsfw=False. Omitting keeps default behavior.
         # "allowNoCredit": True,
         # "hidden": False,
     }
 
+    if not show_nsfw:
+        # aiohttp/yarl reject bool query param values; send as string.
+        params["nsfw"] = "false"
+
     async with session.get(civiAi_url, headers=headers, params=params) as resp:
         if resp.status != 200:
+            upstream_body = await resp.text()
             raise HTTPException(
-                status_code=resp.status, detail="Error in CivitAi search, ensure the query is correct"
+                status_code=resp.status,
+                detail=(
+                    "Error in CivitAi search, ensure the query is correct. "
+                    + (f"Upstream: {upstream_body[:200]}" if upstream_body else "")
+                ).strip(),
             )
         data = await resp.json()
 
@@ -790,12 +801,12 @@ async def search_civitAi_loras_by_query(query: str):
     return JSONResponse(content=loras)
 
 @app.get("/search_civitAi_loras_by_id/{id}")
-async def search_civitAi_loras_by_id(id: str):
+async def search_civitAi_loras_by_id(id: str, show_nsfw: bool = False):
     civiAi_url = f"https://civitai.com/api/v1/models/{id}"
 
-    headers = {
-        "Authorization": f"Bearer {API_KEY}"
-    }
+    headers: Dict[str, str] = {}
+    if CIVITAI_API_KEY:
+        headers["Authorization"] = f"Bearer {CIVITAI_API_KEY}"
 
     async with session.get(civiAi_url, headers=headers) as resp:
         if resp.status != 200:
@@ -806,6 +817,11 @@ async def search_civitAi_loras_by_id(id: str):
 
     loras = []
     if 'modelVersions' in data:
+        if data.get('nsfw') and not show_nsfw:
+            raise HTTPException(
+                status_code=422,
+                detail="Model is marked NSFW. Enable 'Show NSFW results' to view it.",
+            )
         if data.get('type') != 'LORA' and data.get('type') != 'LoCon':
             raise HTTPException(
                 status_code=422, detail="Model is not a LORA, please ensure the model you are searching for is a LORA"
@@ -854,16 +870,22 @@ async def search_civitAi_loras_by_id(id: str):
     return JSONResponse(content=loras)
 
 @app.get("/search_civitAi_loras_by_user/{username}")
-async def search_civitAi_loras_by_user(username: str):
+async def search_civitAi_loras_by_user(username: str, show_nsfw: bool = False):
     civiAi_url = "https://civitai.com/api/v1/models"
 
-    headers = {
-        "Authorization": f"Bearer {API_KEY}"
+    headers: Dict[str, str] = {}
+    if CIVITAI_API_KEY:
+        headers["Authorization"] = f"Bearer {CIVITAI_API_KEY}"
+
+    params: Dict[str, Any] = {
+        "username": username,
+        "types": "LORA",
+        "limit": 30,
     }
 
-    params = {
-        "username": username,
-    }
+    if not show_nsfw:
+        # aiohttp/yarl reject bool query param values; send as string.
+        params["nsfw"] = "false"
 
     async with session.get(civiAi_url, headers=headers, params=params) as resp:
         if resp.status != 200:
