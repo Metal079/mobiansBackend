@@ -74,6 +74,12 @@ LORA_CREDIT_COSTS = {
 # Upscale credit multiplier (upscales are computationally expensive)
 UPSCALE_CREDIT_MULTIPLIER = 3
 
+# Hi-res credit multiplier (generate + upscale in one job)
+HIRES_CREDIT_MULTIPLIER = 4
+
+# Job type for generate+upscale mode
+HIRES_JOB_TYPE = "txt2img_upscale"
+
 # Credit packages for purchase
 CREDIT_PACKAGES = {
     "starter": {
@@ -501,6 +507,13 @@ def get_upscale_credit_cost(model: str) -> int:
     return base_cost * UPSCALE_CREDIT_MULTIPLIER
 
 
+def get_hires_credit_cost(model: str) -> int:
+    """Get the credit cost for a hi-res (generate+upscale) job."""
+    base_type = MODEL_BASE_TYPES.get(model, "SD 1.5")
+    base_cost = CREDIT_COSTS.get(base_type, CREDIT_COSTS.get("SD 1.5", 0))
+    return base_cost * HIRES_CREDIT_MULTIPLIER
+
+
 class ImageData(BaseModel):
     url: Optional[str] = None
     width: Optional[int]
@@ -561,8 +574,9 @@ async def submit_job(
     user_id = None
 
     is_upscale_job = (job_data.job_type == "upscale")
-    if is_upscale_job:
-        # Upscaling is expensive: require priority queue + authentication
+    is_hires_job = (job_data.job_type == HIRES_JOB_TYPE)
+    if is_upscale_job or is_hires_job:
+        # Expensive jobs: require priority queue + authentication
         queue_type = "priority"
     
     # If user wants priority queue, they must be authenticated and have credits
@@ -570,16 +584,26 @@ async def submit_job(
         if not user:
             raise HTTPException(
                 status_code=401,
-                detail="Authentication required. Please log in to use upscaling."
-                if is_upscale_job
-                else "Authentication required for priority queue. Please log in or use the free queue.",
+                detail=(
+                    "Authentication required. Please log in to upscale images."
+                    if is_upscale_job
+                    else (
+                        "Authentication required. Please log in to use Hi-Res generation."
+                        if is_hires_job
+                        else "Authentication required for priority queue. Please log in or use the free queue."
+                    )
+                ),
             )
         
         user_id = user["user_id"]
         credit_cost = (
             get_upscale_credit_cost(job_data.model)
             if is_upscale_job
-            else get_credit_cost(job_data.model, job_data.loras)
+            else (
+                get_hires_credit_cost(job_data.model)
+                if is_hires_job
+                else get_credit_cost(job_data.model, job_data.loras)
+            )
         )
         
         if user["credits"] < credit_cost:
@@ -602,7 +626,7 @@ async def submit_job(
             if is_valid:
                 fast_pass_enabled = True
                 queue_type = "priority"  # FastPass gives priority
-                if not is_upscale_job:
+                if not (is_upscale_job or is_hires_job):
                     credit_cost = 0  # FastPass is free
             else:
                 raise HTTPException(
