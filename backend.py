@@ -568,6 +568,27 @@ async def submit_job(
     # Ensure model is always valid even if clients send stale/renamed ids.
     job_data.model = normalize_model_id(job_data.model)
 
+    # CRITICAL: Validate that img2img/inpainting/upscale jobs have required image data.
+    # This prevents a frontend bug where job_type is set but image data is missing.
+    if job_data.job_type in ("img2img", "inpainting", "upscale"):
+        if not job_data.image or not job_data.image.strip():
+            logging.warning(
+                f"Received {job_data.job_type} job without image data. "
+                "This is likely a frontend bug - falling back to txt2img."
+            )
+            job_data.job_type = "txt2img"
+            job_data.image = None
+            job_data.mask_image = None
+    
+    if job_data.job_type == "inpainting":
+        if not job_data.mask_image or not job_data.mask_image.strip():
+            logging.warning(
+                "Received inpainting job without mask data. "
+                "Falling back to img2img."
+            )
+            job_data.job_type = "img2img" if job_data.image else "txt2img"
+            job_data.mask_image = None
+
     # Determine queue type and credit cost
     queue_type = job_data.queue_type or "free"
     credit_cost = 0
