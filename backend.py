@@ -500,18 +500,24 @@ def get_credit_cost(model: str, loras: Optional[List[Dict[str, Any]]] = None) ->
     per_lora_cost = LORA_CREDIT_COSTS.get(base_type, 0)
     return base_cost + (lora_count * per_lora_cost)
 
-def get_upscale_credit_cost(model: str) -> int:
-    """Get the credit cost for an upscale job (base model cost * multiplier)."""
+def get_upscale_credit_cost(model: str, loras: Optional[List[Dict[str, Any]]] = None) -> int:
+    """Get the credit cost for an upscale job (base model cost * multiplier + LoRA costs * 3)."""
     base_type = MODEL_BASE_TYPES.get(model, "SD 1.5")
     base_cost = CREDIT_COSTS.get(base_type, CREDIT_COSTS.get("SD 1.5", 0))
-    return base_cost * UPSCALE_CREDIT_MULTIPLIER
+    lora_count = len(loras) if isinstance(loras, list) else 0
+    per_lora_cost = LORA_CREDIT_COSTS.get(base_type, 0)
+    lora_total = lora_count * per_lora_cost * UPSCALE_CREDIT_MULTIPLIER
+    return (base_cost * UPSCALE_CREDIT_MULTIPLIER) + lora_total
 
 
-def get_hires_credit_cost(model: str) -> int:
-    """Get the credit cost for a hi-res (generate+upscale) job."""
+def get_hires_credit_cost(model: str, loras: Optional[List[Dict[str, Any]]] = None) -> int:
+    """Get the credit cost for a hi-res (generate+upscale) job (base model cost * 4 + LoRA costs * 4)."""
     base_type = MODEL_BASE_TYPES.get(model, "SD 1.5")
     base_cost = CREDIT_COSTS.get(base_type, CREDIT_COSTS.get("SD 1.5", 0))
-    return base_cost * HIRES_CREDIT_MULTIPLIER
+    lora_count = len(loras) if isinstance(loras, list) else 0
+    per_lora_cost = LORA_CREDIT_COSTS.get(base_type, 0)
+    lora_total = lora_count * per_lora_cost * HIRES_CREDIT_MULTIPLIER
+    return (base_cost * HIRES_CREDIT_MULTIPLIER) + lora_total
 
 
 class ImageData(BaseModel):
@@ -618,10 +624,10 @@ async def submit_job(
         
         user_id = user["user_id"]
         credit_cost = (
-            get_upscale_credit_cost(job_data.model)
+            get_upscale_credit_cost(job_data.model, job_data.loras)
             if is_upscale_job
             else (
-                get_hires_credit_cost(job_data.model)
+                get_hires_credit_cost(job_data.model, job_data.loras)
                 if is_hires_job
                 else get_credit_cost(job_data.model, job_data.loras)
             )
