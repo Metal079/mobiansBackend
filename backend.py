@@ -2744,3 +2744,253 @@ async def cancel_job(job_id: str):
                 raise HTTPException(status_code=404, detail="Job not found")
             else:
                 raise HTTPException(status_code=409, detail=f"Cannot cancel job in status '{row[0]}'")
+
+
+# ============================================================================
+# IMAGE HISTORY SYNC ENDPOINTS
+# ============================================================================
+
+class SyncImageRequest(BaseModel):
+    image_uuid: str
+    prompt: Optional[str] = None
+    prompt_summary: Optional[str] = None
+    negative_prompt: Optional[str] = None
+    model: Optional[str] = None
+    seed: Optional[int] = None
+    cfg: Optional[float] = None
+    width: int
+    height: int
+    aspect_ratio: str
+    is_favorite: bool = False
+    sync_priority: int = 0
+    loras: Optional[List[Any]] = []
+    tags: Optional[List[str]] = []
+    image_blob: str  # Base64 encoded image
+
+
+class SyncTagsRequest(BaseModel):
+    tags: List[dict]
+
+
+@app.get("/history/sync/status")
+async def get_sync_status(user: dict = Depends(require_auth)):
+    """Get the current sync status for the user."""
+    user_id = user["user_id"]
+    
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            # Count synced images
+            await acur.execute(
+                "SELECT COUNT(*) FROM user_synced_images WHERE user_id = %s",
+                (user_id,)
+            )
+            count_row = await acur.fetchone()
+            images_in_cloud = count_row[0] if count_row else 0
+            
+            # Get last sync time (most recent updated_at)
+            await acur.execute(
+                "SELECT MAX(updated_at) FROM user_synced_images WHERE user_id = %s",
+                (user_id,)
+            )
+            time_row = await acur.fetchone()
+            last_sync_time = time_row[0].isoformat() if time_row and time_row[0] else None
+            
+            # Get list of synced UUIDs
+            await acur.execute(
+                "SELECT image_uuid FROM user_synced_images WHERE user_id = %s",
+                (user_id,)
+            )
+            uuid_rows = await acur.fetchall()
+            synced_uuids = [row[0] for row in uuid_rows]
+    
+    return {
+        "images_in_cloud": images_in_cloud,
+        "quota_limit": 1000,
+        "last_sync_time": last_sync_time,
+        "synced_uuids": synced_uuids
+    }
+
+
+@app.post("/history/sync/image")
+async def sync_image(request: SyncImageRequest, user: dict = Depends(require_auth)):
+    """Sync a single image to the cloud."""
+    user_id = user["user_id"]
+    
+    # Check quota
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                "SELECT COUNT(*) FROM user_synced_images WHERE user_id = %s",
+                (user_id,)
+            )
+            count_row = await acur.fetchone()
+            current_count = count_row[0] if count_row else 0
+            
+            # Check if this image already exists (update case)
+            await acur.execute(
+                "SELECT id FROM user_synced_images WHERE user_id = %s AND image_uuid = %s",
+                (user_id, request.image_uuid)
+            )
+            existing = await acur.fetchone()
+            
+            if not existing and current_count >= 1000:
+                raise HTTPException(status_code=400, detail="Sync quota exceeded (1000 images max)")
+            
+            # Decode base64 blob
+            try:
+                image_blob = base64.b64decode(request.image_blob)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid base64 image data: {e}")
+            
+            # Upsert the image
+            await acur.execute(
+                """
+                INSERT INTO user_synced_images (
+                    user_id, image_uuid, prompt, prompt_summary, negative_prompt,
+                    model, seed, cfg, width, height, aspect_ratio,
+                    is_favorite, sync_priority, loras, tags, image_blob, updated_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                )
+                ON CONFLICT (user_id, image_uuid) DO UPDATE SET
+                    prompt = EXCLUDED.prompt,
+                    prompt_summary = EXCLUDED.prompt_summary,
+                    negative_prompt = EXCLUDED.negative_prompt,
+                    model = EXCLUDED.model,
+                    seed = EXCLUDED.seed,
+                    cfg = EXCLUDED.cfg,
+                    width = EXCLUDED.width,
+                    height = EXCLUDED.height,
+                    aspect_ratio = EXCLUDED.aspect_ratio,
+                    is_favorite = EXCLUDED.is_favorite,
+                    sync_priority = EXCLUDED.sync_priority,
+                    loras = EXCLUDED.loras,
+                    tags = EXCLUDED.tags,
+                    image_blob = EXCLUDED.image_blob,
+                    updated_at = NOW()
+                """,
+                (
+                    user_id, request.image_uuid, request.prompt, request.prompt_summary,
+                    request.negative_prompt, request.model, request.seed, request.cfg,
+                    request.width, request.height, request.aspect_ratio,
+                    request.is_favorite, request.sync_priority,
+                    json.dumps(request.loras), json.dumps(request.tags), image_blob
+                )
+            )
+            await aconn.commit()
+    
+    return {"success": True, "image_uuid": request.image_uuid}
+
+
+@app.get("/history/sync/images")
+async def get_synced_images(user: dict = Depends(require_auth)):
+    """Get all synced images for the user."""
+    user_id = user["user_id"]
+    
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT image_uuid, prompt, prompt_summary, negative_prompt, model,
+                       seed, cfg, width, height, aspect_ratio, is_favorite,
+                       sync_priority, loras, tags, image_blob, created_at
+                FROM user_synced_images
+                WHERE user_id = %s
+                ORDER BY sync_priority DESC, created_at DESC
+                """,
+                (user_id,)
+            )
+            rows = await acur.fetchall()
+    
+    images = []
+    for row in rows:
+        # Encode blob to base64 for transfer
+        image_blob_b64 = base64.b64encode(row[14]).decode('utf-8') if row[14] else None
+        
+        images.append({
+            "image_uuid": row[0],
+            "prompt": row[1],
+            "prompt_summary": row[2],
+            "negative_prompt": row[3],
+            "model": row[4],
+            "seed": row[5],
+            "cfg": float(row[6]) if row[6] else None,
+            "width": row[7],
+            "height": row[8],
+            "aspect_ratio": row[9],
+            "is_favorite": row[10],
+            "sync_priority": row[11],
+            "loras": row[12] if row[12] else [],
+            "tags": row[13] if row[13] else [],
+            "image_blob": image_blob_b64,
+            "created_at": row[15].isoformat() if row[15] else None
+        })
+    
+    return images
+
+
+@app.delete("/history/sync/image/{image_uuid}")
+async def delete_synced_image(image_uuid: str, user: dict = Depends(require_auth)):
+    """Remove an image from cloud sync."""
+    user_id = user["user_id"]
+    
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                "DELETE FROM user_synced_images WHERE user_id = %s AND image_uuid = %s RETURNING id",
+                (user_id, image_uuid)
+            )
+            deleted = await acur.fetchone()
+            await aconn.commit()
+    
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Image not found in sync")
+    
+    return {"success": True, "deleted": image_uuid}
+
+
+@app.post("/history/sync/tags")
+async def sync_tags(request: SyncTagsRequest, user: dict = Depends(require_auth)):
+    """Sync user tags to the cloud."""
+    user_id = user["user_id"]
+    
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            for tag in request.tags:
+                await acur.execute(
+                    """
+                    INSERT INTO user_tags (id, user_id, name, color, created_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (user_id, name) DO UPDATE SET
+                        color = EXCLUDED.color
+                    """,
+                    (tag.get("id"), user_id, tag.get("name"), tag.get("color"))
+                )
+            await aconn.commit()
+    
+    return {"success": True, "synced_count": len(request.tags)}
+
+
+@app.get("/history/sync/tags")
+async def get_synced_tags(user: dict = Depends(require_auth)):
+    """Get user's synced tags."""
+    user_id = user["user_id"]
+    
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                "SELECT id, name, color, created_at FROM user_tags WHERE user_id = %s ORDER BY created_at",
+                (user_id,)
+            )
+            rows = await acur.fetchall()
+    
+    return [
+        {
+            "id": row[0],
+            "name": row[1],
+            "color": row[2],
+            "created_at": row[3].isoformat() if row[3] else None
+        }
+        for row in rows
+    ]
+
