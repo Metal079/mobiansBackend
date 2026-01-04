@@ -2951,21 +2951,47 @@ async def delete_synced_image(image_uuid: str, user: dict = Depends(require_auth
 
 @app.post("/history/sync/tags")
 async def sync_tags(request: SyncTagsRequest, user: dict = Depends(require_auth)):
-    """Sync user tags to the cloud."""
+    """Sync user tags to the cloud.
+    
+    Uses upsert on primary key (id) to handle the case where a tag
+    already exists. The unique constraint on (user_id, name) prevents
+    duplicate tag names per user - if a name conflict occurs, we update
+    the existing tag's color.
+    """
     user_id = user["user_id"]
     
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             for tag in request.tags:
+                tag_id = tag.get("id")
+                tag_name = tag.get("name")
+                tag_color = tag.get("color")
+                
+                # First, check if a tag with this name already exists for this user
                 await acur.execute(
-                    """
-                    INSERT INTO user_tags (id, user_id, name, color, created_at)
-                    VALUES (%s, %s, %s, %s, NOW())
-                    ON CONFLICT (user_id, name) DO UPDATE SET
-                        color = EXCLUDED.color
-                    """,
-                    (tag.get("id"), user_id, tag.get("name"), tag.get("color"))
+                    "SELECT id FROM user_tags WHERE user_id = %s AND name = %s",
+                    (user_id, tag_name)
                 )
+                existing = await acur.fetchone()
+                
+                if existing:
+                    # Tag with this name exists - update it (use existing id)
+                    await acur.execute(
+                        "UPDATE user_tags SET color = %s WHERE id = %s",
+                        (tag_color, existing[0])
+                    )
+                else:
+                    # No existing tag with this name - insert new
+                    await acur.execute(
+                        """
+                        INSERT INTO user_tags (id, user_id, name, color, created_at)
+                        VALUES (%s, %s, %s, %s, NOW())
+                        ON CONFLICT (id) DO UPDATE SET
+                            name = EXCLUDED.name,
+                            color = EXCLUDED.color
+                        """,
+                        (tag_id, user_id, tag_name, tag_color)
+                    )
             await aconn.commit()
     
     return {"success": True, "synced_count": len(request.tags)}
@@ -2993,4 +3019,70 @@ async def get_synced_tags(user: dict = Depends(require_auth)):
         }
         for row in rows
     ]
+
+
+@app.delete("/history/sync/tags/{tag_id}")
+async def delete_synced_tag(tag_id: str, user: dict = Depends(require_auth)):
+    """Delete a synced tag and remove it from synced images."""
+    user_id = user["user_id"]
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                "DELETE FROM user_tags WHERE user_id = %s AND id = %s RETURNING id",
+                (user_id, tag_id)
+            )
+            deleted = await acur.fetchone()
+            if not deleted:
+                raise HTTPException(status_code=404, detail="Tag not found")
+
+            await acur.execute(
+                """
+                SELECT data_type
+                FROM information_schema.columns
+                WHERE table_name = 'user_synced_images'
+                  AND column_name = 'tags'
+                  AND table_schema = current_schema()
+                LIMIT 1
+                """
+            )
+            type_row = await acur.fetchone()
+            tags_type = type_row[0] if type_row else 'jsonb'
+
+            if tags_type == 'json':
+                await acur.execute(
+                    """
+                    UPDATE user_synced_images
+                    SET tags = COALESCE(
+                        (
+                            SELECT jsonb_agg(elem)
+                            FROM jsonb_array_elements_text(COALESCE(tags::jsonb, '[]'::jsonb)) elem
+                            WHERE elem <> %s
+                        ),
+                        '[]'::jsonb
+                    )::json
+                    WHERE user_id = %s
+                    """,
+                    (tag_id, user_id)
+                )
+            else:
+                await acur.execute(
+                    """
+                    UPDATE user_synced_images
+                    SET tags = COALESCE(
+                        (
+                            SELECT jsonb_agg(elem)
+                            FROM jsonb_array_elements_text(COALESCE(tags, '[]'::jsonb)) elem
+                            WHERE elem <> %s
+                        ),
+                        '[]'::jsonb
+                    )
+                    WHERE user_id = %s
+                    """,
+                    (tag_id, user_id)
+                )
+
+            await aconn.commit()
+
+    return {"success": True, "deleted": tag_id}
 
