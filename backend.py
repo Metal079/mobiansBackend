@@ -2882,6 +2882,60 @@ async def sync_image(request: SyncImageRequest, user: dict = Depends(require_aut
     return {"success": True, "image_uuid": request.image_uuid}
 
 
+class UpdateImageMetadataRequest(BaseModel):
+    """Request to update just the metadata (tags, favorite) of a synced image."""
+    tags: Optional[List[str]] = None
+    is_favorite: Optional[bool] = None
+
+
+@app.patch("/history/sync/image/{image_uuid}")
+async def update_image_metadata(
+    image_uuid: str, 
+    request: UpdateImageMetadataRequest, 
+    user: dict = Depends(require_auth)
+):
+    """Update metadata (tags, favorite status) for a synced image without re-uploading the blob."""
+    user_id = user["user_id"]
+    
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            # Check if image exists
+            await acur.execute(
+                "SELECT id FROM user_synced_images WHERE user_id = %s AND image_uuid = %s",
+                (user_id, image_uuid)
+            )
+            existing = await acur.fetchone()
+            
+            if not existing:
+                raise HTTPException(status_code=404, detail="Image not found in sync")
+            
+            # Build update query dynamically based on what's provided
+            updates = []
+            params = []
+            
+            if request.tags is not None:
+                updates.append("tags = %s")
+                params.append(json.dumps(request.tags))
+            
+            if request.is_favorite is not None:
+                updates.append("is_favorite = %s")
+                params.append(request.is_favorite)
+            
+            if updates:
+                updates.append("updated_at = NOW()")
+                params.extend([user_id, image_uuid])
+                
+                query = f"""
+                    UPDATE user_synced_images 
+                    SET {', '.join(updates)}
+                    WHERE user_id = %s AND image_uuid = %s
+                """
+                await acur.execute(query, tuple(params))
+                await aconn.commit()
+    
+    return {"success": True, "image_uuid": image_uuid}
+
+
 @app.get("/history/sync/images")
 async def get_synced_images(user: dict = Depends(require_auth)):
     """Get all synced images for the user."""
