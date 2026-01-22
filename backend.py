@@ -50,8 +50,6 @@ DBPASS = os.environ.get("DBPASS")
 # Define your connection parameters for PostgreSQL
 DSN = f"host={DBHOST} dbname='{DBNAME}' user={DBUSER} password={DBPASS}"
 
-API_IP_List = os.environ.get("API_IP_List").split(" ")
-
 VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY")
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY")
 VAPID_CLAIMS = os.environ.get("VAPID_CLAIMS")
