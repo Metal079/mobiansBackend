@@ -118,6 +118,7 @@ MODEL_BASE_TYPES = {
 }
 
 DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "novaMobianXL_v10")
+LORA_SUGGESTION_LIMIT = 5
 
 
 def normalize_model_id(model: Optional[str]) -> str:
@@ -1016,6 +1017,34 @@ async def add_lora_suggestion(lora_data: addLoraSuggestion):
 
     if row:
         return JSONResponse(content={"status": "error", "detail": "This lora already exists! Check out the loras tab :), if this is a mistake, report it on the discord!"}, status_code=400)
+
+    # Enforce per-user active suggestion cap
+    if lora_data.requestor:
+        async with db_pool.connection() as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM lora_suggestions
+                    WHERE requestor = %s
+                      AND status = 'pending'
+                    """,
+                    (lora_data.requestor,)
+                )
+                count_row = await acur.fetchone()
+                active_count = count_row[0] if count_row else 0
+
+        if active_count >= LORA_SUGGESTION_LIMIT:
+            return JSONResponse(
+                content={
+                    "status": "error",
+                    "detail": (
+                        f"Suggestion limit reached ({LORA_SUGGESTION_LIMIT} active suggestions). "
+                        "Please wait for your existing suggestions to be processed."
+                    ),
+                },
+                status_code=429,
+            )
 
     # Try to insert the suggestion into the database
     try:
@@ -2412,8 +2441,28 @@ async def get_admin_civitai_link(version_id: int, user: dict = Depends(require_a
 
 
 @app.get("/get_lora_suggestions/")
-async def get_lora_suggestions(user: dict = Depends(require_admin)):
-    """Get all pending LoRA suggestions. Admin only."""
+async def get_lora_suggestions(status: str = "pending", user: dict = Depends(require_admin)):
+    """Get LoRA suggestions by status. Admin only."""
+    status_norm = (status or "pending").strip().lower()
+    allowed_statuses = {
+        "pending",
+        "approved",
+        "downloading",
+        "downloaded",
+        "failed",
+        "rejected",
+        "duplicate",
+        "all",
+    }
+    if status_norm not in allowed_statuses:
+        raise HTTPException(status_code=400, detail="Invalid status filter")
+
+    where_clause = ""
+    params: tuple = ()
+    if status_norm != "all":
+        where_clause = "WHERE status = %s"
+        params = (status_norm,)
+
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
@@ -2421,9 +2470,10 @@ async def get_lora_suggestions(user: dict = Depends(require_admin)):
                 SELECT version_id, name, version, status, requestor, 
                        is_nsfw, is_minor, preview_image, base_model
                 FROM lora_suggestions
-                WHERE status = 'pending'
+                """ + where_clause + """
                 ORDER BY name
-                """
+                """,
+                params,
             )
             columns = [desc[0] for desc in acur.description]
             rows = await acur.fetchall()
@@ -2507,7 +2557,7 @@ async def admin_approve_suggestion(suggestion_id: int, user: dict = Depends(requ
                 """
                 SELECT version_id, name, version, is_nsfw, is_minor, preview_image
                 FROM lora_suggestions
-                WHERE version_id = %s AND status = 'pending'
+                WHERE version_id = %s AND status IN ('pending', 'rejected')
                 """,
                 (suggestion_id,)
             )
