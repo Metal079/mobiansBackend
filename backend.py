@@ -2893,6 +2893,16 @@ class SyncTagsRequest(BaseModel):
     tags: List[dict]
 
 
+class LoraPreferenceItem(BaseModel):
+    version_id: int
+    is_favorite: Optional[bool] = None
+    last_used_at: Optional[datetime] = None
+
+
+class LoraPreferencesSyncRequest(BaseModel):
+    preferences: List[LoraPreferenceItem]
+
+
 @app.get("/history/sync/status")
 async def get_sync_status(user: dict = Depends(require_auth)):
     """Get the current sync status for the user."""
@@ -3260,4 +3270,68 @@ async def delete_synced_tag(tag_id: str, user: dict = Depends(require_auth)):
             await aconn.commit()
 
     return {"success": True, "deleted": tag_id}
+
+
+# LORA PREFERENCES SYNC ENDPOINTS
+@app.get("/lora/preferences")
+async def get_lora_preferences(user: dict = Depends(require_auth)):
+    """Get user's LoRA favorites and last-used timestamps."""
+    user_id = user["user_id"]
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT version_id, is_favorite, last_used_at, updated_at
+                FROM user_lora_preferences
+                WHERE user_id = %s
+                """,
+                (user_id,)
+            )
+            rows = await acur.fetchall()
+
+    return [
+        {
+            "version_id": row[0],
+            "is_favorite": row[1],
+            "last_used_at": row[2].isoformat() if row[2] else None,
+            "updated_at": row[3].isoformat() if row[3] else None,
+        }
+        for row in rows
+    ]
+
+
+@app.post("/lora/preferences")
+async def sync_lora_preferences(request: LoraPreferencesSyncRequest, user: dict = Depends(require_auth)):
+    """Sync user's LoRA preferences (favorites and last-used)."""
+    user_id = user["user_id"]
+    prefs = request.preferences or []
+
+    if len(prefs) == 0:
+        return {"success": True, "synced_count": 0}
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            for pref in prefs:
+                if pref is None:
+                    continue
+                if pref.is_favorite is None and pref.last_used_at is None:
+                    continue
+                await acur.execute(
+                    """
+                    INSERT INTO user_lora_preferences (
+                        user_id, version_id, is_favorite, last_used_at, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, COALESCE(%s, FALSE), %s, NOW(), NOW()
+                    )
+                    ON CONFLICT (user_id, version_id) DO UPDATE SET
+                        is_favorite = COALESCE(EXCLUDED.is_favorite, user_lora_preferences.is_favorite),
+                        last_used_at = COALESCE(EXCLUDED.last_used_at, user_lora_preferences.last_used_at),
+                        updated_at = NOW()
+                    """,
+                    (user_id, pref.version_id, pref.is_favorite, pref.last_used_at)
+                )
+            await aconn.commit()
+
+    return {"success": True, "synced_count": len(prefs)}
 
