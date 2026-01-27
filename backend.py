@@ -2440,22 +2440,95 @@ async def get_admin_civitai_link(version_id: int, user: dict = Depends(require_a
     return {"url": url}
 
 
+@app.get("/get_my_lora_suggestions/")
+async def get_my_lora_suggestions(status: str = "pending", user: dict = Depends(require_auth)):
+    """Get LoRA suggestions for the current user."""
+    requestor = user.get("discord_user_id") or user.get("user_id") or user.get("username")
+    if not requestor:
+        raise HTTPException(status_code=400, detail="No requestor id available")
+
+    status_norm = (status or "pending").strip().lower()
+
+    where_clause = "WHERE requestor = %s"
+    params: list = [str(requestor)]
+    if status_norm != "all":
+        where_clause += " AND status = %s"
+        params.append(status_norm)
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT version_id, name, version, status, requestor, 
+                       is_nsfw, is_minor, preview_image, base_model
+                FROM lora_suggestions
+                """ + where_clause + """
+                ORDER BY name
+                """,
+                tuple(params),
+            )
+            columns = [desc[0] for desc in acur.description]
+            rows = await acur.fetchall()
+            result = []
+            for row in rows:
+                row_dict = dict(zip(columns, row))
+                row_dict['id'] = row_dict['version_id']
+                row_dict['submitted_by'] = row_dict.get('requestor', '')
+                row_dict['image_url'] = row_dict.get('preview_image', '')
+                result.append(row_dict)
+
+    json_compatible_result = jsonable_encoder(result)
+    return JSONResponse(content=json_compatible_result)
+
+
+@app.post("/cancel_lora_suggestion/{suggestion_id}/")
+async def cancel_lora_suggestion(suggestion_id: int, user: dict = Depends(require_auth)):
+    """Cancel a pending LoRA suggestion for the current user."""
+    requestor = user.get("discord_user_id") or user.get("user_id") or user.get("username")
+    if not requestor:
+        raise HTTPException(status_code=400, detail="No requestor id available")
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT version_id, name, status, requestor
+                FROM lora_suggestions
+                WHERE version_id = %s
+                """,
+                (suggestion_id,),
+            )
+            row = await acur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Suggestion not found")
+
+            _, name, status, row_requestor = row
+            if str(row_requestor) != str(requestor):
+                raise HTTPException(status_code=403, detail="You can only cancel your own suggestions")
+
+            if status != 'pending':
+                raise HTTPException(status_code=409, detail=f"Cannot cancel suggestion in status '{status}'")
+
+            await acur.execute(
+                """
+                UPDATE lora_suggestions
+                SET status = 'cancelled', last_updated_date = NOW()
+                WHERE version_id = %s
+                """,
+                (suggestion_id,),
+            )
+            await aconn.commit()
+
+    return {
+        "status": "success",
+        "message": f"Suggestion '{name}' cancelled"
+    }
+
+
 @app.get("/get_lora_suggestions/")
 async def get_lora_suggestions(status: str = "pending", user: dict = Depends(require_admin)):
     """Get LoRA suggestions by status. Admin only."""
     status_norm = (status or "pending").strip().lower()
-    allowed_statuses = {
-        "pending",
-        "approved",
-        "downloading",
-        "downloaded",
-        "failed",
-        "rejected",
-        "duplicate",
-        "all",
-    }
-    if status_norm not in allowed_statuses:
-        raise HTTPException(status_code=400, detail="Invalid status filter")
 
     where_clause = ""
     params: tuple = ()
