@@ -3068,29 +3068,39 @@ async def update_image_metadata(
 
 
 @app.get("/history/sync/images")
-async def get_synced_images(user: dict = Depends(require_auth)):
+async def get_synced_images(include_blobs: bool = True, user: dict = Depends(require_auth)):
     """Get all synced images for the user."""
     user_id = user["user_id"]
     
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
-            await acur.execute(
-                """
+            if include_blobs:
+                query = """
                 SELECT image_uuid, prompt, prompt_summary, negative_prompt, model,
                        seed, cfg, width, height, aspect_ratio, is_favorite,
                        sync_priority, loras, tags, image_blob, created_at
                 FROM user_synced_images
                 WHERE user_id = %s
                 ORDER BY sync_priority DESC, created_at DESC
-                """,
-                (user_id,)
-            )
+                """
+            else:
+                query = """
+                SELECT image_uuid, prompt, prompt_summary, negative_prompt, model,
+                       seed, cfg, width, height, aspect_ratio, is_favorite,
+                       sync_priority, loras, tags, created_at
+                FROM user_synced_images
+                WHERE user_id = %s
+                ORDER BY sync_priority DESC, created_at DESC
+                """
+            await acur.execute(query, (user_id,))
             rows = await acur.fetchall()
     
     images = []
     for row in rows:
-        # Encode blob to base64 for transfer
-        image_blob_b64 = base64.b64encode(row[14]).decode('utf-8') if row[14] else None
+        image_blob_b64 = None
+        created_at = row[15] if include_blobs else row[14]
+        if include_blobs and row[14]:
+            image_blob_b64 = base64.b64encode(row[14]).decode('utf-8')
         
         images.append({
             "image_uuid": row[0],
@@ -3108,7 +3118,7 @@ async def get_synced_images(user: dict = Depends(require_auth)):
             "loras": row[12] if row[12] else [],
             "tags": row[13] if row[13] else [],
             "image_blob": image_blob_b64,
-            "created_at": row[15].isoformat() if row[15] else None
+            "created_at": created_at.isoformat() if created_at else None
         })
     
     return images
