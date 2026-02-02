@@ -17,8 +17,8 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header, UploadFile, File, Query
+from fastapi.responses import JSONResponse, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -1372,12 +1372,12 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
 async def get_loras(status: str = "active"):
     status_norm = (status or "active").strip().lower()
     if status_norm == "inactive":
-        where_clause = "WHERE image_url IS NOT NULL and is_active = false"
+        where_clause = "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL) and is_active = false"
     elif status_norm == "all":
-        where_clause = "WHERE image_url IS NOT NULL"
+        where_clause = "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL)"
     else:
         # Default to active
-        where_clause = "WHERE image_url IS NOT NULL and is_active = true"
+        where_clause = "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL) and is_active = true"
 
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
@@ -1395,6 +1395,8 @@ async def get_loras(status: str = "active"):
             
             # Convert to list of dictionaries
             result = [dict(zip(columns, row)) for row in rows]
+            for item in result:
+                item.pop('image_blob', None)
     
     # Convert the result to a JSON-serializable format
     json_compatible_result = jsonable_encoder(result)
@@ -2618,6 +2620,91 @@ async def admin_update_lora(lora_id: int, data: LoraToggleRequest, user: dict = 
             "is_nsfw": row[3]
         }
     }
+
+
+def _process_lora_preview_image(raw_bytes: bytes) -> bytes:
+    image = Image.open(io.BytesIO(raw_bytes))
+    image = image.convert("RGB")
+    resample = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+    image.thumbnail((1024, 1024), resample)
+    buffer = io.BytesIO()
+    image.save(buffer, format="WEBP", quality=85, method=6)
+    return buffer.getvalue()
+
+
+@app.post("/admin/lora/{lora_id}/image")
+async def admin_upload_lora_image(
+    lora_id: int,
+    file: UploadFile = File(...),
+    user: dict = Depends(require_admin)
+):
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Invalid file type. Only images are allowed.")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file upload.")
+
+    try:
+        optimized = _process_lora_preview_image(content)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to process image: {exc}")
+
+    cache_bust = int(time.time())
+    image_url = f"/lora-image/{lora_id}?v={cache_bust}"
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                UPDATE lora_metadata
+                SET image_url = %s,
+                    image_blob = %s
+                WHERE id = %s
+                RETURNING id, image_url
+                """,
+                (image_url, optimized, lora_id),
+            )
+            row = await acur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="LoRA not found")
+            await aconn.commit()
+
+    return {"status": "success", "image_url": row[1]}
+
+
+@app.get("/lora-image/{lora_id}")
+async def get_lora_image(lora_id: int, w: Optional[int] = Query(None, gt=0, le=2048)):
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT image_blob
+                FROM lora_metadata
+                WHERE id = %s
+                """,
+                (lora_id,)
+            )
+            row = await acur.fetchone()
+
+    if not row or row[0] is None:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    original_bytes = bytes(row[0])
+    if not w:
+        return Response(content=original_bytes, media_type="image/webp", headers={"Cache-Control": "public, max-age=86400"})
+
+    with Image.open(io.BytesIO(original_bytes)) as image:
+        resample = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+        if image.width > w:
+            ratio = w / float(image.width)
+            height = max(1, int(image.height * ratio))
+            image = image.resize((w, height), resample)
+        buffer = io.BytesIO()
+        image.save(buffer, format="WEBP", quality=85, method=6)
+        data = buffer.getvalue()
+
+    return Response(content=data, media_type="image/webp", headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.post("/admin/suggestion/{suggestion_id}/approve")
