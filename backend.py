@@ -594,6 +594,16 @@ async def submit_job(
             job_data.job_type = "img2img" if job_data.image else "txt2img"
             job_data.mask_image = None
 
+    # Clear color_inpaint if no mask is present.
+    # Prevents filter_image() from trying to process a null mask when
+    # the frontend accidentally sends color_inpaint=True without mask data.
+    if job_data.color_inpaint and (not job_data.mask_image or not job_data.mask_image.strip()):
+        logging.warning(
+            "Clearing color_inpaint flag: no mask_image provided. "
+            "This is likely a stale frontend state."
+        )
+        job_data.color_inpaint = None
+
     # Determine queue type and credit cost
     queue_type = job_data.queue_type or "free"
     credit_cost = 0
