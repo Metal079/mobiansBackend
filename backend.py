@@ -1065,11 +1065,84 @@ async def add_lora_suggestion(lora_data: addLoraSuggestion):
                     INSERT INTO lora_suggestions (version_id, name, version, status, requestor, is_nsfw, is_minor, preview_image, base_model)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (lora_data.lora_version_id, lora_data.name, lora_data.version, lora_data.status, lora_data.requestor, lora_data.is_nsfw, lora_data.is_minor, lora_data.preview_image, lora_data.base_model),
+                    (
+                        lora_data.lora_version_id,
+                        lora_data.name,
+                        lora_data.version,
+                        lora_data.status,
+                        lora_data.requestor,
+                        lora_data.is_nsfw,
+                        lora_data.is_minor,
+                        lora_data.preview_image,
+                        lora_data.base_model,
+                    ),
                 )
         return JSONResponse(content={"status": "success"})
     except errors.UniqueViolation:
-        return JSONResponse(content={"status": "error", "detail": "A suggestion for this LoRA already exists! Please be patient while its added!"}, status_code=400)
+        # Resolve duplicate requests by checking the current status and re-queuing when safe
+        async with db_pool.connection() as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute(
+                    """
+                    SELECT status
+                    FROM lora_suggestions
+                    WHERE version_id = %s
+                    """,
+                    (lora_data.lora_version_id,),
+                )
+                row = await acur.fetchone()
+
+        if not row:
+            return JSONResponse(
+                content={
+                    "status": "error",
+                    "detail": "Unable to verify existing LoRA suggestion. Please try again later.",
+                },
+                status_code=400,
+            )
+
+        existing_status = (row[0] or "").strip().lower()
+        # Allow re-queueing when the previous attempt already finished processing
+        immutable_statuses = {"pending", "approved", "downloading"}
+        if existing_status in immutable_statuses:
+            detail = "A suggestion for this LoRA is already pending approval. Please be patient as we review it."
+            if existing_status == "approved":
+                detail = "This LoRA has already been approved and is queued for download."
+            elif existing_status == "downloading":
+                detail = "This LoRA is currently downloading. Please wait for it to finish."
+            return JSONResponse(content={"status": "error", "detail": detail}, status_code=400)
+
+        async with db_pool.connection() as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute(
+                    """
+                    UPDATE lora_suggestions
+                    SET name = %s,
+                        version = %s,
+                        status = 'pending',
+                        requestor = %s,
+                        is_nsfw = %s,
+                        is_minor = %s,
+                        preview_image = %s,
+                        base_model = %s,
+                        error_message = NULL,
+                        last_updated_date = NOW(),
+                        created_at = NOW()
+                    WHERE version_id = %s
+                    """,
+                    (
+                        lora_data.name,
+                        lora_data.version,
+                        lora_data.requestor,
+                        lora_data.is_nsfw,
+                        lora_data.is_minor,
+                        lora_data.preview_image,
+                        lora_data.base_model,
+                        lora_data.lora_version_id,
+                    ),
+                )
+
+        return JSONResponse(content={"status": "success", "detail": "LoRA suggestion re-queued"})
 
 def decode_base64_to_image(base64_str):
     # Convert base64 string to image
@@ -2471,8 +2544,9 @@ async def get_my_lora_suggestions(status: str = "pending", user: dict = Depends(
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
-                SELECT version_id, name, version, status, requestor, 
-                       is_nsfw, is_minor, preview_image, base_model
+                  SELECT version_id, name, version, status, requestor, 
+                      is_nsfw, is_minor, preview_image, base_model,
+                      error_message, last_updated_date
                 FROM lora_suggestions
                 """ + where_clause + """
                 ORDER BY name
@@ -2552,8 +2626,9 @@ async def get_lora_suggestions(status: str = "pending", user: dict = Depends(req
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
-                SELECT version_id, name, version, status, requestor, 
-                       is_nsfw, is_minor, preview_image, base_model
+                  SELECT version_id, name, version, status, requestor, 
+                      is_nsfw, is_minor, preview_image, base_model,
+                      error_message, last_updated_date
                 FROM lora_suggestions
                 """ + where_clause + """
                 ORDER BY name
