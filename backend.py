@@ -2654,11 +2654,57 @@ class LoraToggleRequest(BaseModel):
     is_active: Optional[bool] = None
     is_nsfw: Optional[bool] = None
     name: Optional[str] = None
+    trigger_words: Optional[Any] = None
+
+
+def _normalize_trigger_words_input(raw_value: Any) -> List[str]:
+    """Normalize trigger words to a de-duplicated string list."""
+    if raw_value is None:
+        return []
+
+    values: List[Any]
+    if isinstance(raw_value, str):
+        candidate = raw_value.strip()
+        if not candidate:
+            values = []
+        elif candidate.startswith("["):
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, list):
+                    values = parsed
+                else:
+                    values = re.split(r"[\n,]", candidate)
+            except Exception:
+                values = re.split(r"[\n,]", candidate)
+        else:
+            values = re.split(r"[\n,]", candidate)
+    elif isinstance(raw_value, list):
+        values = raw_value
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="trigger_words must be an array or a comma/newline-separated string",
+        )
+
+    normalized: List[str] = []
+    seen = set()
+    for item in values:
+        if item is None:
+            continue
+        cleaned = str(item).strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(cleaned)
+    return normalized
 
 
 @app.patch("/admin/lora/{lora_id}")
 async def admin_update_lora(lora_id: int, data: LoraToggleRequest, user: dict = Depends(require_admin)):
-    """Update a LoRA's active, NSFW status, or name by id. Admin only."""
+    """Update a LoRA's active, NSFW status, name, or trigger words by id. Admin only."""
     updates = []
     params = []
     
@@ -2673,6 +2719,11 @@ async def admin_update_lora(lora_id: int, data: LoraToggleRequest, user: dict = 
     if data.name is not None:
         updates.append("name = %s")
         params.append(data.name)
+
+    if data.trigger_words is not None:
+        normalized_trigger_words = _normalize_trigger_words_input(data.trigger_words)
+        updates.append("trigger_words = %s")
+        params.append(json.dumps(normalized_trigger_words))
     
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -2686,7 +2737,7 @@ async def admin_update_lora(lora_id: int, data: LoraToggleRequest, user: dict = 
                 UPDATE lora_metadata
                 SET {', '.join(updates)}
                 WHERE id = %s
-                RETURNING id, name, is_active, is_nsfw
+                RETURNING id, name, is_active, is_nsfw, trigger_words
                 """,
                 tuple(params)
             )
@@ -2702,7 +2753,8 @@ async def admin_update_lora(lora_id: int, data: LoraToggleRequest, user: dict = 
             "id": row[0],
             "name": row[1],
             "is_active": row[2],
-            "is_nsfw": row[3]
+            "is_nsfw": row[3],
+            "trigger_words": row[4] if len(row) > 4 else None
         }
     }
 
