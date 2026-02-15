@@ -11,6 +11,7 @@ import re
 import time
 import math
 import secrets
+import uuid
 
 # Fix for Windows - psycopg async requires SelectorEventLoop
 if sys.platform == "win32":
@@ -553,6 +554,7 @@ class JobData(BaseModel):
     is_dev_job: Optional[bool] = False
     loras: Optional[List[Dict[str, Any]]] = None
     lossy_images: Optional[bool] = False
+    regional_prompting: Optional[Dict[str, Any]] = None
     # New fields for credit system
     queue_type: Optional[str] = "free"  # "free" or "priority"
 
@@ -693,6 +695,12 @@ async def submit_job(
         credit_cost=credit_cost
     )
 
+    regional_prompt_payload: Optional[str] = None
+    if image_request_data.regional_prompting and image_request_data.regional_prompting.get("enabled"):
+        regional_prompt_payload = "__regional_prompting__:" + json.dumps(
+            image_request_data.regional_prompting
+        )
+
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             # If priority queue with credits, deduct first (atomic with job creation)
@@ -732,7 +740,7 @@ async def submit_job(
                     image_request_data.image_UUID,
                     image_request_data.mask_image,
                     image_request_data.color_inpaint,
-                    image_request_data.control_image,
+                    regional_prompt_payload or image_request_data.control_image,
                     image_request_data.scheduler,
                     image_request_data.steps,
                     image_request_data.negative_prompt,
@@ -3109,6 +3117,7 @@ class SyncImageRequest(BaseModel):
     is_favorite: bool = False
     sync_priority: int = 0
     loras: Optional[List[Any]] = []
+    regional_prompting: Optional[dict] = None
     tags: Optional[List[str]] = []
     image_blob: str  # Base64 encoded image
 
@@ -3125,6 +3134,30 @@ class LoraPreferenceItem(BaseModel):
 
 class LoraPreferencesSyncRequest(BaseModel):
     preferences: List[LoraPreferenceItem]
+
+
+class RegionalPromptPresetRegionItem(BaseModel):
+    id: str
+    prompt: str = ""
+    negative_prompt: str = ""
+    x: float = 0
+    y: float = 0
+    width: float = 0.25
+    height: float = 0.25
+    denoise_strength: float = 1.0
+    feather: int = 2
+    opacity: float = 1.0
+    inherit_base_prompt: bool = False
+
+
+class RegionalPromptPresetItem(BaseModel):
+    id: Optional[str] = None
+    name: str
+    regions: List[RegionalPromptPresetRegionItem]
+
+
+class RegionalPromptPresetsSyncRequest(BaseModel):
+    presets: List[RegionalPromptPresetItem]
 
 
 @app.get("/history/sync/status")
@@ -3203,9 +3236,9 @@ async def sync_image(request: SyncImageRequest, user: dict = Depends(require_aut
                 INSERT INTO user_synced_images (
                     user_id, image_uuid, prompt, prompt_summary, negative_prompt,
                     model, seed, cfg, width, height, aspect_ratio,
-                    is_favorite, sync_priority, loras, tags, image_blob, updated_at
+                    is_favorite, sync_priority, loras, regional_prompting, tags, image_blob, updated_at
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
                 )
                 ON CONFLICT (user_id, image_uuid) DO UPDATE SET
                     prompt = EXCLUDED.prompt,
@@ -3220,6 +3253,7 @@ async def sync_image(request: SyncImageRequest, user: dict = Depends(require_aut
                     is_favorite = EXCLUDED.is_favorite,
                     sync_priority = EXCLUDED.sync_priority,
                     loras = EXCLUDED.loras,
+                    regional_prompting = EXCLUDED.regional_prompting,
                     tags = EXCLUDED.tags,
                     image_blob = EXCLUDED.image_blob,
                     updated_at = NOW()
@@ -3229,7 +3263,10 @@ async def sync_image(request: SyncImageRequest, user: dict = Depends(require_aut
                     request.negative_prompt, request.model, request.seed, request.cfg,
                     request.width, request.height, request.aspect_ratio,
                     request.is_favorite, request.sync_priority,
-                    json.dumps(request.loras), json.dumps(request.tags), image_blob
+                    json.dumps(request.loras or []),
+                    json.dumps(request.regional_prompting) if request.regional_prompting is not None else None,
+                    json.dumps(request.tags or []),
+                    image_blob
                 )
             )
             await aconn.commit()
@@ -3302,7 +3339,7 @@ async def get_synced_images(include_blobs: bool = True, user: dict = Depends(req
                 query = """
                 SELECT image_uuid, prompt, prompt_summary, negative_prompt, model,
                        seed, cfg, width, height, aspect_ratio, is_favorite,
-                       sync_priority, loras, tags, image_blob, created_at
+                       sync_priority, loras, regional_prompting, tags, image_blob, created_at
                 FROM user_synced_images
                 WHERE user_id = %s
                 ORDER BY sync_priority DESC, created_at DESC
@@ -3311,7 +3348,7 @@ async def get_synced_images(include_blobs: bool = True, user: dict = Depends(req
                 query = """
                 SELECT image_uuid, prompt, prompt_summary, negative_prompt, model,
                        seed, cfg, width, height, aspect_ratio, is_favorite,
-                       sync_priority, loras, tags, created_at
+                       sync_priority, loras, regional_prompting, tags, created_at
                 FROM user_synced_images
                 WHERE user_id = %s
                 ORDER BY sync_priority DESC, created_at DESC
@@ -3322,9 +3359,9 @@ async def get_synced_images(include_blobs: bool = True, user: dict = Depends(req
     images = []
     for row in rows:
         image_blob_b64 = None
-        created_at = row[15] if include_blobs else row[14]
-        if include_blobs and row[14]:
-            image_blob_b64 = base64.b64encode(row[14]).decode('utf-8')
+        created_at = row[16] if include_blobs else row[15]
+        if include_blobs and row[15]:
+            image_blob_b64 = base64.b64encode(row[15]).decode('utf-8')
         
         images.append({
             "image_uuid": row[0],
@@ -3340,7 +3377,8 @@ async def get_synced_images(include_blobs: bool = True, user: dict = Depends(req
             "is_favorite": row[10],
             "sync_priority": row[11],
             "loras": row[12] if row[12] else [],
-            "tags": row[13] if row[13] else [],
+            "regional_prompting": row[13] if row[13] else {"enabled": False, "regions": []},
+            "tags": row[14] if row[14] else [],
             "image_blob": image_blob_b64,
             "created_at": created_at.isoformat() if created_at else None
         })
@@ -3568,4 +3606,128 @@ async def sync_lora_preferences(request: LoraPreferencesSyncRequest, user: dict 
             await aconn.commit()
 
     return {"success": True, "synced_count": len(prefs)}
+
+
+@app.get("/regional-presets")
+async def get_regional_prompt_presets(user: dict = Depends(require_auth)):
+    """Get account-backed regional prompt presets for the current user."""
+    user_id = user["user_id"]
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT id, name, regions, updated_at
+                FROM user_regional_prompt_presets
+                WHERE user_id = %s
+                ORDER BY updated_at DESC, created_at DESC
+                """,
+                (user_id,)
+            )
+            rows = await acur.fetchall()
+
+    return [
+        {
+            "id": str(row[0]),
+            "name": row[1],
+            "regions": row[2] if isinstance(row[2], list) else [],
+            "updated_at": row[3].isoformat() if row[3] else None,
+        }
+        for row in rows
+    ]
+
+
+@app.post("/regional-presets")
+async def sync_regional_prompt_presets(
+    request: RegionalPromptPresetsSyncRequest,
+    user: dict = Depends(require_auth),
+):
+    """Replace the current user's preset set with the provided list."""
+    user_id = user["user_id"]
+    incoming_presets = request.presets or []
+
+    # Keep payloads bounded.
+    incoming_presets = incoming_presets[:100]
+    sanitized_presets: List[dict] = []
+
+    for preset in incoming_presets:
+        if preset is None:
+            continue
+
+        name = (preset.name or "").strip()
+        if not name:
+            continue
+        name = name[:120]
+
+        regions = []
+        for region in (preset.regions or [])[:32]:
+            width = min(1.0, max(0.05, float(region.width)))
+            height = min(1.0, max(0.05, float(region.height)))
+            x = min(1.0, max(0.0, float(region.x)))
+            y = min(1.0, max(0.0, float(region.y)))
+            if x + width > 1.0:
+                x = max(0.0, 1.0 - width)
+            if y + height > 1.0:
+                y = max(0.0, 1.0 - height)
+
+            regions.append(
+                {
+                    "id": str(region.id or f"{int(time.time() * 1000)}-{secrets.randbelow(1000)}"),
+                    "prompt": (region.prompt or "").strip(),
+                    "negative_prompt": (region.negative_prompt or "").strip(),
+                    "x": x,
+                    "y": y,
+                    "width": width,
+                    "height": height,
+                    "denoise_strength": min(1.0, max(0.0, float(region.denoise_strength))),
+                    "feather": min(96, max(0, int(region.feather))),
+                    "opacity": min(1.0, max(0.0, float(region.opacity))),
+                    "inherit_base_prompt": bool(region.inherit_base_prompt),
+                }
+            )
+
+        if len(regions) == 0:
+            continue
+
+        preset_id = None
+        if preset.id:
+            try:
+                preset_id = uuid.UUID(str(preset.id))
+            except Exception:
+                preset_id = None
+
+        sanitized_presets.append(
+            {
+                "id": preset_id,
+                "name": name,
+                "regions": regions,
+            }
+        )
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                "DELETE FROM user_regional_prompt_presets WHERE user_id = %s",
+                (user_id,)
+            )
+
+            for preset in sanitized_presets:
+                await acur.execute(
+                    """
+                    INSERT INTO user_regional_prompt_presets
+                        (id, user_id, name, regions, created_at, updated_at)
+                    VALUES
+                        (COALESCE(%s, gen_random_uuid()), %s, %s, %s::jsonb, NOW(), NOW())
+                    """,
+                    (
+                        preset["id"],
+                        user_id,
+                        preset["name"],
+                        json.dumps(preset["regions"]),
+                    ),
+                )
+
+            await aconn.commit()
+
+    return {"success": True, "synced_count": len(sanitized_presets)}
 
