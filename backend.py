@@ -60,7 +60,7 @@ subscriptions: Dict[str, dict] = {}
 CREDIT_COSTS = {
     "SD 1.5": 5,       # sonicDiffusionV4
     "Pony": 10,        # autismMix (SDXL-based)
-    "Illustrious": 10  # novaFurryXL_ilV140 (SDXL-based), novaMobianXL_v10
+    "Illustrious": 10  # novaFurryXL_ilV140 (SDXL-based), novaMobianXL_v10, novaMobianXL_v20
 }
 
 # Additional cost per LoRA by model type
@@ -115,10 +115,11 @@ MODEL_BASE_TYPES = {
     "sonicDiffusionV4": "SD 1.5",
     "autismMix": "Pony",
     "novaMobianXL_v10": "Illustrious",
-    "novaFurryXL_ilV140": "Illustrious"
+    "novaFurryXL_ilV140": "Illustrious",
+    "novaMobianXL_v20": "Illustrious"
 }
 
-DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "novaMobianXL_v10")
+DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "novaMobianXL_v20")
 LORA_SUGGESTION_LIMIT = 5
 
 
@@ -130,7 +131,7 @@ def normalize_model_id(model: Optional[str]) -> str:
     default that exists in MODEL_BASE_TYPES.
     """
     available = list(MODEL_BASE_TYPES.keys())
-    fallback = DEFAULT_MODEL_ID if DEFAULT_MODEL_ID in MODEL_BASE_TYPES else (available[0] if available else "novaMobianXL_v10")
+    fallback = DEFAULT_MODEL_ID if DEFAULT_MODEL_ID in MODEL_BASE_TYPES else (available[0] if available else "novaMobianXL_v20")
 
     if not model:
         return fallback
@@ -162,7 +163,7 @@ app.add_middleware(
 
 # Create a connection pool
 async def get_db_pool():
-    return psycopg_pool.AsyncConnectionPool(DSN, min_size=3, max_size=5, timeout=30, max_lifetime=3600, max_idle=300)
+    return psycopg_pool.AsyncConnectionPool(DSN, min_size=2, max_size=10, timeout=10, max_lifetime=3600, max_idle=300)
 
 
 @app.on_event("startup")
