@@ -60,7 +60,8 @@ subscriptions: Dict[str, dict] = {}
 CREDIT_COSTS = {
     "SD 1.5": 5,       # sonicDiffusionV4
     "Pony": 10,        # autismMix (SDXL-based)
-    "Illustrious": 10  # novaFurryXL_ilV140 (SDXL-based), novaMobianXL_v10, novaMobianXL_v20
+    "Illustrious": 10,  # novaFurryXL_ilV140 (SDXL-based), novaMobianXL_v10, novaMobianXL_v20
+    "Anima": 20        # Anima-preview2
 }
 
 # Additional cost per LoRA by model type
@@ -68,6 +69,7 @@ LORA_CREDIT_COSTS = {
     "SD 1.5": 1,
     "Pony": 2,
     "Illustrious": 2,
+    "Anima": 5
 }
 
 # Upscale credit multiplier (upscales are computationally expensive)
@@ -116,11 +118,17 @@ MODEL_BASE_TYPES = {
     "autismMix": "Pony",
     "novaMobianXL_v10": "Illustrious",
     "novaFurryXL_ilV140": "Illustrious",
-    "novaMobianXL_v20": "Illustrious"
+    "novaMobianXL_v20": "Illustrious",
+    "Anima-preview2": "Anima",
 }
 
 DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "novaMobianXL_v20")
 LORA_SUGGESTION_LIMIT = 5
+SUPPORTED_LORA_BASE_MODELS = {"Pony", "SD 1.5", "Illustrious", "Anima"}
+
+
+def is_supported_lora_base_model(base_model: Optional[str]) -> bool:
+    return (base_model or "").strip() in SUPPORTED_LORA_BASE_MODELS
 
 
 def normalize_model_id(model: Optional[str]) -> str:
@@ -857,8 +865,8 @@ async def search_civitAi_loras_by_query(query: str, show_nsfw: bool = False):
                 'donwload_url': model.get('downloadUrl'),
             }
 
-            # Dont show if model isnt Pony, SD1.5, or Illustrious
-            if lora_info['base_model'] not in ['Pony', 'SD 1.5', 'Illustrious']:
+            # Only surface LoRAs that match the model families supported in the app.
+            if not is_supported_lora_base_model(lora_info['base_model']):
                 continue
 
             # add the lora_info to the lora_page_info
@@ -922,8 +930,8 @@ async def search_civitAi_loras_by_id(id: str, show_nsfw: bool = False):
                 'donwload_url': model.get('downloadUrl'),
             }
 
-            # Dont show if model isnt Pony, SD1.5, or Illustrious
-            if lora_info['base_model'] not in ['Pony', 'SD 1.5', 'Illustrious']:
+            # Only surface LoRAs that match the model families supported in the app.
+            if not is_supported_lora_base_model(lora_info['base_model']):
                 continue
 
             # add the lora_info to the lora_page_info
@@ -996,8 +1004,8 @@ async def search_civitAi_loras_by_user(username: str, show_nsfw: bool = False):
                 'donwload_url': model.get('downloadUrl'),
             }
 
-            # Dont show if model isnt Pony, SD1.5, or Illustrious
-            if lora_info['base_model'] not in ['Pony', 'SD 1.5', 'Illustrious']:
+            # Only surface LoRAs that match the model families supported in the app.
+            if not is_supported_lora_base_model(lora_info['base_model']):
                 continue
 
             # add the lora_info to the lora_page_info
@@ -1112,13 +1120,15 @@ async def add_lora_suggestion(lora_data: addLoraSuggestion):
 
         existing_status = (row[0] or "").strip().lower()
         # Allow re-queueing when the previous attempt already finished processing
-        immutable_statuses = {"pending", "approved", "downloading"}
+        immutable_statuses = {"pending", "approved", "downloading", "rejected"}
         if existing_status in immutable_statuses:
             detail = "A suggestion for this LoRA is already pending approval. Please be patient as we review it."
             if existing_status == "approved":
                 detail = "This LoRA has already been approved and is queued for download."
             elif existing_status == "downloading":
                 detail = "This LoRA is currently downloading. Please wait for it to finish."
+            elif existing_status == "rejected":
+                detail = "This LoRA has been reviewed and rejected. It cannot be re-submitted."
             return JSONResponse(content={"status": "error", "detail": detail}, status_code=400)
 
         async with db_pool.connection() as aconn:
@@ -1339,7 +1349,8 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
                 """
                 SELECT v.status, v.queue_position, v.finished_images, v.prompt, v.negative_prompt, 
                        v.seed, v.guidance_scale, v.job_type, v.model, v.error_message, v.loras, v.lossy_images,
-                       g.user_id, g.credit_cost, COALESCE(g.refunded, FALSE) as refunded
+                       g.user_id, g.credit_cost, COALESCE(g.refunded, FALSE) as refunded,
+                       g.control_image
                 FROM vw_generation_queue v
                 JOIN generation_queue g ON v.id = g.id
                 WHERE v.id = %s
@@ -1367,7 +1378,16 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
         job_user_id,
         job_credit_cost,
         job_refunded,
+        raw_control_image,
     ) = result
+
+    # Parse regional prompting from control_image if present
+    metadata['regional_prompting'] = None
+    if raw_control_image and isinstance(raw_control_image, str) and raw_control_image.startswith('__regional_prompting__:'):
+        try:
+            metadata['regional_prompting'] = json.loads(raw_control_image[len('__regional_prompting__:'):])
+        except (json.JSONDecodeError, TypeError):
+            pass
 
     # Helper function to issue refund if eligible
     async def try_refund(reason: str) -> dict | None:
@@ -2574,6 +2594,28 @@ async def get_my_lora_suggestions(status: str = "pending", user: dict = Depends(
 
     json_compatible_result = jsonable_encoder(result)
     return JSONResponse(content=json_compatible_result)
+
+
+@app.get("/get_all_suggestion_statuses/")
+async def get_all_suggestion_statuses():
+    """Get all lora suggestion version_ids grouped by status (public, lightweight)."""
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT version_id, status
+                FROM lora_suggestions
+                WHERE status IN ('rejected', 'approved', 'pending', 'downloading')
+                """
+            )
+            rows = await acur.fetchall()
+
+    result: dict = {"rejected": [], "approved": [], "pending": [], "downloading": []}
+    for version_id, status in rows:
+        key = (status or "").strip().lower()
+        if key in result:
+            result[key].append(version_id)
+    return JSONResponse(content=result)
 
 
 @app.post("/cancel_lora_suggestion/{suggestion_id}/")
