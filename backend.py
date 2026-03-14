@@ -58,17 +58,17 @@ subscriptions: Dict[str, dict] = {}
 
 # Credit costs by model type
 CREDIT_COSTS = {
-    "SD 1.5": 5,       # sonicDiffusionV4
-    "Pony": 10,        # autismMix (SDXL-based)
-    "Illustrious": 10,  # novaFurryXL_ilV140 (SDXL-based), novaMobianXL_v10, novaMobianXL_v20
+    "SD 1.5": 10,      # sonicDiffusionV4
+    "Pony": 15,        # autismMix (SDXL-based)
+    "Illustrious": 15,  # novaFurryXL_ilV140 (SDXL-based), novaMobianXL_v10, novaMobianXL_v20
     "Anima": 20        # Anima-preview2
 }
 
 # Additional cost per LoRA by model type
 LORA_CREDIT_COSTS = {
-    "SD 1.5": 1,
-    "Pony": 2,
-    "Illustrious": 2,
+    "SD 1.5": 2,
+    "Pony": 5,
+    "Illustrious": 5,
     "Anima": 5
 }
 
