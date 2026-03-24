@@ -19,7 +19,7 @@ if sys.platform == "win32":
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header, UploadFile, File, Query
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -1479,6 +1479,152 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
         return JSONResponse(
             content={"status": "error", "message": "Unknown job status"}
         )
+
+
+@app.post("/get_job_status/")
+async def get_job_status(job_data: GetJobData):
+    """Lightweight status-only endpoint for polling. Returns no image data."""
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT v.status, v.queue_position, v.error_message,
+                       g.user_id, g.credit_cost, COALESCE(g.refunded, FALSE) as refunded
+                FROM vw_generation_queue v
+                JOIN generation_queue g ON v.id = g.id
+                WHERE v.id = %s
+                """,
+                (job_data.job_id,),
+            )
+            result = await acur.fetchone()
+
+    if not result:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job_status, queue_position, error_message, job_user_id, job_credit_cost, job_refunded = result
+
+    if job_status == "completed":
+        return JSONResponse(content={"status": "completed"})
+    elif job_status in ["pending", "processing"]:
+        jobs_per_sec = await get_jobs_per_sec(db_pool)
+        eta_seconds = compute_eta_seconds(queue_position, jobs_per_sec)
+        return JSONResponse(
+            content={
+                "status": job_status,
+                "queue_position": queue_position,
+                "eta": eta_seconds,
+            }
+        )
+    elif job_status == "failed":
+        # Issue refund for failed jobs (same logic as /get_job/)
+        refund_info = None
+        if not job_refunded and job_credit_cost > 0 and job_user_id:
+            try:
+                async with db_pool.connection() as refund_conn:
+                    async with refund_conn.cursor() as refund_cur:
+                        await refund_cur.execute(
+                            "SELECT * FROM safe_refund_credits(%s, %s)",
+                            (job_data.job_id, f"Generation failed: {error_message or 'Unknown error'}")
+                        )
+                        refund_result = await refund_cur.fetchone()
+                        if refund_result and refund_result[0]:
+                            refund_info = {
+                                "credits_refunded": refund_result[2],
+                                "new_balance": refund_result[1],
+                                "reason": f"Generation failed: {error_message or 'Unknown error'}"
+                            }
+            except Exception as e:
+                logging.error(f"Failed to refund credits for job {job_data.job_id}: {e}")
+
+        response_content: dict = {"status": "failed", "message": error_message}
+        if refund_info:
+            response_content["refund"] = refund_info
+            response_content["message"] = f"{error_message or 'Generation failed'}. Your credits have been refunded."
+        return JSONResponse(content=response_content)
+    else:
+        return JSONResponse(content={"status": "error", "message": "Unknown job status"})
+
+
+@app.get("/get_job_image/{job_id}/{image_index}")
+async def get_job_image(job_id: str, image_index: int):
+    """Return a single generated image as binary. Index 0-3 for the 4 images."""
+    if image_index < 0 or image_index > 3:
+        raise HTTPException(status_code=400, detail="image_index must be 0-3")
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT v.status, v.finished_images, v.prompt, v.negative_prompt,
+                       v.seed, v.guidance_scale, v.job_type, v.model, v.loras, v.lossy_images,
+                       g.control_image
+                FROM vw_generation_queue v
+                JOIN generation_queue g ON v.id = g.id
+                WHERE v.id = %s
+                """,
+                (job_id,),
+            )
+            result = await acur.fetchone()
+
+    if not result:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    (
+        job_status, finished_images, prompt, negative_prompt,
+        seed, guidance_scale, job_type, model, loras, lossy_images,
+        raw_control_image,
+    ) = result
+
+    if job_status != "completed":
+        raise HTTPException(status_code=409, detail="Job not completed yet")
+
+    if not finished_images:
+        raise HTTPException(status_code=404, detail="No images available")
+
+    finished_images = finished_images.strip("{}")
+    base64_strings = finished_images.split(",")
+
+    if image_index >= len(base64_strings):
+        raise HTTPException(status_code=404, detail="Image index out of range")
+
+    metadata = {
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "seed": seed,
+        "guidance_scale": guidance_scale,
+        "job_type": job_type,
+        "model": model,
+        "loras": loras,
+        "lossy_images": lossy_images,
+        "regional_prompting": None,
+    }
+
+    if raw_control_image and isinstance(raw_control_image, str) and raw_control_image.startswith('__regional_prompting__:'):
+        try:
+            metadata['regional_prompting'] = json.loads(raw_control_image[len('__regional_prompting__:'):])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    image = decode_base64_to_image(base64_strings[image_index])
+    watermarked_base64 = await add_image_metadata(image.convert("RGB"), metadata, lossy_image=lossy_images)
+
+    # Decode the watermarked base64 back to binary
+    # add_image_metadata returns "data:<mime>;base64,<data>" format
+    if "," in watermarked_base64:
+        header, b64_data = watermarked_base64.split(",", 1)
+        media_type = "image/webp" if "webp" in header else "image/png"
+    else:
+        b64_data = watermarked_base64
+        media_type = "image/webp" if lossy_images else "image/png"
+
+    image_bytes = base64.b64decode(b64_data)
+
+    return Response(
+        content=image_bytes,
+        media_type=media_type,
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
 
 @app.get("/get_loras/")
 async def get_loras(status: str = "active"):
