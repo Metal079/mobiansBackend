@@ -58,6 +58,21 @@ async def add_image_metadata(image, request_data, lossy_image=False):
 
         # Convert list to string
         metadata_dict["loras"] = '\n'.join(metadata_dict["loras"])
+
+        # Add regional prompting metadata if present
+        regional = request_data.get('regional_prompting')
+        if regional and regional.get('enabled') and regional.get('regions'):
+            regions_text = []
+            for i, region in enumerate(regional['regions'], 1):
+                parts = [f"Region {i}: prompt=\"{region.get('prompt', '')}\""]
+                if region.get('negative_prompt'):
+                    parts.append(f"negative_prompt=\"{region['negative_prompt']}\"")
+                parts.append(f"x={region.get('x', 0)}, y={region.get('y', 0)}, w={region.get('width', 0)}, h={region.get('height', 0)}")
+                parts.append(f"denoise={region.get('denoise_strength', 0)}, feather={region.get('feather', 0)}, opacity={region.get('opacity', 0)}")
+                if region.get('inherit_base_prompt'):
+                    parts.append("inherit_base_prompt=true")
+                regions_text.append(', '.join(parts))
+            metadata_dict["regional_prompting"] = '\n'.join(regions_text)
     except Exception as e:
         logging.error(f"Error adding metadata to image: {e}")
         with open("error_log.txt", "a") as f:
