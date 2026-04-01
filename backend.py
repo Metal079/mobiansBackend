@@ -3957,7 +3957,7 @@ async def submit_rings(data: RingSubmission, user: dict = Depends(require_auth))
 
 
 @app.get("/april-fools/ring-leaderboard")
-async def get_ring_leaderboard():
+async def get_ring_leaderboard(current_user: Optional[dict] = Depends(get_current_user)):
     """Get the top 10 ring collectors. Public endpoint."""
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
@@ -3972,6 +3972,47 @@ async def get_ring_leaderboard():
             )
             rows = await acur.fetchall()
 
+            viewer = None
+            if current_user:
+                await acur.execute(
+                    """
+                    SELECT rings_collected
+                    FROM april_fools_rings
+                    WHERE user_id = %s
+                    """
+                    ,
+                    (current_user["user_id"],)
+                )
+                viewer_row = await acur.fetchone()
+                viewer_rings = viewer_row[0] if viewer_row else 0
+
+                viewer_rank = None
+                if viewer_rings > 0:
+                    await acur.execute(
+                        """
+                        SELECT COUNT(*) + 1
+                        FROM april_fools_rings
+                        WHERE rings_collected > %s
+                        """
+                        ,
+                        (viewer_rings,)
+                    )
+                    rank_row = await acur.fetchone()
+                    viewer_rank = rank_row[0] if rank_row else None
+
+                top_ten_cutoff = rows[-1][2] if len(rows) == 10 else None
+                points_to_top_ten = 0
+                if top_ten_cutoff is not None and (viewer_rank is None or viewer_rank > 10):
+                    points_to_top_ten = max(0, top_ten_cutoff + 1 - viewer_rings)
+
+                viewer = {
+                    "display_name": current_user.get("display_name") or current_user.get("username") or "You",
+                    "rings": viewer_rings,
+                    "rank": viewer_rank,
+                    "points_to_top_ten": points_to_top_ten,
+                    "top_ten_cutoff": top_ten_cutoff,
+                }
+
     leaderboard = []
     for i, row in enumerate(rows):
         leaderboard.append({
@@ -3980,5 +4021,5 @@ async def get_ring_leaderboard():
             "rings": row[2],
         })
 
-    return {"leaderboard": leaderboard}
+    return {"leaderboard": leaderboard, "viewer": viewer}
 
