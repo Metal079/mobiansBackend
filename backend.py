@@ -3920,3 +3920,65 @@ async def sync_regional_prompt_presets(
 
     return {"success": True, "synced_count": len(sanitized_presets)}
 
+
+# ============================================
+# APRIL FOOLS - RING COLLECTION MINI-GAME
+# ============================================
+
+class RingSubmission(BaseModel):
+    rings: int
+
+
+@app.post("/april-fools/rings")
+async def submit_rings(data: RingSubmission, user: dict = Depends(require_auth)):
+    """Submit collected rings for the leaderboard. Authenticated users only."""
+    if data.rings < 1 or data.rings > 1000:
+        raise HTTPException(status_code=400, detail="Invalid ring count")
+
+    user_id = user["user_id"]
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                INSERT INTO april_fools_rings (user_id, rings_collected, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                SET rings_collected = april_fools_rings.rings_collected + EXCLUDED.rings_collected,
+                    updated_at = NOW()
+                RETURNING rings_collected
+                """,
+                (user_id, data.rings),
+            )
+            result = await acur.fetchone()
+            await aconn.commit()
+
+    return {"status": "success", "total_rings": result[0] if result else data.rings}
+
+
+@app.get("/april-fools/ring-leaderboard")
+async def get_ring_leaderboard():
+    """Get the top 20 ring collectors. Public endpoint."""
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT u.display_name, u.username, r.rings_collected
+                FROM april_fools_rings r
+                JOIN users u ON u.id = r.user_id
+                ORDER BY r.rings_collected DESC
+                LIMIT 20
+                """
+            )
+            rows = await acur.fetchall()
+
+    leaderboard = []
+    for i, row in enumerate(rows):
+        leaderboard.append({
+            "rank": i + 1,
+            "display_name": row[0] or row[1] or "Anonymous",
+            "rings": row[2],
+        })
+
+    return {"leaderboard": leaderboard}
+
