@@ -3958,7 +3958,7 @@ async def submit_rings(data: RingSubmission, user: dict = Depends(require_auth))
 
 @app.get("/april-fools/ring-leaderboard")
 async def get_ring_leaderboard():
-    """Get the top 20 ring collectors. Public endpoint."""
+    """Get the top 10 ring collectors. Public endpoint."""
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
@@ -3967,7 +3967,7 @@ async def get_ring_leaderboard():
                 FROM april_fools_rings r
                 JOIN users u ON u.id = r.user_id
                 ORDER BY r.rings_collected DESC
-                LIMIT 20
+                LIMIT 10
                 """
             )
             rows = await acur.fetchall()
