@@ -383,6 +383,30 @@ async def require_auth(credentials: HTTPAuthorizationCredentials = Depends(secur
     return user
 
 
+def get_lora_requestor_candidates(user: Optional[dict]) -> List[str]:
+    candidates: List[str] = []
+    if not user:
+        return candidates
+
+    for key in ("user_id", "discord_user_id", "google_user_id", "username", "email"):
+        value = user.get(key)
+        if value is None:
+            continue
+
+        normalized = str(value).strip()
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    return candidates
+
+
+def get_primary_lora_requestor(user: Optional[dict]) -> str:
+    candidates = get_lora_requestor_candidates(user)
+    if not candidates:
+        raise HTTPException(status_code=400, detail="No requestor id available")
+    return candidates[0]
+
+
 async def upsert_user(
     discord_user_id: str = None,
     google_user_id: str = None,
@@ -1022,14 +1046,17 @@ class addLoraSuggestion(BaseModel):
     name: str
     version: str
     status: str
-    requestor: str
+    requestor: Optional[str] = None
     is_nsfw: bool
     is_minor: bool
     preview_image: str
     base_model: Optional[str] = None
 
 @app.post("/add_lora_suggestion/")
-async def add_lora_suggestion(lora_data: addLoraSuggestion):
+async def add_lora_suggestion(lora_data: addLoraSuggestion, user: dict = Depends(require_auth)):
+    requestor_candidates = get_lora_requestor_candidates(user)
+    requestor = get_primary_lora_requestor(user)
+
     # First we check if the lora is in the database already
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
@@ -1046,32 +1073,31 @@ async def add_lora_suggestion(lora_data: addLoraSuggestion):
         return JSONResponse(content={"status": "error", "detail": "This lora already exists! Check out the loras tab :), if this is a mistake, report it on the discord!"}, status_code=400)
 
     # Enforce per-user active suggestion cap
-    if lora_data.requestor:
-        async with db_pool.connection() as aconn:
-            async with aconn.cursor() as acur:
-                await acur.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM lora_suggestions
-                    WHERE requestor = %s
-                      AND status = 'pending'
-                    """,
-                    (lora_data.requestor,)
-                )
-                count_row = await acur.fetchone()
-                active_count = count_row[0] if count_row else 0
-
-        if active_count >= LORA_SUGGESTION_LIMIT:
-            return JSONResponse(
-                content={
-                    "status": "error",
-                    "detail": (
-                        f"Suggestion limit reached ({LORA_SUGGESTION_LIMIT} active suggestions). "
-                        "Please wait for your existing suggestions to be processed."
-                    ),
-                },
-                status_code=429,
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT COUNT(*)
+                FROM lora_suggestions
+                WHERE requestor = ANY(%s)
+                  AND status = 'pending'
+                """,
+                (requestor_candidates,)
             )
+            count_row = await acur.fetchone()
+            active_count = count_row[0] if count_row else 0
+
+    if active_count >= LORA_SUGGESTION_LIMIT:
+        return JSONResponse(
+            content={
+                "status": "error",
+                "detail": (
+                    f"Suggestion limit reached ({LORA_SUGGESTION_LIMIT} active suggestions). "
+                    "Please wait for your existing suggestions to be processed."
+                ),
+            },
+            status_code=429,
+        )
 
     # Try to insert the suggestion into the database
     try:
@@ -1087,7 +1113,7 @@ async def add_lora_suggestion(lora_data: addLoraSuggestion):
                         lora_data.name,
                         lora_data.version,
                         lora_data.status,
-                        lora_data.requestor,
+                        requestor,
                         lora_data.is_nsfw,
                         lora_data.is_minor,
                         lora_data.preview_image,
@@ -1152,7 +1178,7 @@ async def add_lora_suggestion(lora_data: addLoraSuggestion):
                     (
                         lora_data.name,
                         lora_data.version,
-                        lora_data.requestor,
+                        requestor,
                         lora_data.is_nsfw,
                         lora_data.is_minor,
                         lora_data.preview_image,
@@ -1171,6 +1197,86 @@ def decode_base64_to_image(base64_str):
         image = Image.open(io.BytesIO(base64.b64decode(base64_str.split(",", 1)[0])))
 
     return image
+
+
+async def get_pending_queue_position(acur, job_id: str, fast_pass_enabled: bool, create_date) -> Optional[int]:
+    if create_date is None:
+        return None
+
+    # Count only pending jobs ahead of the current one instead of sorting the full queue view.
+    await acur.execute(
+        """
+        SELECT COUNT(*) + 1
+        FROM generation_queue pending
+        WHERE pending.status = 'pending'
+          AND (
+                COALESCE(pending.fast_pass_enabled, FALSE) > %s
+                OR (
+                    COALESCE(pending.fast_pass_enabled, FALSE) = %s
+                    AND (
+                        pending.create_date < %s
+                        OR (pending.create_date = %s AND pending.id < %s)
+                    )
+                )
+              )
+        """,
+        (fast_pass_enabled, fast_pass_enabled, create_date, create_date, job_id),
+    )
+    row = await acur.fetchone()
+    return row[0] if row else None
+
+
+async def get_generation_job_details(job_id: str) -> Optional[dict[str, Any]]:
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT id, status, create_date, COALESCE(fast_pass_enabled, FALSE),
+                       finished_images, prompt, negative_prompt, seed, guidance_scale,
+                       job_type, model, error_message, loras, lossy_images,
+                       user_id, credit_cost, COALESCE(refunded, FALSE), control_image
+                FROM generation_queue
+                WHERE id = %s
+                """,
+                (job_id,),
+            )
+            row = await acur.fetchone()
+
+            if not row:
+                return None
+
+            queue_position = None
+            if row[1] == "pending":
+                queue_position = await get_pending_queue_position(acur, str(row[0]), row[3], row[2])
+
+    return {
+        "id": str(row[0]),
+        "status": row[1],
+        "queue_position": queue_position,
+        "finished_images": row[4],
+        "prompt": row[5],
+        "negative_prompt": row[6],
+        "seed": row[7],
+        "guidance_scale": row[8],
+        "job_type": row[9],
+        "model": row[10],
+        "error_message": row[11],
+        "loras": row[12],
+        "lossy_images": row[13],
+        "user_id": row[14],
+        "credit_cost": row[15],
+        "refunded": row[16],
+        "control_image": row[17],
+    }
+
+
+def parse_regional_prompting(raw_control_image: Optional[str]) -> Optional[dict[str, Any]]:
+    if raw_control_image and isinstance(raw_control_image, str) and raw_control_image.startswith('__regional_prompting__:'):
+        try:
+            return json.loads(raw_control_image[len('__regional_prompting__:'):])
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return None
 
 
 async def increment_fastpass_use_count(fast_pass_code: str):
@@ -1342,52 +1448,27 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
     error_message = None
     refund_info = None  # Will be populated if a refund is issued
 
-    async with db_pool.connection() as aconn:
-        async with aconn.cursor() as acur:
-            # Query both view (for queue_position) and base table (for credit/refund info)
-            await acur.execute(
-                """
-                SELECT v.status, v.queue_position, v.finished_images, v.prompt, v.negative_prompt, 
-                       v.seed, v.guidance_scale, v.job_type, v.model, v.error_message, v.loras, v.lossy_images,
-                       g.user_id, g.credit_cost, COALESCE(g.refunded, FALSE) as refunded,
-                       g.control_image
-                FROM vw_generation_queue v
-                JOIN generation_queue g ON v.id = g.id
-                WHERE v.id = %s
-            """,
-                (job_data.job_id,),
-            )
-            result = await acur.fetchone()
+    job_details = await get_generation_job_details(job_data.job_id)
 
-    if not result:
+    if not job_details:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    (
-        job_status,
-        queue_position,
-        finished_images,
-        metadata["prompt"],
-        metadata["negative_prompt"],
-        metadata["seed"],
-        metadata["guidance_scale"],
-        metadata["job_type"],
-        metadata["model"],
-        error_message,
-        metadata['loras'],
-        metadata['lossy_images'],
-        job_user_id,
-        job_credit_cost,
-        job_refunded,
-        raw_control_image,
-    ) = result
-
-    # Parse regional prompting from control_image if present
-    metadata['regional_prompting'] = None
-    if raw_control_image and isinstance(raw_control_image, str) and raw_control_image.startswith('__regional_prompting__:'):
-        try:
-            metadata['regional_prompting'] = json.loads(raw_control_image[len('__regional_prompting__:'):])
-        except (json.JSONDecodeError, TypeError):
-            pass
+    job_status = job_details["status"]
+    queue_position = job_details["queue_position"]
+    finished_images = job_details["finished_images"]
+    metadata["prompt"] = job_details["prompt"]
+    metadata["negative_prompt"] = job_details["negative_prompt"]
+    metadata["seed"] = job_details["seed"]
+    metadata["guidance_scale"] = job_details["guidance_scale"]
+    metadata["job_type"] = job_details["job_type"]
+    metadata["model"] = job_details["model"]
+    error_message = job_details["error_message"]
+    metadata['loras'] = job_details["loras"]
+    metadata['lossy_images'] = job_details["lossy_images"]
+    job_user_id = job_details["user_id"]
+    job_credit_cost = job_details["credit_cost"]
+    job_refunded = job_details["refunded"]
+    metadata['regional_prompting'] = parse_regional_prompting(job_details["control_image"])
 
     # Helper function to issue refund if eligible
     async def try_refund(reason: str) -> dict | None:
@@ -1484,24 +1565,17 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
 @app.post("/get_job_status/")
 async def get_job_status(job_data: GetJobData):
     """Lightweight status-only endpoint for polling. Returns no image data."""
-    async with db_pool.connection() as aconn:
-        async with aconn.cursor() as acur:
-            await acur.execute(
-                """
-                SELECT v.status, v.queue_position, v.error_message,
-                       g.user_id, g.credit_cost, COALESCE(g.refunded, FALSE) as refunded
-                FROM vw_generation_queue v
-                JOIN generation_queue g ON v.id = g.id
-                WHERE v.id = %s
-                """,
-                (job_data.job_id,),
-            )
-            result = await acur.fetchone()
+    job_details = await get_generation_job_details(job_data.job_id)
 
-    if not result:
+    if not job_details:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    job_status, queue_position, error_message, job_user_id, job_credit_cost, job_refunded = result
+    job_status = job_details["status"]
+    queue_position = job_details["queue_position"]
+    error_message = job_details["error_message"]
+    job_user_id = job_details["user_id"]
+    job_credit_cost = job_details["credit_cost"]
+    job_refunded = job_details["refunded"]
 
     if job_status == "completed":
         return JSONResponse(content={"status": "completed"})
@@ -1551,29 +1625,21 @@ async def get_job_image(job_id: str, image_index: int):
     if image_index < 0 or image_index > 3:
         raise HTTPException(status_code=400, detail="image_index must be 0-3")
 
-    async with db_pool.connection() as aconn:
-        async with aconn.cursor() as acur:
-            await acur.execute(
-                """
-                SELECT v.status, v.finished_images, v.prompt, v.negative_prompt,
-                       v.seed, v.guidance_scale, v.job_type, v.model, v.loras, v.lossy_images,
-                       g.control_image
-                FROM vw_generation_queue v
-                JOIN generation_queue g ON v.id = g.id
-                WHERE v.id = %s
-                """,
-                (job_id,),
-            )
-            result = await acur.fetchone()
+    job_details = await get_generation_job_details(job_id)
 
-    if not result:
+    if not job_details:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    (
-        job_status, finished_images, prompt, negative_prompt,
-        seed, guidance_scale, job_type, model, loras, lossy_images,
-        raw_control_image,
-    ) = result
+    job_status = job_details["status"]
+    finished_images = job_details["finished_images"]
+    prompt = job_details["prompt"]
+    negative_prompt = job_details["negative_prompt"]
+    seed = job_details["seed"]
+    guidance_scale = job_details["guidance_scale"]
+    job_type = job_details["job_type"]
+    model = job_details["model"]
+    loras = job_details["loras"]
+    lossy_images = job_details["lossy_images"]
 
     if job_status != "completed":
         raise HTTPException(status_code=409, detail="Job not completed yet")
@@ -1596,14 +1662,8 @@ async def get_job_image(job_id: str, image_index: int):
         "model": model,
         "loras": loras,
         "lossy_images": lossy_images,
-        "regional_prompting": None,
+        "regional_prompting": parse_regional_prompting(job_details["control_image"]),
     }
-
-    if raw_control_image and isinstance(raw_control_image, str) and raw_control_image.startswith('__regional_prompting__:'):
-        try:
-            metadata['regional_prompting'] = json.loads(raw_control_image[len('__regional_prompting__:'):])
-        except (json.JSONDecodeError, TypeError):
-            pass
 
     image = decode_base64_to_image(base64_strings[image_index])
     watermarked_base64 = await add_image_metadata(image.convert("RGB"), metadata, lossy_image=lossy_images)
@@ -2703,14 +2763,14 @@ async def get_admin_civitai_link(version_id: int, user: dict = Depends(require_a
 @app.get("/get_my_lora_suggestions/")
 async def get_my_lora_suggestions(status: str = "pending", user: dict = Depends(require_auth)):
     """Get LoRA suggestions for the current user."""
-    requestor = user.get("discord_user_id") or user.get("user_id") or user.get("username")
-    if not requestor:
+    requestor_candidates = get_lora_requestor_candidates(user)
+    if not requestor_candidates:
         raise HTTPException(status_code=400, detail="No requestor id available")
 
     status_norm = (status or "pending").strip().lower()
 
-    where_clause = "WHERE requestor = %s"
-    params: list = [str(requestor)]
+    where_clause = "WHERE requestor = ANY(%s)"
+    params: list[Any] = [requestor_candidates]
     if status_norm != "all":
         where_clause += " AND status = %s"
         params.append(status_norm)
@@ -2767,8 +2827,8 @@ async def get_all_suggestion_statuses():
 @app.post("/cancel_lora_suggestion/{suggestion_id}/")
 async def cancel_lora_suggestion(suggestion_id: int, user: dict = Depends(require_auth)):
     """Cancel a pending LoRA suggestion for the current user."""
-    requestor = user.get("discord_user_id") or user.get("user_id") or user.get("username")
-    if not requestor:
+    requestor_candidates = set(get_lora_requestor_candidates(user))
+    if not requestor_candidates:
         raise HTTPException(status_code=400, detail="No requestor id available")
 
     async with db_pool.connection() as aconn:
@@ -2786,7 +2846,7 @@ async def cancel_lora_suggestion(suggestion_id: int, user: dict = Depends(requir
                 raise HTTPException(status_code=404, detail="Suggestion not found")
 
             _, name, status, row_requestor = row
-            if str(row_requestor) != str(requestor):
+            if str(row_requestor) not in requestor_candidates:
                 raise HTTPException(status_code=403, detail="You can only cancel your own suggestions")
 
             if status != 'pending':
@@ -3277,7 +3337,7 @@ async def cancel_job(job_id: str):
             # If not deleted, check if it exists and report why it can't be cancelled
             await acur.execute(
                 """
-                SELECT status FROM vw_generation_queue WHERE id = %s;
+                SELECT status FROM generation_queue WHERE id = %s;
                 """,
                 (job_id,),
             )
