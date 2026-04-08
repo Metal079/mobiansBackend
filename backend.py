@@ -61,7 +61,7 @@ CREDIT_COSTS = {
     "SD 1.5": 10,      # sonicDiffusionV4
     "Pony": 15,        # autismMix (SDXL-based)
     "Illustrious": 15,  # novaFurryXL_ilV140 (SDXL-based), novaMobianXL_v10, novaMobianXL_v20
-    "Anima": 20        # Anima-preview2
+    "Anima": 20        # Anima-preview3
 }
 
 # Additional cost per LoRA by model type
@@ -119,7 +119,7 @@ MODEL_BASE_TYPES = {
     "novaMobianXL_v10": "Illustrious",
     "novaFurryXL_ilV140": "Illustrious",
     "novaMobianXL_v20": "Illustrious",
-    "Anima-preview2": "Anima",
+    "Anima-preview3": "Anima",
 }
 
 DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "novaMobianXL_v20")
