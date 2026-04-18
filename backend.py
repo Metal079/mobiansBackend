@@ -843,9 +843,9 @@ async def search_civitAi_loras_by_query(query: str, show_nsfw: bool = False):
         # "hidden": False,
     }
 
-    if not show_nsfw:
-        # aiohttp/yarl reject bool query param values; send as string.
-        params["nsfw"] = "false"
+    # CivitAI defaults to SFW-only when `nsfw` is omitted, so always send it explicitly.
+    # aiohttp/yarl reject bool query param values; send as string.
+    params["nsfw"] = "true" if show_nsfw else "false"
 
     async with session.get(civiAi_url, headers=headers, params=params) as resp:
         if resp.status != 200:
@@ -984,9 +984,9 @@ async def search_civitAi_loras_by_user(username: str, show_nsfw: bool = False):
         "limit": 30,
     }
 
-    if not show_nsfw:
-        # aiohttp/yarl reject bool query param values; send as string.
-        params["nsfw"] = "false"
+    # CivitAI defaults to SFW-only when `nsfw` is omitted, so always send it explicitly.
+    # aiohttp/yarl reject bool query param values; send as string.
+    params["nsfw"] = "true" if show_nsfw else "false"
 
     async with session.get(civiAi_url, headers=headers, params=params) as resp:
         if resp.status != 200:
