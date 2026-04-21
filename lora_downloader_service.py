@@ -49,6 +49,12 @@ LORAS_FOLDER = os.environ.get("LORAS_FOLDER", r"D:\mobians_api\loras")
 DOWNLOAD_INTERVAL_SECONDS = int(os.environ.get("DOWNLOAD_INTERVAL_SECONDS", "300"))
 DOWNLOADER_HTTP_PORT = int(os.environ.get("DOWNLOADER_HTTP_PORT", "9002"))
 
+# Backend URL + shared token used to trigger user-facing push notifications
+# (e.g., "your LoRA is ready!") once a download completes. Both must be set
+# for notifications to fire; otherwise the hook is a no-op.
+BACKEND_INTERNAL_URL = os.environ.get("BACKEND_INTERNAL_URL", "http://localhost:9001").rstrip("/")
+INTERNAL_API_TOKEN = os.environ.get("INTERNAL_API_TOKEN")
+
 # Database configuration
 DBHOST = os.environ.get("DBHOST")
 DBNAME = os.environ.get("DBNAME")
@@ -127,6 +133,50 @@ async def update_suggestion_status(
                 })
     except Exception as e:
         logger.error(f"Failed to update suggestion status: {e}")
+
+
+# ============================================
+# PUSH NOTIFICATION TRIGGER
+# ============================================
+
+async def notify_lora_downloaded(
+    version_id: int,
+    name: Optional[str],
+    version: Optional[str],
+    requestor: Optional[str],
+) -> None:
+    """Ping the backend so it can send a Web Push to the suggestion's requestor.
+
+    No-op when BACKEND_INTERNAL_URL or INTERNAL_API_TOKEN aren't configured,
+    or when the suggestion has no requestor to target.
+    """
+    if not INTERNAL_API_TOKEN:
+        return
+    if not requestor:
+        return
+    if http_session is None:
+        return
+
+    url = f"{BACKEND_INTERNAL_URL}/internal/notify_lora_downloaded"
+    payload = {
+        "version_id": version_id,
+        "name": name,
+        "version": version,
+        "requestor": requestor,
+    }
+    headers = {"X-Internal-Token": INTERNAL_API_TOKEN}
+
+    try:
+        async with http_session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status >= 400:
+                body = await resp.text()
+                logger.warning(
+                    f"notify_lora_downloaded got {resp.status} from backend: {body[:200]}"
+                )
+            else:
+                logger.info(f"Queued LoRA-ready notification for version_id={version_id}")
+    except Exception as exc:
+        logger.warning(f"notify_lora_downloaded request failed: {exc}")
 
 
 # ============================================
@@ -446,7 +496,19 @@ async def process_approved_loras():
                 
                 # Update suggestion status to downloaded
                 await update_suggestion_status(version_id, "downloaded")
-                
+
+                # Notify the requesting user that their LoRA is live on-site.
+                # Failures here must never prevent other downloads from proceeding.
+                try:
+                    await notify_lora_downloaded(
+                        version_id=version_id,
+                        name=main_page.get('name') or suggestion_name,
+                        version=lora_version.get('name') or suggestion_version,
+                        requestor=requestor,
+                    )
+                except Exception as notify_exc:
+                    logger.warning(f"LoRA-ready push notification failed for {version_id}: {notify_exc}")
+
                 logger.info(f"Completed: {lora_display_name}")
                 
             except Exception as e:

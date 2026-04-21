@@ -63,7 +63,9 @@ DSN = (
 VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY")
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY")
 VAPID_CLAIMS = os.environ.get("VAPID_CLAIMS")
-subscriptions: Dict[str, dict] = {}
+# Shared secret used by trusted local services (e.g., lora_downloader_service)
+# to trigger server-initiated push notifications. Leave unset to disable.
+INTERNAL_API_TOKEN = os.environ.get("INTERNAL_API_TOKEN")
 
 # Credit costs by model type
 CREDIT_COSTS = {
@@ -202,6 +204,10 @@ async def startup_event():
     # Start orphaned job cleanup background task
     asyncio.create_task(orphaned_job_cleanup_task())
 
+    # Start the server-side push notifier so users get pinged when their
+    # long-running upscale/hi-res jobs finish even if the tab is closed.
+    asyncio.create_task(job_completion_notifier_task())
+
 
 async def orphaned_job_cleanup_task():
     """Background task that periodically cleans up orphaned jobs and refunds credits."""
@@ -222,6 +228,116 @@ async def orphaned_job_cleanup_task():
         
         # Run every 15 minutes
         await asyncio.sleep(900)
+
+
+# How often the job-completion notifier polls for newly-finished jobs.
+# Kept short so the UX feels near-real-time, but long enough that the query
+# (which uses the `idx_generation_queue_pending_notify` partial index) stays
+# cheap even under heavy traffic.
+JOB_NOTIFY_POLL_SECONDS = 5
+
+# Never look further back than this when claiming unnotified jobs. Protects
+# the system from spamming stale notifications if the backend was down for a
+# long time and a backlog of completed/failed rows built up.
+JOB_NOTIFY_MAX_AGE_MINUTES = 30
+
+
+async def _send_job_completion_notification(
+    user_id: str,
+    status: str,
+    job_type: Optional[str],
+    model: Optional[str],
+    credit_cost: Optional[int],
+    refunded: bool,
+) -> None:
+    """Build and dispatch the appropriate push payload for a finished job."""
+    if status == "completed":
+        if job_type == "upscale":
+            title = "Your upscale is ready!"
+            body = "Your high-resolution image is done — tap to view."
+        elif job_type == HIRES_JOB_TYPE:
+            title = "Your Hi-Res generation is ready!"
+            body = "Tap to see your finished image."
+        else:
+            title = "Your image is ready!"
+            body = "Tap to view your generation."
+    elif status == "failed":
+        title = "Your generation failed"
+        if refunded and credit_cost:
+            body = f"Something went wrong — {credit_cost} credits have been refunded."
+        else:
+            body = "Something went wrong. Please try again."
+    else:
+        return
+
+    payload = {
+        "notification": {
+            "title": title,
+            "body": body,
+            "vibrate": [100, 50, 100],
+            "data": {"url": "https://mobians.ai/"},
+        }
+    }
+    await send_push_to_user(user_id, payload)
+
+
+async def job_completion_notifier_task():
+    """Poll for finished jobs owned by logged-in users and send a Web Push.
+
+    Anonymous (not logged-in) jobs keep the existing client-triggered path in
+    `NotificationService.sendPushNotification`. We only handle `user_id IS NOT NULL`
+    here because those are the subscriptions we can actually target server-side.
+    """
+    # Small initial delay so the app fully starts and the pool is warm.
+    await asyncio.sleep(15)
+
+    while True:
+        try:
+            async with db_pool.connection() as aconn:
+                async with aconn.cursor() as acur:
+                    # Atomically claim the batch of jobs we're about to notify
+                    # for, so two workers (or a restart) can't double-send.
+                    await acur.execute(
+                        """
+                        UPDATE generation_queue
+                        SET notified_at = NOW()
+                        WHERE id IN (
+                            SELECT id FROM generation_queue
+                            WHERE notified_at IS NULL
+                              AND status IN ('completed', 'failed')
+                              AND user_id IS NOT NULL
+                              AND create_date > NOW() - (%s || ' minutes')::interval
+                            ORDER BY create_date ASC
+                            LIMIT 50
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        RETURNING user_id, status, job_type, model, credit_cost,
+                                  COALESCE(refunded, FALSE)
+                        """,
+                        (JOB_NOTIFY_MAX_AGE_MINUTES,),
+                    )
+                    claimed = await acur.fetchall()
+                    await aconn.commit()
+
+            for row in claimed:
+                user_id, status, job_type, model, credit_cost, refunded = row
+                try:
+                    await _send_job_completion_notification(
+                        user_id=str(user_id),
+                        status=status,
+                        job_type=job_type,
+                        model=model,
+                        credit_cost=credit_cost,
+                        refunded=refunded,
+                    )
+                except Exception as exc:
+                    # One bad notification must not stop the poller.
+                    logging.warning(f"Failed to send job notification: {exc}")
+
+        except Exception as e:
+            logging.error(f"Error in job_completion_notifier_task: {e}")
+
+        await asyncio.sleep(JOB_NOTIFY_POLL_SECONDS)
 
 
 @app.on_event("shutdown")
@@ -2052,41 +2168,260 @@ class Subscription(BaseModel):
     keys: dict
 
 
+def _vapid_claims() -> dict:
+    # pywebpush requires a `sub` (mailto: or https:) claim.
+    sub = VAPID_CLAIMS or "mailto:admin@mobians.ai"
+    if not sub.startswith(("mailto:", "https:")):
+        sub = f"mailto:{sub}"
+    return {"sub": sub}
+
+
+async def _delete_push_subscription(endpoint: str) -> None:
+    try:
+        async with db_pool.connection() as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute(
+                    "DELETE FROM push_subscriptions WHERE endpoint = %s",
+                    (endpoint,),
+                )
+                await aconn.commit()
+    except Exception as exc:
+        logging.warning(f"Failed to prune dead push subscription {endpoint}: {exc}")
+
+
+async def _send_webpush(endpoint: str, p256dh: str, auth: str, payload: dict) -> bool:
+    """Send a single web push. Returns True on success. Prunes dead subs."""
+    if not VAPID_PRIVATE_KEY:
+        logging.warning("VAPID_PRIVATE_KEY not configured; skipping push notification")
+        return False
+    try:
+        webpush(
+            subscription_info={
+                "endpoint": endpoint,
+                "keys": {"p256dh": p256dh, "auth": auth},
+            },
+            data=json.dumps(payload),
+            vapid_private_key=VAPID_PRIVATE_KEY,
+            vapid_claims=_vapid_claims(),
+        )
+        return True
+    except WebPushException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (404, 410):
+            # Endpoint gone permanently — drop it.
+            await _delete_push_subscription(endpoint)
+        logging.warning(f"webpush failed (status={status}) for {endpoint}: {exc}")
+        return False
+    except Exception as exc:
+        logging.error(f"webpush unexpected error for {endpoint}: {exc}")
+        return False
+
+
+async def send_push_to_user(user_id: str, payload: dict) -> int:
+    """Send the given payload to every subscription owned by user_id."""
+    if not user_id:
+        return 0
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                "SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = %s",
+                (user_id,),
+            )
+            rows = await acur.fetchall()
+    sent = 0
+    for endpoint, p256dh, auth in rows:
+        if await _send_webpush(endpoint, p256dh, auth, payload):
+            sent += 1
+    return sent
+
+
+async def send_push_to_anonymous(anonymous_id: str, payload: dict) -> int:
+    """Send the given payload to anonymous (not-logged-in) subscriptions."""
+    if not anonymous_id:
+        return 0
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT endpoint, p256dh, auth
+                FROM push_subscriptions
+                WHERE anonymous_id = %s AND user_id IS NULL
+                """,
+                (anonymous_id,),
+            )
+            rows = await acur.fetchall()
+    sent = 0
+    for endpoint, p256dh, auth in rows:
+        if await _send_webpush(endpoint, p256dh, auth, payload):
+            sent += 1
+    return sent
+
+
 @app.post("/subscribe")
-async def subscribe(subscription: Subscription):
-    user_id = subscription.userId
-    subscriptions[user_id] = subscription.dict()
-    return {"status": "subscribed"}
+async def subscribe(
+    subscription: Subscription,
+    user: Optional[dict] = Depends(get_current_user),
+):
+    """Register (or refresh) a Web Push subscription.
+
+    If the caller is authenticated, the subscription is linked to their user_id
+    so we can target them across devices (e.g., LoRA-approved notifications).
+    Anonymous browsers are keyed by the client-generated `userId`.
+    """
+    p256dh = subscription.keys.get("p256dh") if subscription.keys else None
+    auth = subscription.keys.get("auth") if subscription.keys else None
+    if not (subscription.endpoint and p256dh and auth):
+        raise HTTPException(status_code=400, detail="Invalid subscription payload")
+
+    user_id = user["user_id"] if user else None
+    anonymous_id = subscription.userId or None
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                INSERT INTO push_subscriptions (user_id, anonymous_id, endpoint, p256dh, auth)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (endpoint) DO UPDATE SET
+                    user_id      = COALESCE(EXCLUDED.user_id, push_subscriptions.user_id),
+                    anonymous_id = COALESCE(EXCLUDED.anonymous_id, push_subscriptions.anonymous_id),
+                    p256dh       = EXCLUDED.p256dh,
+                    auth         = EXCLUDED.auth,
+                    last_used_at = NOW()
+                """,
+                (user_id, anonymous_id, subscription.endpoint, p256dh, auth),
+            )
+            await aconn.commit()
+
+    return {"status": "subscribed", "linked_to_user": bool(user_id)}
+
+
+@app.post("/unsubscribe")
+async def unsubscribe(payload: Dict[str, Any]):
+    """Remove a push subscription by endpoint."""
+    endpoint = (payload or {}).get("endpoint")
+    if not endpoint:
+        raise HTTPException(status_code=400, detail="endpoint is required")
+    await _delete_push_subscription(endpoint)
+    return {"status": "unsubscribed"}
 
 
 @app.get("/send_notification/{user_id}")
-async def send_notification(user_id: str):  # Change the type to str
-    # Retrieve the subscription object for the user
-    subscription = subscriptions.get(user_id)
-    if not subscription:
-        return {"status": "failed", "detail": "User not subscribed"}
+async def send_notification(user_id: str):
+    """Send the 'image ready' notification.
 
-    try:
-        payload = {
-            "notification": {
-                "title": "Your image is ready!",
-                "body": "Click to view your image.",
-                # "icon": "icon.png",
-                "vibrate": [100, 50, 100],
-                "data": {"url": "https://mobians.ai/"},
-            }
+    `user_id` here is whatever id the caller stored at subscribe-time. It may
+    be a real authenticated user UUID OR the client-side anonymous id.
+    We try both so the existing frontend (anon trigger on poll-complete) and
+    server-initiated flows both work.
+    """
+    payload = {
+        "notification": {
+            "title": "Your image is ready!",
+            "body": "Click to view your generation.",
+            "vibrate": [100, 50, 100],
+            "data": {"url": "https://mobians.ai/"},
         }
-        webpush(
-            subscription_info=subscription,
-            data=json.dumps(payload),
-            vapid_private_key=VAPID_PRIVATE_KEY,
-            vapid_claims={"sub": "mailto:your_email@example.com"},
-        )
-    except WebPushException as e:
-        print("Failed to send notification:", repr(e))
-        return {"status": "failed", "detail": repr(e)}
+    }
 
-    return {"status": "sent"}
+    sent = 0
+    # Authenticated match (user_id is a UUID string).
+    try:
+        sent += await send_push_to_user(user_id, payload)
+    except Exception as exc:
+        logging.warning(f"send_push_to_user failed: {exc}")
+    # Anonymous fallback (legacy behavior).
+    sent += await send_push_to_anonymous(user_id, payload)
+
+    if sent == 0:
+        return {"status": "failed", "detail": "No active subscriptions"}
+    return {"status": "sent", "count": sent}
+
+
+# ============================================
+# INTERNAL NOTIFICATION ENDPOINTS
+# ============================================
+
+def _require_internal_token(x_internal_token: Optional[str]) -> None:
+    if not INTERNAL_API_TOKEN:
+        raise HTTPException(status_code=503, detail="Internal notifications disabled")
+    if not x_internal_token or x_internal_token != INTERNAL_API_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid internal token")
+
+
+async def _resolve_user_id_from_requestor(requestor: Optional[str]) -> Optional[str]:
+    """Map a lora_suggestions.requestor value back to a users.id.
+
+    `requestor` can be a UUID (user_id), discord id, google id, username, or email.
+    """
+    if not requestor:
+        return None
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT id FROM users
+                WHERE id::text         = %s
+                   OR discord_user_id  = %s
+                   OR google_user_id   = %s
+                   OR username         = %s
+                   OR email            = %s
+                LIMIT 1
+                """,
+                (requestor, requestor, requestor, requestor, requestor),
+            )
+            row = await acur.fetchone()
+    return str(row[0]) if row else None
+
+
+class LoraNotifyPayload(BaseModel):
+    version_id: int
+    name: Optional[str] = None
+    version: Optional[str] = None
+    requestor: Optional[str] = None
+
+
+@app.post("/internal/notify_lora_downloaded")
+async def internal_notify_lora_downloaded(
+    payload: LoraNotifyPayload,
+    x_internal_token: Optional[str] = Header(default=None, alias="X-Internal-Token"),
+):
+    """Called by the LoRA downloader service once a LoRA is available on-site."""
+    _require_internal_token(x_internal_token)
+
+    requestor = payload.requestor
+    # Fallback: look up requestor from the suggestion if not supplied.
+    if not requestor:
+        async with db_pool.connection() as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute(
+                    "SELECT requestor, name, version FROM lora_suggestions WHERE version_id = %s",
+                    (payload.version_id,),
+                )
+                row = await acur.fetchone()
+        if row:
+            requestor = row[0]
+            payload.name = payload.name or row[1]
+            payload.version = payload.version or row[2]
+
+    user_id = await _resolve_user_id_from_requestor(requestor)
+    if not user_id:
+        return {"status": "skipped", "reason": "no user_id for requestor"}
+
+    lora_label = payload.name or "Your LoRA"
+    if payload.version:
+        lora_label = f"{lora_label} v{payload.version}"
+
+    notification_payload = {
+        "notification": {
+            "title": "Your LoRA is ready!",
+            "body": f"{lora_label} is now available on Mobians.ai.",
+            "vibrate": [100, 50, 100],
+            "data": {"url": "https://mobians.ai/"},
+        }
+    }
+    sent = await send_push_to_user(user_id, notification_payload)
+    return {"status": "sent" if sent else "no_subscriptions", "count": sent}
 
 
 class DiscordAuthCode(BaseModel):
