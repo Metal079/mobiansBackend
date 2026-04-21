@@ -63,9 +63,14 @@ DSN = (
 VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY")
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY")
 VAPID_CLAIMS = os.environ.get("VAPID_CLAIMS")
+# Windows Push Service rejects Web Push requests with TTL=0, so use a
+# non-zero default unless explicitly overridden.
+WEBPUSH_TTL_SECONDS = max(1, int(os.environ.get("WEBPUSH_TTL_SECONDS", "300")))
 # Shared secret used by trusted local services (e.g., lora_downloader_service)
 # to trigger server-initiated push notifications. Leave unset to disable.
 INTERNAL_API_TOKEN = os.environ.get("INTERNAL_API_TOKEN")
+# Destination opened when a user clicks a push notification.
+PUBLIC_SITE_URL = (os.environ.get("PUBLIC_SITE_URL") or "https://mobians.ai/").rstrip("/") + "/"
 
 # Credit costs by model type
 CREDIT_COSTS = {
@@ -275,7 +280,7 @@ async def _send_job_completion_notification(
             "title": title,
             "body": body,
             "vibrate": [100, 50, 100],
-            "data": {"url": "https://mobians.ai/"},
+            "data": {"url": PUBLIC_SITE_URL},
         }
     }
     await send_push_to_user(user_id, payload)
@@ -2201,6 +2206,7 @@ async def _send_webpush(endpoint: str, p256dh: str, auth: str, payload: dict) ->
                 "keys": {"p256dh": p256dh, "auth": auth},
             },
             data=json.dumps(payload),
+            ttl=WEBPUSH_TTL_SECONDS,
             vapid_private_key=VAPID_PRIVATE_KEY,
             vapid_claims=_vapid_claims(),
         )
@@ -2320,7 +2326,7 @@ async def send_notification(user_id: str):
             "title": "Your image is ready!",
             "body": "Click to view your generation.",
             "vibrate": [100, 50, 100],
-            "data": {"url": "https://mobians.ai/"},
+            "data": {"url": PUBLIC_SITE_URL},
         }
     }
 
@@ -2417,7 +2423,7 @@ async def internal_notify_lora_downloaded(
             "title": "Your LoRA is ready!",
             "body": f"{lora_label} is now available on Mobians.ai.",
             "vibrate": [100, 50, 100],
-            "data": {"url": "https://mobians.ai/"},
+            "data": {"url": PUBLIC_SITE_URL},
         }
     }
     sent = await send_push_to_user(user_id, notification_payload)
