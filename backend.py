@@ -48,8 +48,17 @@ DBNAME = os.environ.get("DBNAME")
 DBUSER = os.environ.get("DBUSER")
 DBPASS = os.environ.get("DBPASS")
 
-# Define your connection parameters for PostgreSQL
-DSN = f"host={DBHOST} dbname='{DBNAME}' user={DBUSER} password={DBPASS}"
+# Define your connection parameters for PostgreSQL.
+# - keepalives_*: detect dead peers (e.g. orphaned connections after a container
+#   restart) within ~60s instead of waiting for the server-side 2h default.
+# - options=-c ...: per-session safety timeouts so a stuck transaction cannot
+#   hold row locks indefinitely and block the generator's pending-job polling.
+DSN = (
+    f"host={DBHOST} dbname='{DBNAME}' user={DBUSER} password={DBPASS} "
+    "keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3 "
+    "options='-c idle_in_transaction_session_timeout=30000 "
+    "-c statement_timeout=60000 -c lock_timeout=5000'"
+)
 
 VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY")
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY")
