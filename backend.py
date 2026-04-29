@@ -1831,7 +1831,12 @@ async def get_loras(status: str = "active"):
         async with aconn.cursor() as acur:
             await acur.execute(
                 f"""
-                SELECT * FROM lora_metadata
+                SELECT
+                    id, name, version, base_model, download_url, is_nsfw, is_minor,
+                    creator, description, version_description, tags, who_added, status,
+                    trigger_words, date_added, hashes, image_url, file_path, uses,
+                    is_active, last_used_date, version_id
+                FROM lora_metadata
                 {where_clause}
                 ORDER BY uses DESC
                 """
@@ -1843,9 +1848,7 @@ async def get_loras(status: str = "active"):
             
             # Convert to list of dictionaries
             result = [dict(zip(columns, row)) for row in rows]
-            for item in result:
-                item.pop('image_blob', None)
-    
+
     # Convert the result to a JSON-serializable format
     json_compatible_result = jsonable_encoder(result)
     
