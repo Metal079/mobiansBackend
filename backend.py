@@ -140,6 +140,7 @@ MODEL_BASE_TYPES = {
 
 DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "novaMobianXL_v20")
 LORA_SUGGESTION_LIMIT = 5
+LORA_REREQUEST_COOLDOWN_DAYS = 7
 SUPPORTED_LORA_BASE_MODELS = {"Pony", "SD 1.5", "Illustrious", "Anima"}
 
 
@@ -1257,11 +1258,17 @@ async def add_lora_suggestion(lora_data: addLoraSuggestion, user: dict = Depends
             async with aconn.cursor() as acur:
                 await acur.execute(
                     """
-                    SELECT status
+                    SELECT status,
+                           last_updated_date,
+                           COALESCE(last_updated_date, NOW()) + (%s * INTERVAL '1 day') AS rerequest_available_at,
+                           GREATEST(
+                               0,
+                               CEIL(EXTRACT(EPOCH FROM ((COALESCE(last_updated_date, NOW()) + (%s * INTERVAL '1 day')) - NOW())))::INTEGER
+                           ) AS cooldown_seconds_remaining
                     FROM lora_suggestions
                     WHERE version_id = %s
                     """,
-                    (lora_data.lora_version_id,),
+                    (LORA_REREQUEST_COOLDOWN_DAYS, LORA_REREQUEST_COOLDOWN_DAYS, lora_data.lora_version_id),
                 )
                 row = await acur.fetchone()
 
@@ -1275,17 +1282,33 @@ async def add_lora_suggestion(lora_data: addLoraSuggestion, user: dict = Depends
             )
 
         existing_status = (row[0] or "").strip().lower()
+        rerequest_available_at = row[2]
+        cooldown_seconds_remaining = int(row[3] or 0)
         # Allow re-queueing when the previous attempt already finished processing
-        immutable_statuses = {"pending", "approved", "downloading", "rejected"}
+        immutable_statuses = {"pending", "approved", "downloading"}
         if existing_status in immutable_statuses:
             detail = "A suggestion for this LoRA is already pending approval. Please be patient as we review it."
             if existing_status == "approved":
                 detail = "This LoRA has already been approved and is queued for download."
             elif existing_status == "downloading":
                 detail = "This LoRA is currently downloading. Please wait for it to finish."
-            elif existing_status == "rejected":
-                detail = "This LoRA has been reviewed and rejected. It cannot be re-submitted."
             return JSONResponse(content={"status": "error", "detail": detail}, status_code=400)
+
+        if existing_status == "rejected" and cooldown_seconds_remaining > 0:
+            days_remaining = max(1, math.ceil(cooldown_seconds_remaining / 86400))
+            day_label = "day" if days_remaining == 1 else "days"
+            return JSONResponse(
+                content=jsonable_encoder({
+                    "status": "error",
+                    "detail": (
+                        f"This LoRA was rejected recently. You can re-request it in "
+                        f"{days_remaining} {day_label}."
+                    ),
+                    "cooldown_seconds_remaining": cooldown_seconds_remaining,
+                    "rerequest_available_at": rerequest_available_at,
+                }),
+                status_code=429,
+            )
 
         async with db_pool.connection() as aconn:
             async with aconn.cursor() as acur:
@@ -3134,12 +3157,25 @@ async def get_my_lora_suggestions(status: str = "pending", user: dict = Depends(
                 """
                   SELECT version_id, name, version, status, requestor, 
                       is_nsfw, is_minor, preview_image, base_model,
-                      error_message, last_updated_date
+                      error_message, last_updated_date,
+                      CASE
+                          WHEN status = 'rejected'
+                          THEN COALESCE(last_updated_date, NOW()) + (%s * INTERVAL '1 day')
+                          ELSE NULL
+                      END AS rerequest_available_at,
+                      CASE
+                          WHEN status = 'rejected'
+                          THEN GREATEST(
+                              0,
+                              CEIL(EXTRACT(EPOCH FROM ((COALESCE(last_updated_date, NOW()) + (%s * INTERVAL '1 day')) - NOW())))::INTEGER
+                          )
+                          ELSE 0
+                      END AS cooldown_seconds_remaining
                 FROM lora_suggestions
                 """ + where_clause + """
                 ORDER BY name
                 """,
-                tuple(params),
+                (LORA_REREQUEST_COOLDOWN_DAYS, LORA_REREQUEST_COOLDOWN_DAYS, *params),
             )
             columns = [desc[0] for desc in acur.description]
             rows = await acur.fetchall()
@@ -3162,19 +3198,41 @@ async def get_all_suggestion_statuses():
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
-                SELECT version_id, status
+                SELECT version_id,
+                       status,
+                       last_updated_date,
+                       CASE
+                           WHEN status = 'rejected'
+                           THEN COALESCE(last_updated_date, NOW()) + (%s * INTERVAL '1 day')
+                           ELSE NULL
+                       END AS rerequest_available_at,
+                       CASE
+                           WHEN status = 'rejected'
+                           THEN GREATEST(
+                               0,
+                               CEIL(EXTRACT(EPOCH FROM ((COALESCE(last_updated_date, NOW()) + (%s * INTERVAL '1 day')) - NOW())))::INTEGER
+                           )
+                           ELSE 0
+                       END AS cooldown_seconds_remaining
                 FROM lora_suggestions
                 WHERE status IN ('rejected', 'approved', 'pending', 'downloading')
-                """
+                """,
+                (LORA_REREQUEST_COOLDOWN_DAYS, LORA_REREQUEST_COOLDOWN_DAYS),
             )
             rows = await acur.fetchall()
 
-    result: dict = {"rejected": [], "approved": [], "pending": [], "downloading": []}
-    for version_id, status in rows:
+    result: dict = {"rejected": [], "approved": [], "pending": [], "downloading": [], "rejected_cooldowns": {}}
+    for version_id, status, last_updated_date, rerequest_available_at, cooldown_seconds_remaining in rows:
         key = (status or "").strip().lower()
         if key in result:
             result[key].append(version_id)
-    return JSONResponse(content=result)
+            if key == "rejected":
+                result["rejected_cooldowns"][str(version_id)] = {
+                    "last_updated_date": last_updated_date,
+                    "rerequest_available_at": rerequest_available_at,
+                    "cooldown_seconds_remaining": cooldown_seconds_remaining,
+                }
+    return JSONResponse(content=jsonable_encoder(result))
 
 
 @app.post("/cancel_lora_suggestion/{suggestion_id}/")
@@ -3238,12 +3296,25 @@ async def get_lora_suggestions(status: str = "pending", user: dict = Depends(req
                 """
                   SELECT version_id, name, version, status, requestor, 
                       is_nsfw, is_minor, preview_image, base_model,
-                      error_message, last_updated_date
+                      error_message, last_updated_date,
+                      CASE
+                          WHEN status = 'rejected'
+                          THEN COALESCE(last_updated_date, NOW()) + (%s * INTERVAL '1 day')
+                          ELSE NULL
+                      END AS rerequest_available_at,
+                      CASE
+                          WHEN status = 'rejected'
+                          THEN GREATEST(
+                              0,
+                              CEIL(EXTRACT(EPOCH FROM ((COALESCE(last_updated_date, NOW()) + (%s * INTERVAL '1 day')) - NOW())))::INTEGER
+                          )
+                          ELSE 0
+                      END AS cooldown_seconds_remaining
                 FROM lora_suggestions
                 """ + where_clause + """
                 ORDER BY name
                 """,
-                params,
+                (LORA_REREQUEST_COOLDOWN_DAYS, LORA_REREQUEST_COOLDOWN_DAYS, *params),
             )
             columns = [desc[0] for desc in acur.description]
             rows = await acur.fetchall()
@@ -3483,7 +3554,7 @@ async def admin_approve_suggestion(suggestion_id: int, user: dict = Depends(requ
             if existing:
                 # Mark suggestion as duplicate
                 await acur.execute(
-                    "UPDATE lora_suggestions SET status = 'duplicate' WHERE version_id = %s",
+                    "UPDATE lora_suggestions SET status = 'duplicate', last_updated_date = NOW() WHERE version_id = %s",
                     (suggestion_id,)
                 )
                 await aconn.commit()
@@ -3511,7 +3582,8 @@ async def admin_reject_suggestion(suggestion_id: int, user: dict = Depends(requi
             await acur.execute(
                 """
                 UPDATE lora_suggestions
-                SET status = 'rejected'
+                SET status = 'rejected',
+                    last_updated_date = NOW()
                 WHERE version_id = %s AND status = 'pending'
                 RETURNING version_id, name
                 """,
