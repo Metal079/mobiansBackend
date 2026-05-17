@@ -3,7 +3,7 @@ import io
 import base64
 import sys
 import asyncio
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 import logging
 from datetime import datetime, timedelta
 import json
@@ -152,10 +152,6 @@ MODEL_BASE_TYPES = {
     "Anima-baseV1": "Anima",
 }
 
-MODEL_ID_ALIASES = {
-    "anima-preview3": "Anima-baseV1",
-}
-
 DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "novaMobianXL_v20")
 LORA_SUGGESTION_LIMIT = 5
 LORA_REREQUEST_COOLDOWN_DAYS = 7
@@ -178,10 +174,6 @@ def normalize_model_id(model: Optional[str]) -> str:
 
     if not model:
         return fallback
-
-    alias = MODEL_ID_ALIASES.get(model.lower())
-    if alias:
-        return alias
 
     if model in MODEL_BASE_TYPES:
         return model
@@ -795,7 +787,8 @@ class DynamicPromptCustomCategoryUpdate(BaseModel):
 
 
 COMMUNITY_TEMPLATE_STATUSES = {"private", "pending", "approved", "rejected", "hidden"}
-COMMUNITY_TEMPLATE_EDITABLE_STATUSES = {"private", "rejected"}
+ADMIN_COMMUNITY_TEMPLATE_STATUSES = {"pending", "approved", "rejected", "hidden"}
+COMMUNITY_TEMPLATE_MUTABLE_STATUSES = {"private", "pending", "approved", "rejected"}
 COMMUNITY_TEMPLATE_PUBLIC_SORTS = {"new", "top", "popular"}
 COMMUNITY_TEMPLATE_TITLE_MAX = 90
 COMMUNITY_TEMPLATE_DESCRIPTION_MAX = 500
@@ -803,6 +796,7 @@ COMMUNITY_TEMPLATE_MAX_TAGS = 8
 COMMUNITY_TEMPLATE_TAG_MAX = 24
 COMMUNITY_TEMPLATE_PREVIEW_SEED = 1729
 CUSTOM_CATEGORY_STATUSES = {"private", "public", "hidden"}
+ADMIN_CUSTOM_CATEGORY_STATUSES = {"public", "hidden"}
 CUSTOM_CATEGORY_PUBLIC_SORTS = {"new", "top", "popular"}
 CUSTOM_CATEGORY_TITLE_MAX = 80
 CUSTOM_CATEGORY_DESCRIPTION_MAX = 500
@@ -1024,7 +1018,7 @@ async def _load_dynamic_prompt_assets(
         entry_values = [str(entry).strip() for entry in (entries or []) if str(entry).strip()]
         if not entry_values:
             continue
-        wildcard_id = str(token).strip("_")
+        wildcard_id = _wildcard_id_from_token(token)
         items_by_category[wildcard_id] = entry_values
         categories.append(
             {
@@ -1094,12 +1088,56 @@ def _isoformat(value: Any) -> Optional[str]:
     return str(value)
 
 
-def _has_dynamic_prompt_syntax(template: str) -> bool:
-    return bool(re.search(r"__[-\w/]+__", template) or re.search(r"\{[^{}]*\|[^{}]*\}", template))
+def _has_dynamic_prompt_variant_syntax(template: str) -> bool:
+    return bool(re.search(r"\{[^{}]*\|[^{}]*\}", template))
+
+
+def _has_dynamic_prompt_syntax(template: str, allowed_wildcards: Optional[set[str]] = None) -> bool:
+    if _has_dynamic_prompt_variant_syntax(template):
+        return True
+    wildcard_ids = _extract_dynamic_prompt_wildcard_ids(template)
+    if not wildcard_ids:
+        return False
+    if allowed_wildcards is None:
+        return True
+    return any(wildcard_id in allowed_wildcards for wildcard_id in wildcard_ids)
 
 
 def _extract_dynamic_prompt_wildcard_ids(template: str) -> List[str]:
     return sorted(set(re.findall(r"__([-\w/]+)__", template)))
+
+
+def _allowed_dynamic_prompt_wildcard_ids(assets: Dict[str, Any]) -> set[str]:
+    wildcard_ids: set[str] = set()
+    for category in assets.get("library", {}).get("categories", []):
+        category_id = str(category.get("id", "")).strip()
+        if category_id:
+            wildcard_ids.add(category_id)
+    return wildcard_ids
+
+
+def _resolve_dynamic_prompt_request(
+    prompt: str,
+    config: Optional[DynamicPromptingConfig],
+    allowed_wildcards: Optional[set[str]] = None,
+) -> Optional[Tuple[str, DynamicPromptingConfig]]:
+    prompt_text = str(prompt or "").strip()
+    resolved_config = config or DynamicPromptingConfig()
+    config_template = str(resolved_config.template or "").strip()
+
+    candidates: List[str] = []
+    if resolved_config.enabled and config_template:
+        candidates.append(config_template)
+    if prompt_text:
+        candidates.append(prompt_text)
+
+    for candidate in candidates:
+        if (resolved_config.enabled and candidate == config_template) or _has_dynamic_prompt_syntax(candidate, allowed_wildcards):
+            resolved_config.enabled = True
+            resolved_config.template = candidate
+            return candidate, resolved_config
+
+    return None
 
 
 def _normalize_community_template_tags(tags: Optional[List[str]]) -> List[str]:
@@ -1124,8 +1162,204 @@ def _normalize_community_template_tags(tags: Optional[List[str]]) -> List[str]:
     return normalized
 
 
-def _custom_category_token(category_id: str) -> str:
+CUSTOM_CATEGORY_SLUG_MAX = 56
+CUSTOM_CATEGORY_NAMESPACE_MAX = 32
+RESERVED_DYNAMIC_PROMPT_NAMESPACES = {
+    "admin",
+    "api",
+    "community",
+    "custom",
+    "dynamic",
+    "dynamic-prompt",
+    "dynamic-prompts",
+    "mobian",
+    "public",
+    "system",
+}
+
+
+def _dynamic_prompt_slug_part(value: Any, max_length: int, fallback: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower())
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    if not slug:
+        slug = fallback
+    return slug[:max_length].strip("-") or fallback
+
+
+def _custom_category_slug(title: str) -> str:
+    return _dynamic_prompt_slug_part(title, CUSTOM_CATEGORY_SLUG_MAX, "category")
+
+
+def _custom_category_id_suffix(category_id: str, length: int = 12) -> str:
+    suffix = re.sub(r"[^a-f0-9]", "", str(category_id or "").lower())
+    return suffix[:length] or "custom"
+
+
+def _namespace_letters_and_numbers(value: Any) -> str:
+    namespace = re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+    return namespace[:CUSTOM_CATEGORY_NAMESPACE_MAX]
+
+
+def _display_name_namespace_slug(display_name: Any) -> str:
+    display_value = str(display_name or "").strip()
+    if "@" in display_value:
+        return ""
+    return _namespace_letters_and_numbers(display_value)
+
+
+def _username_namespace_slug(username: Any) -> str:
+    username_value = str(username or "").strip()
+    if "@" in username_value:
+        username_value = username_value.split("@", 1)[0]
+    return _namespace_letters_and_numbers(username_value)
+
+
+def _custom_category_namespace_candidates(user: Optional[Dict[str, Any]]) -> List[str]:
+    user = user or {}
+    user_id = str(user.get("user_id") or "")
+    fallback_short = f"user-{_custom_category_id_suffix(user_id, 8)}"
+    fallback_long = f"user-{_custom_category_id_suffix(user_id, 12)}"
+    candidates = [
+        _display_name_namespace_slug(user.get("display_name")),
+        _username_namespace_slug(user.get("username")),
+        fallback_short,
+        fallback_long,
+    ]
+
+    namespaces: List[str] = []
+    for candidate in candidates:
+        if not candidate or candidate in RESERVED_DYNAMIC_PROMPT_NAMESPACES or candidate in namespaces:
+            continue
+        namespaces.append(candidate)
+    return namespaces or [fallback_short]
+
+
+def _custom_category_namespace_slug(user: Optional[Dict[str, Any]]) -> str:
+    return _custom_category_namespace_candidates(user)[0]
+
+
+def _custom_category_token_from_parts(namespace: str, slug: str) -> str:
+    namespace_slug = _dynamic_prompt_slug_part(namespace, CUSTOM_CATEGORY_NAMESPACE_MAX, "user")
+    category_slug = _custom_category_slug(slug)
+    return f"__{namespace_slug}/{category_slug}__"
+
+
+def _legacy_custom_category_token(category_id: str) -> str:
     return f"__custom/{category_id}__"
+
+
+def _custom_category_token(category_id: str, title: Optional[str] = None, namespace: str = "custom") -> str:
+    if title is None:
+        return _legacy_custom_category_token(category_id)
+    return _custom_category_token_from_parts(namespace, _custom_category_slug(title))
+
+
+def _wildcard_id_from_token(token: Any) -> str:
+    return str(token or "").strip().strip("_")
+
+
+def _namespace_from_category_token(token: Any) -> str:
+    wildcard_id = _wildcard_id_from_token(token)
+    namespace, separator, _category_slug = wildcard_id.partition("/")
+    return namespace if separator else ""
+
+
+async def _custom_category_namespace_for_user(acur: Any, user: Dict[str, Any]) -> str:
+    user_id = str(user.get("user_id") or "")
+    await acur.execute(
+        """
+        SELECT token
+        FROM dynamic_prompt.custom_categories
+        WHERE user_id = %s AND token !~ '^__custom/'
+        ORDER BY created_at ASC, id ASC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    existing_namespace_row = await acur.fetchone()
+    if existing_namespace_row:
+        existing_namespace = _namespace_from_category_token(existing_namespace_row[0])
+        if existing_namespace:
+            return existing_namespace
+
+    for namespace in _custom_category_namespace_candidates(user):
+        await acur.execute(
+            """
+            SELECT 1
+            FROM dynamic_prompt.custom_categories
+            WHERE user_id <> %s AND token LIKE %s
+            LIMIT 1
+            """,
+            (user_id, f"__{namespace}/%"),
+        )
+        if not await acur.fetchone():
+            return namespace
+
+    return f"user-{_custom_category_id_suffix(user_id, 16)}"
+
+
+async def _generate_unique_custom_category_token(
+    acur: Any,
+    title: str,
+    category_id: str,
+    user: Dict[str, Any],
+    exclude_category_id: Optional[str] = None,
+) -> str:
+    namespace = await _custom_category_namespace_for_user(acur, user)
+    base_slug = _custom_category_slug(title)
+    id_suffix = _custom_category_id_suffix(category_id)
+    candidate_slugs = [base_slug, f"{base_slug}-{id_suffix}"]
+    candidate_slugs.extend(f"{base_slug}-{id_suffix}-{index}" for index in range(2, 100))
+
+    for slug in candidate_slugs:
+        candidate = _custom_category_token_from_parts(namespace, slug)
+        if exclude_category_id:
+            await acur.execute(
+                """
+                SELECT 1
+                FROM dynamic_prompt.custom_categories
+                WHERE id <> %s
+                  AND token = %s
+                LIMIT 1
+                """,
+                (exclude_category_id, candidate),
+            )
+        else:
+            await acur.execute(
+                """
+                SELECT 1
+                FROM dynamic_prompt.custom_categories
+                WHERE token = %s
+                LIMIT 1
+                """,
+                (candidate,),
+            )
+        if not await acur.fetchone():
+            return candidate
+
+    raise HTTPException(status_code=500, detail="Unable to create a unique category token.")
+
+
+async def _resolve_updated_custom_category_token(
+    acur: Any,
+    user: Dict[str, Any],
+    category_id: str,
+    title: str,
+    current_token: Optional[str],
+ ) -> str:
+    clean_current_token = str(current_token or "").strip()
+    clean_title = str(title or "").strip()
+
+    if not clean_current_token or not clean_title:
+        return clean_current_token
+
+    return await _generate_unique_custom_category_token(
+        acur,
+        clean_title,
+        category_id,
+        user,
+        exclude_category_id=category_id,
+    )
 
 
 def _normalize_custom_category_entries(entries: Optional[List[str]]) -> List[str]:
@@ -1210,7 +1444,11 @@ def _custom_category_select_sql(viewer_user_id: Optional[str] = None) -> str:
             c.id, c.user_id, c.title, c.description, c.token, c.tags, c.status,
             c.source_category_id, c.source_snapshot_updated_at,
             c.upvote_count, c.import_count, c.created_at, c.updated_at,
-            COALESCE(u.display_name, u.username, u.email, 'Mobians user') AS author_display_name,
+            COALESCE(
+                NULLIF(CASE WHEN POSITION('@' IN COALESCE(TRIM(u.display_name), '')) = 0 THEN TRIM(u.display_name) ELSE '' END, ''),
+                NULLIF(CASE WHEN POSITION('@' IN COALESCE(TRIM(u.username), '')) = 0 THEN TRIM(u.username) ELSE '' END, ''),
+                'Mobians user'
+            ) AS author_display_name,
             EXISTS (
                 SELECT 1 FROM dynamic_prompt.custom_category_votes v
                 WHERE v.category_id = c.id AND v.user_id = {viewer_uuid}
@@ -1301,11 +1539,12 @@ async def _validate_community_dynamic_prompt_template(
         raise HTTPException(status_code=400, detail=f"Description must be {COMMUNITY_TEMPLATE_DESCRIPTION_MAX} characters or fewer.")
     if not clean_template:
         raise HTTPException(status_code=400, detail="Dynamic prompt template is required.")
+
     if not _has_dynamic_prompt_syntax(clean_template):
         raise HTTPException(status_code=400, detail="Template must include dynamic prompt syntax such as __mobian/characters__ or {a|b}.")
 
     assets = await _load_dynamic_prompt_assets(user_id=user_id)
-    allowed_wildcards = {category["id"] for category in assets["library"].get("categories", [])}
+    allowed_wildcards = _allowed_dynamic_prompt_wildcard_ids(assets)
     unknown_wildcards = [wildcard for wildcard in _extract_dynamic_prompt_wildcard_ids(clean_template) if wildcard not in allowed_wildcards]
     if unknown_wildcards:
         raise HTTPException(
@@ -1368,7 +1607,11 @@ def _community_template_select_sql(viewer_user_id: Optional[str] = None) -> str:
             t.rejection_reason, t.source_template_id, t.source_snapshot_updated_at,
             t.upvote_count, t.import_count, t.created_at, t.updated_at, t.submitted_at,
             t.approved_at, t.hidden_at,
-            COALESCE(u.display_name, u.username, u.email, 'Mobians user') AS author_display_name,
+            COALESCE(
+                NULLIF(CASE WHEN POSITION('@' IN COALESCE(TRIM(u.display_name), '')) = 0 THEN TRIM(u.display_name) ELSE '' END, ''),
+                NULLIF(CASE WHEN POSITION('@' IN COALESCE(TRIM(u.username), '')) = 0 THEN TRIM(u.username) ELSE '' END, ''),
+                'Mobians user'
+            ) AS author_display_name,
             EXISTS (
                 SELECT 1 FROM dynamic_prompt.template_votes v
                 WHERE v.template_id = t.id AND v.user_id = {viewer_uuid}
@@ -1547,6 +1790,7 @@ async def create_user_dynamic_prompt_category(
 
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
+            category_token = await _generate_unique_custom_category_token(acur, validated["title"], category_id, user)
             await acur.execute(
                 """
                 INSERT INTO dynamic_prompt.custom_categories (id, user_id, title, description, token, tags, status)
@@ -1557,7 +1801,7 @@ async def create_user_dynamic_prompt_category(
                     user["user_id"],
                     validated["title"],
                     validated["description"],
-                    _custom_category_token(category_id),
+                    category_token,
                     validated["tags"],
                 ),
             )
@@ -1587,11 +1831,20 @@ async def update_user_dynamic_prompt_category(
 
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
+            next_token = await _resolve_updated_custom_category_token(
+                acur,
+                user,
+                category_id,
+                validated["title"],
+                existing.get("token"),
+            )
             await acur.execute(
                 """
                 UPDATE dynamic_prompt.custom_categories
                 SET title = %s,
                     description = %s,
+                    token = %s,
+                    token_aliases = %s,
                     tags = %s,
                     updated_at = NOW()
                 WHERE id = %s AND user_id = %s
@@ -1599,6 +1852,8 @@ async def update_user_dynamic_prompt_category(
                 (
                     validated["title"],
                     validated["description"],
+                    next_token,
+                    [],
                     validated["tags"],
                     category_id,
                     user["user_id"],
@@ -1816,6 +2071,7 @@ async def import_dynamic_prompt_category(category_id: str, user: dict = Depends(
                 imported_id = existing_import[0]
             else:
                 imported_id = str(uuid.uuid4())
+                imported_token = await _generate_unique_custom_category_token(acur, category["title"], imported_id, user)
                 await acur.execute(
                     """
                     INSERT INTO dynamic_prompt.custom_categories (
@@ -1828,7 +2084,7 @@ async def import_dynamic_prompt_category(category_id: str, user: dict = Depends(
                         user["user_id"],
                         category["title"],
                         category["description"],
-                        _custom_category_token(imported_id),
+                        imported_token,
                         category["tags"],
                         category_id,
                         category["updated_at"],
@@ -1925,8 +2181,8 @@ async def update_user_dynamic_prompt_template(
     existing = await _fetch_community_template(template_id, viewer_user_id=user["user_id"], owner_user_id=user["user_id"])
     if not existing:
         raise HTTPException(status_code=404, detail="Template not found.")
-    if existing["status"] not in COMMUNITY_TEMPLATE_EDITABLE_STATUSES:
-        raise HTTPException(status_code=409, detail="Only private or rejected templates can be edited.")
+    if existing["status"] not in COMMUNITY_TEMPLATE_MUTABLE_STATUSES:
+        raise HTTPException(status_code=409, detail="This template can no longer be edited.")
 
     validated = await _validate_community_dynamic_prompt_template(
         request.title if request.title is not None else existing["title"],
@@ -1935,6 +2191,8 @@ async def update_user_dynamic_prompt_template(
         request.tags if request.tags is not None else existing["tags"],
         user_id=user["user_id"],
     )
+
+    next_status = "approved" if existing["status"] == "approved" else "private"
 
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
@@ -1945,9 +2203,10 @@ async def update_user_dynamic_prompt_template(
                     description = %s,
                     template = %s,
                     tags = %s,
-                    status = 'private',
+                    status = %s,
                     rejection_reason = NULL,
                     submitted_at = NULL,
+                    approved_at = CASE WHEN %s = 'approved' THEN COALESCE(approved_at, NOW()) ELSE NULL END,
                     updated_at = NOW()
                 WHERE id = %s AND user_id = %s
                 """,
@@ -1956,6 +2215,8 @@ async def update_user_dynamic_prompt_template(
                     validated["description"],
                     validated["template"],
                     validated["tags"],
+                    next_status,
+                    next_status,
                     template_id,
                     user["user_id"],
                 ),
@@ -1985,13 +2246,13 @@ async def delete_user_dynamic_prompt_template(template_id: str, user: dict = Dep
     return JSONResponse(content={"success": True})
 
 
-@app.post("/user/dynamic-prompts/templates/{template_id}/submit")
-async def submit_user_dynamic_prompt_template(template_id: str, user: dict = Depends(require_auth)):
+@app.post("/user/dynamic-prompts/templates/{template_id}/share")
+async def share_user_dynamic_prompt_template(template_id: str, user: dict = Depends(require_auth)):
     existing = await _fetch_community_template(template_id, viewer_user_id=user["user_id"], owner_user_id=user["user_id"])
     if not existing:
         raise HTTPException(status_code=404, detail="Template not found.")
-    if existing["status"] not in COMMUNITY_TEMPLATE_EDITABLE_STATUSES:
-        raise HTTPException(status_code=409, detail="Only private or rejected templates can be submitted for review.")
+    if existing["status"] not in COMMUNITY_TEMPLATE_MUTABLE_STATUSES:
+        raise HTTPException(status_code=409, detail="This template can no longer be shared.")
 
     preview_samples = (await _validate_community_dynamic_prompt_template(
         existing["title"],
@@ -2006,15 +2267,42 @@ async def submit_user_dynamic_prompt_template(template_id: str, user: dict = Dep
             await acur.execute(
                 """
                 UPDATE dynamic_prompt.templates
-                SET status = 'pending', rejection_reason = NULL, submitted_at = NOW(), updated_at = NOW()
-                WHERE id = %s AND user_id = %s
+                SET status = 'approved', rejection_reason = NULL, submitted_at = NULL, approved_at = COALESCE(approved_at, NOW()), updated_at = NOW()
+                WHERE id = %s AND user_id = %s AND status <> 'hidden'
                 """,
                 (template_id, user["user_id"]),
             )
             await aconn.commit()
 
-    submitted = await _fetch_community_template(template_id, viewer_user_id=user["user_id"], owner_user_id=user["user_id"])
-    return JSONResponse(content={"template": submitted, "preview_samples": preview_samples})
+    shared = await _fetch_community_template(template_id, viewer_user_id=user["user_id"], owner_user_id=user["user_id"])
+    return JSONResponse(content={"template": shared, "preview_samples": preview_samples})
+
+
+@app.post("/user/dynamic-prompts/templates/{template_id}/unshare")
+async def unshare_user_dynamic_prompt_template(template_id: str, user: dict = Depends(require_auth)):
+    existing = await _fetch_community_template(template_id, viewer_user_id=user["user_id"], owner_user_id=user["user_id"])
+    if not existing:
+        raise HTTPException(status_code=404, detail="Template not found.")
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                UPDATE dynamic_prompt.templates
+                SET status = 'private', rejection_reason = NULL, submitted_at = NULL, approved_at = NULL, updated_at = NOW()
+                WHERE id = %s AND user_id = %s AND status = 'approved'
+                """,
+                (template_id, user["user_id"]),
+            )
+            await aconn.commit()
+
+    unshared = await _fetch_community_template(template_id, viewer_user_id=user["user_id"], owner_user_id=user["user_id"])
+    return JSONResponse(content={"template": unshared})
+
+
+@app.post("/user/dynamic-prompts/templates/{template_id}/submit")
+async def submit_user_dynamic_prompt_template(template_id: str, user: dict = Depends(require_auth)):
+    return await share_user_dynamic_prompt_template(template_id, user)
 
 
 @app.get("/dynamic-prompts/templates")
@@ -2325,11 +2613,41 @@ async def submit_job(
 
     dynamic_prompt_template: Optional[str] = None
     dynamic_expanded_prompt: Optional[str] = None
-    dynamic_prompt_config = job_data.dynamic_prompting
-    if dynamic_prompt_config and dynamic_prompt_config.enabled:
-        dynamic_prompt_template = dynamic_prompt_config.template or job_data.prompt
+    dynamic_prompt_candidate = str(
+        (job_data.dynamic_prompting.template if job_data.dynamic_prompting and job_data.dynamic_prompting.template else job_data.prompt)
+        or ""
+    )
+    should_try_dynamic_prompt = bool(
+        (job_data.dynamic_prompting and job_data.dynamic_prompting.enabled)
+        or _has_dynamic_prompt_syntax(dynamic_prompt_candidate)
+    )
+    allowed_wildcards: set[str] = set()
+    if should_try_dynamic_prompt:
+        dynamic_prompt_assets = await _load_dynamic_prompt_assets(user_id=user["user_id"] if user else None)
+        allowed_wildcards = _allowed_dynamic_prompt_wildcard_ids(dynamic_prompt_assets)
+        resolved_dynamic_prompt = _resolve_dynamic_prompt_request(
+            job_data.prompt,
+            job_data.dynamic_prompting,
+            allowed_wildcards,
+        )
+    else:
+        dynamic_prompt_assets = None
+        resolved_dynamic_prompt = None
+
+    if resolved_dynamic_prompt and dynamic_prompt_assets:
+        dynamic_prompt_template, dynamic_prompt_config = resolved_dynamic_prompt
+        unknown_wildcards = [
+            wildcard
+            for wildcard in _extract_dynamic_prompt_wildcard_ids(dynamic_prompt_template)
+            if wildcard not in allowed_wildcards
+        ]
+        if unknown_wildcards:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown wildcard token: __{unknown_wildcards[0]}__",
+            )
+        job_data.dynamic_prompting = dynamic_prompt_config
         try:
-            dynamic_prompt_assets = await _load_dynamic_prompt_assets(user_id=user["user_id"] if user else None)
             expansion = expand_dynamic_prompt(
                 dynamic_prompt_template,
                 _dynamic_config_dict(dynamic_prompt_config),
@@ -4719,15 +5037,15 @@ async def admin_update_dynamic_prompt_library(
 
 @app.get("/admin/dynamic-prompts/templates")
 async def admin_list_dynamic_prompt_templates(
-    status: str = "pending",
+    status: str = "approved",
     user: dict = Depends(require_admin),
 ):
     normalized_status = status.strip().lower()
-    if normalized_status != "all" and normalized_status not in COMMUNITY_TEMPLATE_STATUSES:
+    if normalized_status != "all" and normalized_status not in ADMIN_COMMUNITY_TEMPLATE_STATUSES:
         raise HTTPException(status_code=400, detail="Invalid template status filter.")
 
     params: List[Any] = []
-    where_clause = ""
+    where_clause = " WHERE t.status <> 'private'"
     if normalized_status != "all":
         where_clause = " WHERE t.status = %s"
         params.append(normalized_status)
@@ -4752,6 +5070,39 @@ async def admin_list_dynamic_prompt_templates(
         templates.append(item)
 
     return JSONResponse(content={"templates": templates, "status": normalized_status})
+
+
+@app.get("/admin/dynamic-prompts/categories")
+async def admin_list_dynamic_prompt_categories(
+    status: str = "public",
+    user: dict = Depends(require_admin),
+):
+    normalized_status = status.strip().lower()
+    if normalized_status != "all" and normalized_status not in ADMIN_CUSTOM_CATEGORY_STATUSES:
+        raise HTTPException(status_code=400, detail="Invalid category status filter.")
+
+    params: List[Any] = []
+    where_clause = " WHERE c.status <> 'private'"
+    if normalized_status != "all":
+        where_clause = " WHERE c.status = %s"
+        params.append(normalized_status)
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                _custom_category_select_sql(None)
+                + where_clause
+                + " ORDER BY c.updated_at DESC LIMIT 200",
+                tuple(params),
+            )
+            rows = await acur.fetchall()
+
+    return JSONResponse(
+        content={
+            "categories": [_custom_category_response(row) for row in rows],
+            "status": normalized_status,
+        }
+    )
 
 
 @app.post("/admin/dynamic-prompts/templates/{template_id}/approve")
@@ -4820,13 +5171,21 @@ async def admin_reject_dynamic_prompt_template(
 
 @app.post("/admin/dynamic-prompts/templates/{template_id}/hide")
 async def admin_hide_dynamic_prompt_template(template_id: str, user: dict = Depends(require_admin)):
+    existing = await _fetch_community_template(template_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Template not found.")
+    if existing["status"] == "private":
+        raise HTTPException(status_code=409, detail="Private templates cannot be moderated.")
+    if existing["status"] == "hidden":
+        raise HTTPException(status_code=409, detail="Template is already hidden.")
+
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
                 UPDATE dynamic_prompt.templates
                 SET status = 'hidden', hidden_at = NOW(), updated_at = NOW()
-                WHERE id = %s AND status <> 'hidden'
+                WHERE id = %s AND status IN ('pending', 'approved', 'rejected')
                 RETURNING id
                 """,
                 (template_id,),
@@ -4838,6 +5197,98 @@ async def admin_hide_dynamic_prompt_template(template_id: str, user: dict = Depe
 
     hidden = await _fetch_community_template(template_id)
     return JSONResponse(content={"template": hidden})
+
+
+@app.post("/admin/dynamic-prompts/templates/{template_id}/restore")
+async def admin_restore_dynamic_prompt_template(template_id: str, user: dict = Depends(require_admin)):
+    existing = await _fetch_community_template(template_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Template not found.")
+    if existing["status"] != "hidden":
+        raise HTTPException(status_code=409, detail="Only hidden templates can be restored.")
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                UPDATE dynamic_prompt.templates
+                SET status = CASE
+                        WHEN approved_at IS NOT NULL THEN 'approved'
+                        WHEN rejection_reason IS NOT NULL THEN 'rejected'
+                        ELSE 'pending'
+                    END,
+                    hidden_at = NULL,
+                    updated_at = NOW()
+                WHERE id = %s AND status = 'hidden'
+                RETURNING id
+                """,
+                (template_id,),
+            )
+            row = await acur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Hidden template not found.")
+            await aconn.commit()
+
+    restored = await _fetch_community_template(template_id)
+    return JSONResponse(content={"template": restored})
+
+
+@app.post("/admin/dynamic-prompts/categories/{category_id}/hide")
+async def admin_hide_dynamic_prompt_category(category_id: str, user: dict = Depends(require_admin)):
+    existing = await _fetch_custom_category(category_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Category not found.")
+    if existing["status"] == "private":
+        raise HTTPException(status_code=409, detail="Private categories cannot be moderated.")
+    if existing["status"] == "hidden":
+        raise HTTPException(status_code=409, detail="Category is already hidden.")
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                UPDATE dynamic_prompt.custom_categories
+                SET status = 'hidden', updated_at = NOW()
+                WHERE id = %s AND status = 'public'
+                RETURNING id
+                """,
+                (category_id,),
+            )
+            row = await acur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Shared category not found.")
+            await aconn.commit()
+
+    hidden = await _fetch_custom_category(category_id)
+    return JSONResponse(content={"category": hidden})
+
+
+@app.post("/admin/dynamic-prompts/categories/{category_id}/restore")
+async def admin_restore_dynamic_prompt_category(category_id: str, user: dict = Depends(require_admin)):
+    existing = await _fetch_custom_category(category_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Category not found.")
+    if existing["status"] != "hidden":
+        raise HTTPException(status_code=409, detail="Only hidden categories can be restored.")
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                UPDATE dynamic_prompt.custom_categories
+                SET status = 'public', updated_at = NOW()
+                WHERE id = %s AND status = 'hidden'
+                RETURNING id
+                """,
+                (category_id,),
+            )
+            row = await acur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Hidden category not found.")
+            await aconn.commit()
+
+    restored = await _fetch_custom_category(category_id)
+    return JSONResponse(content={"category": restored})
 
 
 async def resolve_civitai_model_link(version_id: int) -> str:
