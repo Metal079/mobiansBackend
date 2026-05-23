@@ -1875,8 +1875,7 @@ async def delete_user_dynamic_prompt_category(category_id: str, user: dict = Dep
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
-                UPDATE dynamic_prompt.custom_categories
-                SET status = 'hidden', updated_at = NOW()
+                DELETE FROM dynamic_prompt.custom_categories
                 WHERE id = %s AND user_id = %s
                 """,
                 (category_id, user["user_id"]),
@@ -2236,8 +2235,7 @@ async def delete_user_dynamic_prompt_template(template_id: str, user: dict = Dep
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
-                UPDATE dynamic_prompt.templates
-                SET status = 'hidden', hidden_at = NOW(), updated_at = NOW()
+                DELETE FROM dynamic_prompt.templates
                 WHERE id = %s AND user_id = %s
                 """,
                 (template_id, user["user_id"]),
