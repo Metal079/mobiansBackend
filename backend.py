@@ -802,6 +802,15 @@ CUSTOM_CATEGORY_TITLE_MAX = 80
 CUSTOM_CATEGORY_DESCRIPTION_MAX = 500
 CUSTOM_CATEGORY_MAX_ENTRIES = 250
 CUSTOM_CATEGORY_ENTRY_MAX = 180
+DYNAMIC_PROMPT_VOTE_CONTENT_TYPES = {"template", "category"}
+DYNAMIC_PROMPT_CREATOR_VOTE_REWARD_CREDITS = 100
+DYNAMIC_PROMPT_VOTER_VOTE_REWARD_CREDITS = 10
+DYNAMIC_PROMPT_TEMPLATE_VOTER_DAILY_CAP = 5
+DYNAMIC_PROMPT_CATEGORY_VOTER_DAILY_CAP = 5
+DYNAMIC_PROMPT_TEMPLATE_CREATOR_TRANSACTION_TYPE = "dynamic_template_vote_received"
+DYNAMIC_PROMPT_TEMPLATE_VOTER_TRANSACTION_TYPE = "dynamic_template_vote_given"
+DYNAMIC_PROMPT_CATEGORY_CREATOR_TRANSACTION_TYPE = "dynamic_category_vote_received"
+DYNAMIC_PROMPT_CATEGORY_VOTER_TRANSACTION_TYPE = "dynamic_category_vote_given"
 
 
 class JobData(BaseModel):
@@ -1681,6 +1690,158 @@ async def _community_template_preview_samples(template: str, user_id: Optional[s
     return preview.previews
 
 
+async def _award_credit_transaction(
+    acur: Any,
+    user_id: str,
+    amount: int,
+    transaction_type: str,
+    description: str,
+) -> Dict[str, Any]:
+    await acur.execute(
+        """
+        UPDATE public.users
+        SET credits = credits + %s
+        WHERE id = %s
+        RETURNING credits
+        """,
+        (amount, user_id),
+    )
+    balance_row = await acur.fetchone()
+    if not balance_row:
+        raise HTTPException(status_code=404, detail="User not found while awarding credits.")
+
+    balance_after = balance_row[0]
+    await acur.execute(
+        """
+        INSERT INTO public.credit_transactions (user_id, amount, balance_after, transaction_type, description)
+        VALUES (%s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (user_id, amount, balance_after, transaction_type, description),
+    )
+    transaction_row = await acur.fetchone()
+    if not transaction_row:
+        raise HTTPException(status_code=500, detail="Credit transaction was not recorded.")
+
+    return {
+        "transaction_id": transaction_row[0],
+        "balance_after": balance_after,
+    }
+
+
+async def _award_dynamic_prompt_vote_rewards(
+    acur: Any,
+    content_type: str,
+    content_id: str,
+    content_title: str,
+    creator_user_id: str,
+    voter_user_id: str,
+) -> Dict[str, Any]:
+    if content_type not in DYNAMIC_PROMPT_VOTE_CONTENT_TYPES:
+        raise ValueError(f"Unsupported dynamic prompt vote content type: {content_type}")
+
+    await acur.execute(
+        """
+        INSERT INTO dynamic_prompt.vote_credit_rewards (content_type, content_id, voter_user_id, creator_user_id)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT DO NOTHING
+        RETURNING id
+        """,
+        (content_type, content_id, voter_user_id, creator_user_id),
+    )
+    reward_row = await acur.fetchone()
+    if not reward_row:
+        return {
+            "creator_credits_awarded": 0,
+            "voter_credits_awarded": 0,
+            "voter_balance_after": None,
+            "voter_reward_skipped_reason": "already_rewarded",
+        }
+
+    reward_id = reward_row[0]
+    for lock_user_id in sorted({str(creator_user_id), str(voter_user_id)}):
+        await acur.execute(
+            "SELECT id FROM public.users WHERE id = %s FOR UPDATE",
+            (lock_user_id,),
+        )
+        if not await acur.fetchone():
+            raise HTTPException(status_code=404, detail="User not found while locking credit reward rows.")
+
+    if content_type == "template":
+        creator_transaction_type = DYNAMIC_PROMPT_TEMPLATE_CREATOR_TRANSACTION_TYPE
+        voter_transaction_type = DYNAMIC_PROMPT_TEMPLATE_VOTER_TRANSACTION_TYPE
+        voter_daily_cap = DYNAMIC_PROMPT_TEMPLATE_VOTER_DAILY_CAP
+        content_label = "template"
+    else:
+        creator_transaction_type = DYNAMIC_PROMPT_CATEGORY_CREATOR_TRANSACTION_TYPE
+        voter_transaction_type = DYNAMIC_PROMPT_CATEGORY_VOTER_TRANSACTION_TYPE
+        voter_daily_cap = DYNAMIC_PROMPT_CATEGORY_VOTER_DAILY_CAP
+        content_label = "category"
+
+    creator_award = await _award_credit_transaction(
+        acur,
+        creator_user_id,
+        DYNAMIC_PROMPT_CREATOR_VOTE_REWARD_CREDITS,
+        creator_transaction_type,
+        f'Vote received on dynamic prompt {content_label} "{content_title}"',
+    )
+
+    await acur.execute(
+        """
+        SELECT COUNT(*)
+        FROM public.credit_transactions
+        WHERE user_id = %s
+          AND transaction_type = %s
+          AND created_at >= CURRENT_DATE
+          AND created_at < CURRENT_DATE + INTERVAL '1 day'
+        """,
+        (voter_user_id, voter_transaction_type),
+    )
+    voter_reward_count_row = await acur.fetchone()
+    voter_reward_count_today = int(voter_reward_count_row[0] or 0) if voter_reward_count_row else 0
+
+    voter_award_transaction_id = None
+    voter_balance_after = None
+    voter_credits_awarded = 0
+    voter_reward_skipped_reason = None
+    if voter_reward_count_today < voter_daily_cap:
+        voter_award = await _award_credit_transaction(
+            acur,
+            voter_user_id,
+            DYNAMIC_PROMPT_VOTER_VOTE_REWARD_CREDITS,
+            voter_transaction_type,
+            f'Vote reward for dynamic prompt {content_label} "{content_title}"',
+        )
+        voter_award_transaction_id = voter_award["transaction_id"]
+        voter_balance_after = voter_award["balance_after"]
+        voter_credits_awarded = DYNAMIC_PROMPT_VOTER_VOTE_REWARD_CREDITS
+    else:
+        voter_reward_skipped_reason = "daily_cap_reached"
+
+    await acur.execute(
+        """
+        UPDATE dynamic_prompt.vote_credit_rewards
+        SET creator_credit_transaction_id = %s,
+            voter_credit_transaction_id = %s,
+            voter_reward_skipped_reason = %s
+        WHERE id = %s
+        """,
+        (
+            creator_award["transaction_id"],
+            voter_award_transaction_id,
+            voter_reward_skipped_reason,
+            reward_id,
+        ),
+    )
+
+    return {
+        "creator_credits_awarded": DYNAMIC_PROMPT_CREATOR_VOTE_REWARD_CREDITS,
+        "voter_credits_awarded": voter_credits_awarded,
+        "voter_balance_after": voter_balance_after,
+        "voter_reward_skipped_reason": voter_reward_skipped_reason,
+    }
+
+
 def _expand_regional_dynamic_prompts(
     regional_prompting: Optional[Dict[str, Any]],
     config: DynamicPromptingConfig,
@@ -2007,6 +2168,7 @@ async def upvote_dynamic_prompt_category(category_id: str, user: dict = Depends(
     if category["user_id"] == user["user_id"]:
         raise HTTPException(status_code=400, detail="You cannot upvote your own category.")
 
+    vote_reward = None
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
@@ -2024,10 +2186,21 @@ async def upvote_dynamic_prompt_category(category_id: str, user: dict = Depends(
                     "UPDATE dynamic_prompt.custom_categories SET upvote_count = upvote_count + 1, updated_at = NOW() WHERE id = %s",
                     (category_id,),
                 )
+                vote_reward = await _award_dynamic_prompt_vote_rewards(
+                    acur,
+                    "category",
+                    category_id,
+                    category["title"],
+                    category["user_id"],
+                    user["user_id"],
+                )
             await aconn.commit()
 
     updated = await _fetch_custom_category(category_id, viewer_user_id=user["user_id"], public_only=True)
-    return JSONResponse(content={"category": updated})
+    response_content = {"category": updated}
+    if vote_reward:
+        response_content["vote_reward"] = vote_reward
+    return JSONResponse(content=response_content)
 
 
 @app.delete("/dynamic-prompts/categories/{category_id}/upvote")
@@ -2431,6 +2604,7 @@ async def upvote_dynamic_prompt_template(template_id: str, user: dict = Depends(
     if template["user_id"] == user["user_id"]:
         raise HTTPException(status_code=400, detail="You cannot upvote your own template.")
 
+    vote_reward = None
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
@@ -2448,10 +2622,21 @@ async def upvote_dynamic_prompt_template(template_id: str, user: dict = Depends(
                     "UPDATE dynamic_prompt.templates SET upvote_count = upvote_count + 1, updated_at = NOW() WHERE id = %s",
                     (template_id,),
                 )
+                vote_reward = await _award_dynamic_prompt_vote_rewards(
+                    acur,
+                    "template",
+                    template_id,
+                    template["title"],
+                    template["user_id"],
+                    user["user_id"],
+                )
             await aconn.commit()
 
     updated = await _fetch_community_template(template_id, viewer_user_id=user["user_id"], public_only=True)
-    return JSONResponse(content={"template": updated})
+    response_content = {"template": updated}
+    if vote_reward:
+        response_content["vote_reward"] = vote_reward
+    return JSONResponse(content=response_content)
 
 
 @app.delete("/dynamic-prompts/templates/{template_id}/upvote")
