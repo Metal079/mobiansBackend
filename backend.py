@@ -744,6 +744,7 @@ class DynamicPromptAdminStarterTemplateUpdate(BaseModel):
     id: str
     name: str
     description: Optional[str] = ""
+    token: Optional[str] = None
     template: str
     display_order: Optional[int] = 0
     is_active: Optional[bool] = True
@@ -949,7 +950,7 @@ async def _load_dynamic_prompt_assets(
 
                 await acur.execute(
                     f"""
-                    SELECT id, name, description, template, display_order, is_active
+                    SELECT id, name, description, token, template, display_order, is_active
                     FROM dynamic_prompt.starter_templates
                     WHERE wildcard_set = %s {starter_active_clause}
                     ORDER BY display_order, name
@@ -1046,9 +1047,10 @@ async def _load_dynamic_prompt_assets(
             "id": row[0],
             "name": row[1],
             "description": row[2],
-            "template": row[3],
-            "display_order": row[4],
-            "is_active": bool(row[5]),
+            "token": row[3] or _starter_template_token(row[0]),
+            "template": row[4],
+            "display_order": row[5],
+            "is_active": bool(row[6]),
         }
         for row in starter_rows
     ]
@@ -1057,6 +1059,7 @@ async def _load_dynamic_prompt_assets(
             "id": starter["id"],
             "name": starter["name"],
             "description": starter["description"],
+            "token": starter["token"],
             "template": starter["template"],
         }
         for starter in starter_templates
@@ -1104,16 +1107,25 @@ def _has_dynamic_prompt_variant_syntax(template: str) -> bool:
 def _has_dynamic_prompt_syntax(template: str, allowed_wildcards: Optional[set[str]] = None) -> bool:
     if _has_dynamic_prompt_variant_syntax(template):
         return True
-    wildcard_ids = _extract_dynamic_prompt_wildcard_ids(template)
-    if not wildcard_ids:
-        return False
-    if allowed_wildcards is None:
-        return True
-    return any(wildcard_id in allowed_wildcards for wildcard_id in wildcard_ids)
+    category_ids = _extract_dynamic_prompt_wildcard_ids(template)
+    if category_ids:
+        if allowed_wildcards is None:
+            return True
+        if any(category_id in allowed_wildcards for category_id in category_ids):
+            return True
+    return bool(_extract_dynamic_prompt_template_ids(template))
 
 
 def _extract_dynamic_prompt_wildcard_ids(template: str) -> List[str]:
+    return sorted(set(re.findall(r"(?<!_)_([A-Za-z0-9](?:[-\w/]*[A-Za-z0-9])?)_(?!_)", template)))
+
+
+def _extract_dynamic_prompt_template_ids(template: str) -> List[str]:
     return sorted(set(re.findall(r"__([-\w/]+)__", template)))
+
+
+def _category_tokens_to_engine_wildcards(template: str) -> str:
+    return re.sub(r"(?<!_)_([A-Za-z0-9](?:[-\w/]*[A-Za-z0-9])?)_(?!_)", r"__\1__", template)
 
 
 def _allowed_dynamic_prompt_wildcard_ids(assets: Dict[str, Any]) -> set[str]:
@@ -1149,6 +1161,91 @@ def _resolve_dynamic_prompt_request(
     return None
 
 
+async def _resolve_dynamic_prompt_template_tokens(
+    template: str,
+    user_id: Optional[str],
+    assets: Dict[str, Any],
+) -> str:
+    template_ids = _extract_dynamic_prompt_template_ids(template)
+    if not template_ids:
+        return template
+
+    templates_by_id: Dict[str, str] = {}
+    for starter in assets.get("library", {}).get("starter_templates", []):
+        starter_token = str(starter.get("token") or _starter_template_token(str(starter.get("id") or ""))).strip()
+        starter_id = _wildcard_id_from_token(starter_token)
+        if starter_id in template_ids:
+            templates_by_id[starter_id] = str(starter.get("template") or "").strip()
+
+    missing_ids = [template_id for template_id in template_ids if template_id not in templates_by_id]
+    if missing_ids and db_pool is not None:
+        try:
+            async with db_pool.connection() as aconn:
+                async with aconn.cursor() as acur:
+                    await acur.execute(
+                        """
+                        SELECT token, template
+                        FROM dynamic_prompt.templates
+                        WHERE token = ANY(%s)
+                          AND status <> 'hidden'
+                          AND (status = 'approved' OR user_id = %s)
+                        """,
+                        ([f"__{template_id}__" for template_id in missing_ids], user_id),
+                    )
+                    for token, template_body in await acur.fetchall():
+                        templates_by_id[_wildcard_id_from_token(token)] = str(template_body or "").strip()
+        except (errors.InvalidSchemaName, errors.UndefinedTable, errors.UndefinedColumn) as exc:
+            logging.warning("Dynamic prompt template tokens are unavailable: %s", exc)
+
+    unresolved_ids = [template_id for template_id in template_ids if template_id not in templates_by_id]
+    if unresolved_ids:
+        raise HTTPException(status_code=400, detail=f"Unknown template token: __{unresolved_ids[0]}__")
+
+    for template_id, template_body in templates_by_id.items():
+        nested_ids = _extract_dynamic_prompt_template_ids(template_body)
+        if nested_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Template token __{template_id}__ cannot contain another template token.",
+            )
+
+    def replace_template_token(match: re.Match[str]) -> str:
+        template_id = match.group(1)
+        return templates_by_id.get(template_id, match.group(0))
+
+    return re.sub(r"__([-\w/]+)__", replace_template_token, template)
+
+
+async def _prepare_dynamic_prompt_template_for_expansion(
+    template: str,
+    user_id: Optional[str],
+    assets: Dict[str, Any],
+    allow_template_tokens: bool = True,
+) -> str:
+    clean_template = str(template or "").strip()
+    template_ids = _extract_dynamic_prompt_template_ids(clean_template)
+    if template_ids and not allow_template_tokens:
+        raise HTTPException(
+            status_code=400,
+            detail="Templates can include categories and variants, but not other template tokens.",
+        )
+
+    resolved_template = clean_template
+    if template_ids:
+        resolved_template = await _resolve_dynamic_prompt_template_tokens(clean_template, user_id, assets)
+
+    allowed_wildcards = _allowed_dynamic_prompt_wildcard_ids(assets)
+    unknown_wildcards = [
+        wildcard
+        for wildcard in _extract_dynamic_prompt_wildcard_ids(resolved_template)
+        if wildcard not in allowed_wildcards
+    ]
+    if unknown_wildcards:
+        raise HTTPException(status_code=400, detail=f"Unknown category token: _{unknown_wildcards[0]}_")
+
+    return _category_tokens_to_engine_wildcards(resolved_template)
+
+
 def _normalize_community_template_tags(tags: Optional[List[str]]) -> List[str]:
     normalized: List[str] = []
     for raw_tag in tags or []:
@@ -1172,6 +1269,7 @@ def _normalize_community_template_tags(tags: Optional[List[str]]) -> List[str]:
 
 
 CUSTOM_CATEGORY_SLUG_MAX = 56
+CUSTOM_TEMPLATE_SLUG_MAX = 56
 CUSTOM_CATEGORY_NAMESPACE_MAX = 32
 RESERVED_DYNAMIC_PROMPT_NAMESPACES = {
     "admin",
@@ -1197,6 +1295,10 @@ def _dynamic_prompt_slug_part(value: Any, max_length: int, fallback: str) -> str
 
 def _custom_category_slug(title: str) -> str:
     return _dynamic_prompt_slug_part(title, CUSTOM_CATEGORY_SLUG_MAX, "category")
+
+
+def _custom_template_slug(title: str) -> str:
+    return _dynamic_prompt_slug_part(title, CUSTOM_TEMPLATE_SLUG_MAX, "template")
 
 
 def _custom_category_id_suffix(category_id: str, length: int = 12) -> str:
@@ -1250,11 +1352,21 @@ def _custom_category_namespace_slug(user: Optional[Dict[str, Any]]) -> str:
 def _custom_category_token_from_parts(namespace: str, slug: str) -> str:
     namespace_slug = _dynamic_prompt_slug_part(namespace, CUSTOM_CATEGORY_NAMESPACE_MAX, "user")
     category_slug = _custom_category_slug(slug)
-    return f"__{namespace_slug}/{category_slug}__"
+    return f"_{namespace_slug}/{category_slug}_"
+
+
+def _template_token_from_parts(namespace: str, slug: str) -> str:
+    namespace_slug = _dynamic_prompt_slug_part(namespace, CUSTOM_CATEGORY_NAMESPACE_MAX, "user")
+    template_slug = _custom_template_slug(slug)
+    return f"__{namespace_slug}/{template_slug}__"
+
+
+def _starter_template_token(starter_id: str) -> str:
+    return _template_token_from_parts("mobian", starter_id)
 
 
 def _legacy_custom_category_token(category_id: str) -> str:
-    return f"__custom/{category_id}__"
+    return f"_custom/{category_id}_"
 
 
 def _custom_category_token(category_id: str, title: Optional[str] = None, namespace: str = "custom") -> str:
@@ -1279,7 +1391,7 @@ async def _custom_category_namespace_for_user(acur: Any, user: Dict[str, Any]) -
         """
         SELECT token
         FROM dynamic_prompt.custom_categories
-        WHERE user_id = %s AND token !~ '^__custom/'
+        WHERE user_id = %s AND token !~ '^_custom/'
         ORDER BY created_at ASC, id ASC
         LIMIT 1
         """,
@@ -1296,10 +1408,10 @@ async def _custom_category_namespace_for_user(acur: Any, user: Dict[str, Any]) -
             """
             SELECT 1
             FROM dynamic_prompt.custom_categories
-            WHERE user_id <> %s AND token LIKE %s
+            WHERE user_id <> %s AND token LIKE %s ESCAPE '\\'
             LIMIT 1
             """,
-            (user_id, f"__{namespace}/%"),
+            (user_id, f"\\_{namespace}/%"),
         )
         if not await acur.fetchone():
             return namespace
@@ -1347,6 +1459,60 @@ async def _generate_unique_custom_category_token(
             return candidate
 
     raise HTTPException(status_code=500, detail="Unable to create a unique category token.")
+
+
+async def _generate_unique_template_token(
+    acur: Any,
+    title: str,
+    template_id: str,
+    user: Dict[str, Any],
+    exclude_template_id: Optional[str] = None,
+) -> str:
+    namespace = _custom_category_namespace_slug(user)
+    base_slug = _custom_template_slug(title)
+    id_suffix = _custom_category_id_suffix(template_id)
+    candidate_slugs = [base_slug, f"{base_slug}-{id_suffix}"]
+    candidate_slugs.extend(f"{base_slug}-{id_suffix}-{index}" for index in range(2, 100))
+
+    for slug in candidate_slugs:
+        candidate = _template_token_from_parts(namespace, slug)
+        await acur.execute(
+            """
+            SELECT 1
+            FROM dynamic_prompt.starter_templates
+            WHERE token = %s
+            LIMIT 1
+            """,
+            (candidate,),
+        )
+        if await acur.fetchone():
+            continue
+
+        if exclude_template_id:
+            await acur.execute(
+                """
+                SELECT 1
+                FROM dynamic_prompt.templates
+                WHERE id <> %s
+                  AND token = %s
+                LIMIT 1
+                """,
+                (exclude_template_id, candidate),
+            )
+        else:
+            await acur.execute(
+                """
+                SELECT 1
+                FROM dynamic_prompt.templates
+                WHERE token = %s
+                LIMIT 1
+                """,
+                (candidate,),
+            )
+        if not await acur.fetchone():
+            return candidate
+
+    raise HTTPException(status_code=500, detail="Unable to create a unique template token.")
 
 
 async def _resolve_updated_custom_category_token(
@@ -1549,21 +1715,23 @@ async def _validate_community_dynamic_prompt_template(
     if not clean_template:
         raise HTTPException(status_code=400, detail="Dynamic prompt template is required.")
 
+    if _extract_dynamic_prompt_template_ids(clean_template):
+        raise HTTPException(status_code=400, detail="Templates can include categories and variants, but not other template tokens.")
+
     if not _has_dynamic_prompt_syntax(clean_template):
-        raise HTTPException(status_code=400, detail="Template must include dynamic prompt syntax such as __mobian/characters__ or {a|b}.")
+        raise HTTPException(status_code=400, detail="Template must include dynamic prompt syntax such as _mobian/characters_ or {a|b}.")
 
     assets = await _load_dynamic_prompt_assets(user_id=user_id)
-    allowed_wildcards = _allowed_dynamic_prompt_wildcard_ids(assets)
-    unknown_wildcards = [wildcard for wildcard in _extract_dynamic_prompt_wildcard_ids(clean_template) if wildcard not in allowed_wildcards]
-    if unknown_wildcards:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown wildcard token: __{unknown_wildcards[0]}__",
-        )
+    engine_template = await _prepare_dynamic_prompt_template_for_expansion(
+        clean_template,
+        user_id,
+        assets,
+        allow_template_tokens=False,
+    )
 
     try:
         preview = preview_dynamic_prompt(
-            template=clean_template,
+            template=engine_template,
             seed=COMMUNITY_TEMPLATE_PREVIEW_SEED,
             preview_count=DEFAULT_PREVIEW_COUNT,
             max_generations=32,
@@ -1588,6 +1756,7 @@ def _community_template_response(row: Any, preview_samples: Optional[List[str]] 
         "title": row[2],
         "description": row[3] or "",
         "template": row[4],
+        "token": row[22] if len(row) > 22 and row[22] else _template_token_from_parts("user", row[2]),
         "tags": list(row[5] or []),
         "status": row[6],
         "rejection_reason": row[7],
@@ -1643,6 +1812,7 @@ def _community_template_select_sql(viewer_user_id: Optional[str] = None) -> str:
                     'Mobians user'
                 )
             END AS source_author_display_name
+            , t.token
         FROM dynamic_prompt.templates t
         JOIN users u ON u.id = t.user_id
         LEFT JOIN dynamic_prompt.templates source_t ON source_t.id = t.source_template_id
@@ -1680,8 +1850,14 @@ async def _fetch_community_template(
 
 async def _community_template_preview_samples(template: str, user_id: Optional[str] = None) -> List[str]:
     assets = await _load_dynamic_prompt_assets(user_id=user_id)
+    engine_template = await _prepare_dynamic_prompt_template_for_expansion(
+        template,
+        user_id,
+        assets,
+        allow_template_tokens=False,
+    )
     preview = preview_dynamic_prompt(
-        template=template,
+        template=engine_template,
         seed=COMMUNITY_TEMPLATE_PREVIEW_SEED,
         preview_count=DEFAULT_PREVIEW_COUNT,
         max_generations=32,
@@ -1869,14 +2045,18 @@ def _expand_regional_dynamic_prompts(
         if prompt:
             region_config = dict(base_config)
             region_config["expansion_seed"] = seed + 1009 + (region_index * 17)
-            region["prompt"] = expand_dynamic_prompt(prompt, region_config, wildcard_root_map=root_map).expanded_prompt
+            region["prompt"] = expand_dynamic_prompt(
+                _category_tokens_to_engine_wildcards(prompt),
+                region_config,
+                wildcard_root_map=root_map,
+            ).expanded_prompt
 
         negative_prompt = str(region.get("negative_prompt", "")).strip()
         if negative_prompt:
             negative_config = dict(base_config)
             negative_config["expansion_seed"] = seed + 2009 + (region_index * 17)
             region["negative_prompt"] = expand_dynamic_prompt(
-                negative_prompt,
+                _category_tokens_to_engine_wildcards(negative_prompt),
                 negative_config,
                 wildcard_root_map=root_map,
             ).expanded_prompt
@@ -1897,8 +2077,13 @@ async def dynamic_prompt_preview(
 ):
     try:
         assets = await _load_dynamic_prompt_assets(user_id=user["user_id"] if user else None)
+        engine_template = await _prepare_dynamic_prompt_template_for_expansion(
+            request.template,
+            user["user_id"] if user else None,
+            assets,
+        )
         preview = preview_dynamic_prompt(
-            template=request.template,
+            template=engine_template,
             mode=request.mode,
             seed=request.seed,
             preview_count=DEFAULT_PREVIEW_COUNT,
@@ -1910,7 +2095,7 @@ async def dynamic_prompt_preview(
 
     return JSONResponse(
         content={
-            "template": preview.template,
+            "template": str(request.template or "").strip(),
             "previews": preview.previews,
             "seed": preview.seed,
             "mode": preview.mode,
@@ -2340,17 +2525,21 @@ async def create_user_dynamic_prompt_template(
 
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
+            template_id = str(uuid.uuid4())
+            template_token = await _generate_unique_template_token(acur, validated["title"], template_id, user)
             await acur.execute(
                 """
-                INSERT INTO dynamic_prompt.templates (user_id, title, description, template, tags, status)
-                VALUES (%s, %s, %s, %s, %s, 'private')
+                INSERT INTO dynamic_prompt.templates (id, user_id, title, description, template, token, tags, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'private')
                 RETURNING id
                 """,
                 (
+                    template_id,
                     user["user_id"],
                     validated["title"],
                     validated["description"],
                     validated["template"],
+                    template_token,
                     validated["tags"],
                 ),
             )
@@ -2393,6 +2582,16 @@ async def update_user_dynamic_prompt_template(
 
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
+            next_token = existing.get("token")
+            if not next_token:
+                next_token = await _generate_unique_template_token(
+                    acur,
+                    validated["title"],
+                    template_id,
+                    user,
+                    exclude_template_id=template_id,
+                )
+
             if should_detach_source_template:
                 await acur.execute(
                     """
@@ -2419,6 +2618,7 @@ async def update_user_dynamic_prompt_template(
                 SET title = %s,
                     description = %s,
                     template = %s,
+                    token = %s,
                     tags = %s,
                     status = %s,
                     rejection_reason = NULL,
@@ -2433,6 +2633,7 @@ async def update_user_dynamic_prompt_template(
                     validated["title"],
                     validated["description"],
                     validated["template"],
+                    next_token,
                     validated["tags"],
                     next_status,
                     next_source_template_id,
@@ -2695,19 +2896,23 @@ async def import_dynamic_prompt_template(template_id: str, user: dict = Depends(
             if existing_import:
                 imported_id = existing_import[0]
             else:
+                imported_id = str(uuid.uuid4())
+                imported_token = await _generate_unique_template_token(acur, template["title"], imported_id, user)
                 await acur.execute(
                     """
                     INSERT INTO dynamic_prompt.templates (
-                        user_id, title, description, template, tags, status,
+                        id, user_id, title, description, template, token, tags, status,
                         source_template_id, source_snapshot_updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, 'private', %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'private', %s, %s)
                     RETURNING id
                     """,
                     (
+                        imported_id,
                         user["user_id"],
                         template["title"],
                         template["description"],
                         template["template"],
+                        imported_token,
                         template["tags"],
                         template_id,
                         template["updated_at"],
@@ -2850,6 +3055,7 @@ async def submit_job(
             )
 
     dynamic_prompt_template: Optional[str] = None
+    dynamic_prompt_engine_template: Optional[str] = None
     dynamic_expanded_prompt: Optional[str] = None
     dynamic_prompt_candidate = str(
         (job_data.dynamic_prompting.template if job_data.dynamic_prompting and job_data.dynamic_prompting.template else job_data.prompt)
@@ -2874,20 +3080,15 @@ async def submit_job(
 
     if resolved_dynamic_prompt and dynamic_prompt_assets:
         dynamic_prompt_template, dynamic_prompt_config = resolved_dynamic_prompt
-        unknown_wildcards = [
-            wildcard
-            for wildcard in _extract_dynamic_prompt_wildcard_ids(dynamic_prompt_template)
-            if wildcard not in allowed_wildcards
-        ]
-        if unknown_wildcards:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown wildcard token: __{unknown_wildcards[0]}__",
-            )
+        dynamic_prompt_engine_template = await _prepare_dynamic_prompt_template_for_expansion(
+            dynamic_prompt_template,
+            user["user_id"] if user else None,
+            dynamic_prompt_assets,
+        )
         job_data.dynamic_prompting = dynamic_prompt_config
         try:
             expansion = expand_dynamic_prompt(
-                dynamic_prompt_template,
+                dynamic_prompt_engine_template,
                 _dynamic_config_dict(dynamic_prompt_config),
                 fallback_seed=job_data.seed,
                 wildcard_root_map=dynamic_prompt_assets["root_map"],
@@ -5186,7 +5387,7 @@ async def admin_update_dynamic_prompt_library(
                 category_id = category.id.strip()
                 if not category_id:
                     continue
-                token = category.token or f"__{category_id}__"
+                token = category.token or f"_{category_id}_"
                 display_order = category.display_order if category.display_order is not None else (index + 1) * 10
                 await acur.execute(
                     """
@@ -5240,16 +5441,18 @@ async def admin_update_dynamic_prompt_library(
                 starter_id = starter.id.strip()
                 if not starter_id or not starter.template.strip():
                     continue
+                token = starter.token or _starter_template_token(starter_id)
                 display_order = starter.display_order if starter.display_order is not None else (index + 1) * 10
                 await acur.execute(
                     """
                     INSERT INTO dynamic_prompt.starter_templates (
-                        id, wildcard_set, name, description, template, display_order, is_active, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                        id, wildcard_set, name, description, token, template, display_order, is_active, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (id) DO UPDATE SET
                         wildcard_set = EXCLUDED.wildcard_set,
                         name = EXCLUDED.name,
                         description = EXCLUDED.description,
+                        token = EXCLUDED.token,
                         template = EXCLUDED.template,
                         display_order = EXCLUDED.display_order,
                         is_active = EXCLUDED.is_active,
@@ -5260,6 +5463,7 @@ async def admin_update_dynamic_prompt_library(
                         WILDCARD_SET_ID,
                         starter.name.strip() or starter_id,
                         starter.description or "",
+                        token,
                         starter.template.strip(),
                         display_order,
                         bool(starter.is_active),
