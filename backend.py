@@ -1595,6 +1595,7 @@ def _community_template_response(row: Any, preview_samples: Optional[List[str]] 
         "has_upvoted": bool(row[18]) if len(row) > 18 else False,
         "has_imported": bool(row[19]) if len(row) > 19 else False,
         "owned_template_id": str(row[20]) if len(row) > 20 and row[20] else None,
+        "source_author_display_name": row[21] if len(row) > 21 else None,
         "preview_samples": preview_samples or [],
     }
 
@@ -1624,9 +1625,19 @@ def _community_template_select_sql(viewer_user_id: Optional[str] = None) -> str:
                 SELECT i.imported_template_id FROM dynamic_prompt.template_imports i
                 WHERE i.original_template_id = t.id AND i.user_id = {viewer_uuid}
                 LIMIT 1
-            ) AS owned_template_id
+            ) AS owned_template_id,
+            CASE
+                WHEN t.source_template_id IS NULL THEN NULL
+                ELSE COALESCE(
+                    NULLIF(CASE WHEN POSITION('@' IN COALESCE(TRIM(source_u.display_name), '')) = 0 THEN TRIM(source_u.display_name) ELSE '' END, ''),
+                    NULLIF(CASE WHEN POSITION('@' IN COALESCE(TRIM(source_u.username), '')) = 0 THEN TRIM(source_u.username) ELSE '' END, ''),
+                    'Mobians user'
+                )
+            END AS source_author_display_name
         FROM dynamic_prompt.templates t
         JOIN users u ON u.id = t.user_id
+        LEFT JOIN dynamic_prompt.templates source_t ON source_t.id = t.source_template_id
+        LEFT JOIN users source_u ON source_u.id = source_t.user_id
     """
 
 
@@ -1889,6 +1900,8 @@ async def share_user_dynamic_prompt_category(category_id: str, user: dict = Depe
     existing = await _fetch_custom_category(category_id, viewer_user_id=user["user_id"], owner_user_id=user["user_id"])
     if not existing:
         raise HTTPException(status_code=404, detail="Category not found.")
+    if existing.get("status") != "public" and existing.get("source_category_id"):
+        raise HTTPException(status_code=400, detail="Imported categories cannot be shared to the community.")
     if not existing["entries"]:
         raise HTTPException(status_code=400, detail="Add at least one prompt idea before sharing.")
 
@@ -2054,6 +2067,10 @@ async def import_dynamic_prompt_category(category_id: str, user: dict = Depends(
     category = await _fetch_custom_category(category_id, viewer_user_id=user["user_id"], public_only=True)
     if not category:
         raise HTTPException(status_code=404, detail="Category not found.")
+    if category.get("user_id") == user["user_id"]:
+        raise HTTPException(status_code=400, detail="You cannot import your own category.")
+    if category.get("source_category_id"):
+        raise HTTPException(status_code=400, detail="Imported community categories cannot be imported again.")
 
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
@@ -2192,9 +2209,37 @@ async def update_user_dynamic_prompt_template(
     )
 
     next_status = "approved" if existing["status"] == "approved" else "private"
+    should_detach_source_template = bool(existing.get("source_template_id")) and (
+        validated["title"] != existing["title"]
+        or validated["description"] != existing["description"]
+        or validated["template"] != existing["template"]
+        or validated["tags"] != existing["tags"]
+    )
+    next_source_template_id = None if should_detach_source_template else existing.get("source_template_id")
+    next_source_snapshot_updated_at = None if should_detach_source_template else existing.get("source_snapshot_updated_at")
 
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
+            if should_detach_source_template:
+                await acur.execute(
+                    """
+                    DELETE FROM dynamic_prompt.template_imports
+                    WHERE imported_template_id = %s AND user_id = %s
+                    RETURNING original_template_id
+                    """,
+                    (template_id, user["user_id"]),
+                )
+                detached_import = await acur.fetchone()
+                if detached_import and detached_import[0]:
+                    await acur.execute(
+                        """
+                        UPDATE dynamic_prompt.templates
+                        SET import_count = GREATEST(import_count - 1, 0), updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (detached_import[0],),
+                    )
+
             await acur.execute(
                 """
                 UPDATE dynamic_prompt.templates
@@ -2204,6 +2249,8 @@ async def update_user_dynamic_prompt_template(
                     tags = %s,
                     status = %s,
                     rejection_reason = NULL,
+                    source_template_id = %s,
+                    source_snapshot_updated_at = %s,
                     submitted_at = NULL,
                     approved_at = CASE WHEN %s = 'approved' THEN COALESCE(approved_at, NOW()) ELSE NULL END,
                     updated_at = NOW()
@@ -2215,6 +2262,8 @@ async def update_user_dynamic_prompt_template(
                     validated["template"],
                     validated["tags"],
                     next_status,
+                    next_source_template_id,
+                    next_source_snapshot_updated_at,
                     next_status,
                     template_id,
                     user["user_id"],
@@ -2251,6 +2300,8 @@ async def share_user_dynamic_prompt_template(template_id: str, user: dict = Depe
         raise HTTPException(status_code=404, detail="Template not found.")
     if existing["status"] not in COMMUNITY_TEMPLATE_MUTABLE_STATUSES:
         raise HTTPException(status_code=409, detail="This template can no longer be shared.")
+    if existing["status"] != "approved" and existing.get("source_template_id"):
+        raise HTTPException(status_code=400, detail="Imported templates cannot be shared to the community.")
 
     preview_samples = (await _validate_community_dynamic_prompt_template(
         existing["title"],
@@ -2440,6 +2491,10 @@ async def import_dynamic_prompt_template(template_id: str, user: dict = Depends(
     template = await _fetch_community_template(template_id, viewer_user_id=user["user_id"], public_only=True)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found.")
+    if template.get("user_id") == user["user_id"]:
+        raise HTTPException(status_code=400, detail="You cannot import your own template.")
+    if template.get("source_template_id"):
+        raise HTTPException(status_code=400, detail="Imported community templates cannot be imported again.")
 
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
