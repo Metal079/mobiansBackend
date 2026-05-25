@@ -3820,6 +3820,39 @@ def _image_hash_insert_lock_id(job_id: Any) -> int:
     return int.from_bytes(digest, "big", signed=True)
 
 
+def _split_finished_images(finished_images: Any) -> List[str]:
+    return [image for image in str(finished_images or "").strip("{}").split(",") if image]
+
+
+async def _get_job_hash_row_counts(job_id: str, acur=None) -> Tuple[int, int]:
+    if acur is None:
+        async with db_pool.connection() as aconn:
+            async with aconn.cursor() as inner_cur:
+                return await _get_job_hash_row_counts(job_id, inner_cur)
+
+    await acur.execute(
+        """
+        SELECT COUNT(*), COUNT(DISTINCT finished_images_index)
+        FROM hashes
+        WHERE job_id = %s
+        """,
+        (job_id,),
+    )
+    row = await acur.fetchone()
+    if not row:
+        return 0, 0
+
+    return int(row[0] or 0), int(row[1] or 0)
+
+
+async def _job_hashes_ready(job_id: str, expected_count: int, acur=None) -> bool:
+    if expected_count <= 0:
+        return False
+
+    row_count, distinct_index_count = await _get_job_hash_row_counts(job_id, acur)
+    return row_count == expected_count and distinct_index_count == expected_count
+
+
 async def insert_image_hashes(image_hashes, metadata, job_data):
     logging.info("Inserting image hashes")
 
@@ -3852,6 +3885,9 @@ async def insert_image_hashes(image_hashes, metadata, job_data):
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             await acur.execute("SELECT pg_advisory_xact_lock(%s)", (_image_hash_insert_lock_id(job_id),))
+            if await _job_hashes_ready(job_id, len(values), acur):
+                await aconn.commit()
+                return
             await acur.execute("DELETE FROM hashes WHERE job_id = %s", (job_id,))
             await acur.executemany(insert_query, values)
             await aconn.commit()
@@ -3900,7 +3936,7 @@ def _job_image_hash_metadata(job_details: Dict[str, Any]) -> Dict[str, Any]:
 
 async def process_finished_job_images_and_store_hashes(finished_images: str, metadata: Dict[str, Any], job_data: GetJobData):
     try:
-        base64_strings = [image for image in str(finished_images or "").strip("{}").split(",") if image]
+        base64_strings = _split_finished_images(finished_images)
         watermarked_image_base64 = []
         for base64_string in base64_strings:
             image = decode_base64_to_image(base64_string)
@@ -3978,8 +4014,8 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
     if job_status == "completed":
 
         if finished_images:
-            finished_images = finished_images.strip("{}")
-            base64_strings = finished_images.split(",")
+            job_id = str(job_data.job_id)
+            base64_strings = _split_finished_images(finished_images)
 
             # Add watermark and metadata
             watermarked_image_base64 = []
@@ -3991,12 +4027,13 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
 
             # Generate hashes for each image and store them in DB along with image info
             # Pass the results for images and other necessary data to the background task
-            background_tasks.add_task(
-                process_images_and_store_hashes,
-                watermarked_image_base64,
-                metadata,
-                job_data,
-            )
+            if not await _job_hashes_ready(job_id, len(watermarked_image_base64)):
+                background_tasks.add_task(
+                    process_images_and_store_hashes,
+                    watermarked_image_base64,
+                    metadata,
+                    job_data,
+                )
 
             return JSONResponse(
                 content={
@@ -4063,7 +4100,8 @@ async def get_job_status(job_data: GetJobData, background_tasks: BackgroundTasks
     job_refunded = job_details["refunded"]
 
     if job_status == "completed":
-        if job_details["finished_images"]:
+        finished_images = _split_finished_images(job_details["finished_images"])
+        if finished_images and not await _job_hashes_ready(str(job_data.job_id), len(finished_images)):
             background_tasks.add_task(
                 process_finished_job_images_and_store_hashes,
                 job_details["finished_images"],
