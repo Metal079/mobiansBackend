@@ -3,6 +3,7 @@ import io
 import base64
 import sys
 import asyncio
+import hashlib
 from typing import Optional, Dict, List, Any, Tuple
 import logging
 from datetime import datetime, timedelta
@@ -11,6 +12,7 @@ import re
 import time
 import math
 import secrets
+import tempfile
 import uuid
 
 # Fix for Windows - psycopg async requires SelectorEventLoop
@@ -18,7 +20,7 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header, UploadFile, File, Query
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header, UploadFile, File, Form, Query
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
@@ -85,6 +87,16 @@ WEBPUSH_TTL_SECONDS = max(1, int(os.environ.get("WEBPUSH_TTL_SECONDS", "300")))
 INTERNAL_API_TOKEN = os.environ.get("INTERNAL_API_TOKEN")
 # Destination opened when a user clicks a push notification.
 PUBLIC_SITE_URL = (os.environ.get("PUBLIC_SITE_URL") or "https://mobians.ai/").rstrip("/") + "/"
+LORAS_FOLDER = os.environ.get("LORAS_FOLDER", r"D:\mobians_api\loras")
+ADMIN_LORA_MAX_UPLOAD_BYTES = max(
+    1024 * 1024,
+    int(os.environ.get("ADMIN_LORA_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024))),
+)
+ADMIN_LORA_HEADER_MAX_BYTES = max(
+    1024,
+    int(os.environ.get("ADMIN_LORA_HEADER_MAX_BYTES", str(16 * 1024 * 1024))),
+)
+ADMIN_LORA_VERSION_ID_LOCK_KEY = 20498631
 
 # Credit costs by model type
 CREDIT_COSTS = {
@@ -3803,13 +3815,19 @@ class JobRetryInfo(BaseModel):
     job_id: str
 
 
+def _image_hash_insert_lock_id(job_id: Any) -> int:
+    digest = hashlib.blake2b(str(job_id).encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
 async def insert_image_hashes(image_hashes, metadata, job_data):
     logging.info("Inserting image hashes")
 
     lora_text = ""
-    if metadata["loras"]:
-        for lora in metadata["loras"]:
-            lora_text += f"{lora['name']} - {lora['version']} - strength: {lora['strength']}\n"
+    for lora in metadata.get("loras") or []:
+        lora_text += f"{lora.get('name')} - {lora.get('version')} - strength: {lora.get('strength')}\n"
+
+    job_id = str(job_data.job_id)
 
     insert_query = """
         INSERT INTO hashes (hash, prompt, negative_prompt, seed, cfg, model, created_date, loras, job_id, finished_images_index)
@@ -3817,25 +3835,26 @@ async def insert_image_hashes(image_hashes, metadata, job_data):
     """
     values = [
         (
-            image_hashes[i],
-            metadata["prompt"],
-            metadata["negative_prompt"],
-            metadata["seed"],
-            metadata["guidance_scale"],
-            metadata["model"],
+            image_hash,
+            metadata.get("prompt"),
+            metadata.get("negative_prompt"),
+            metadata.get("seed"),
+            metadata.get("guidance_scale"),
+            metadata.get("model"),
             datetime.now(),
             lora_text,
-            job_data.job_id,
-            i+1,
+            job_id,
+            index,
         )
-        for i in range(4)
+        for index, image_hash in enumerate(image_hashes, start=1)
     ]
 
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
-            # Use executemany to insert multiple records
+            await acur.execute("SELECT pg_advisory_xact_lock(%s)", (_image_hash_insert_lock_id(job_id),))
+            await acur.execute("DELETE FROM hashes WHERE job_id = %s", (job_id,))
             await acur.executemany(insert_query, values)
-            await aconn.commit()  # Commit the transaction
+            await aconn.commit()
 
 
 async def twos_complement(hexstr, bits):
@@ -3849,8 +3868,8 @@ async def twos_complement(hexstr, bits):
 
 async def process_images_and_store_hashes(image_results, metadata, job_data):
     image_hashes = []
-    for i in range(4):
-        image = decode_base64_to_image(image_results[i])
+    for image_result in image_results:
+        image = decode_base64_to_image(image_result)
         image_hash = imagehash.phash(image, 8)
         image_hash = await twos_complement(str(image_hash), 64)
         image_hashes.append(image_hash)
@@ -3862,6 +3881,43 @@ async def process_images_and_store_hashes(image_results, metadata, job_data):
             f"Error occurred while inserting image hash info into DB, JOB: {job_data.job_id}"
         )
         logging.error(str(e))
+
+
+def _job_image_hash_metadata(job_details: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "prompt": job_details["prompt"],
+        "prompt_template": job_details.get("prompt_template"),
+        "negative_prompt": job_details["negative_prompt"],
+        "seed": job_details["seed"],
+        "guidance_scale": job_details["guidance_scale"],
+        "job_type": job_details["job_type"],
+        "model": job_details["model"],
+        "loras": job_details["loras"] or [],
+        "lossy_images": bool(job_details["lossy_images"]),
+        "regional_prompting": parse_regional_prompting(job_details["control_image"]),
+    }
+
+
+async def process_finished_job_images_and_store_hashes(finished_images: str, metadata: Dict[str, Any], job_data: GetJobData):
+    try:
+        base64_strings = [image for image in str(finished_images or "").strip("{}").split(",") if image]
+        watermarked_image_base64 = []
+        for base64_string in base64_strings:
+            image = decode_base64_to_image(base64_string)
+            watermarked_image_base64.append(
+                await add_image_metadata(
+                    image.convert("RGB"),
+                    metadata,
+                    lossy_image=metadata.get("lossy_images", False),
+                )
+            )
+
+        await process_images_and_store_hashes(watermarked_image_base64, metadata, job_data)
+    except Exception as e:
+        logging.error(
+            f"Error occurred while preparing image hash info for DB, JOB: {job_data.job_id}",
+            exc_info=True,
+        )
 
 
 @app.post("/get_job/")
@@ -3992,7 +4048,7 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
 
 
 @app.post("/get_job_status/")
-async def get_job_status(job_data: GetJobData):
+async def get_job_status(job_data: GetJobData, background_tasks: BackgroundTasks):
     """Lightweight status-only endpoint for polling. Returns no image data."""
     job_details = await get_generation_job_details(job_data.job_id)
 
@@ -4007,6 +4063,13 @@ async def get_job_status(job_data: GetJobData):
     job_refunded = job_details["refunded"]
 
     if job_status == "completed":
+        if job_details["finished_images"]:
+            background_tasks.add_task(
+                process_finished_job_images_and_store_hashes,
+                job_details["finished_images"],
+                _job_image_hash_metadata(job_details),
+                job_data,
+            )
         return JSONResponse(content={"status": "completed"})
     elif job_status in ["pending", "processing"]:
         jobs_per_sec = await get_jobs_per_sec(db_pool)
@@ -5735,6 +5798,9 @@ async def admin_restore_dynamic_prompt_category(category_id: str, user: dict = D
 
 async def resolve_civitai_model_link(version_id: int) -> str:
     """Resolve a CivitAI model page URL from a model version id."""
+    if not _has_civitai_version_id(version_id):
+        raise HTTPException(status_code=404, detail="Manual LoRAs do not have a CivitAI link")
+
     cached = civitai_link_cache.get(version_id)
     if cached:
         return cached
@@ -6022,6 +6088,164 @@ def _normalize_trigger_words_input(raw_value: Any) -> List[str]:
     return normalized
 
 
+def _sanitize_lora_filename(name: str) -> str:
+    sanitized = name.replace("'", "")
+    sanitized = "".join(c if c.isalnum() or c in (' ', '.', '_') else '_' for c in sanitized).strip()
+    return sanitized or "untitled"
+
+
+def _coerce_lora_json_field(raw_value: Any) -> Any:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, (dict, list)):
+        return raw_value
+    if isinstance(raw_value, memoryview):
+        raw_value = raw_value.tobytes()
+    if isinstance(raw_value, bytes):
+        raw_value = raw_value.decode("utf-8", errors="ignore")
+    if isinstance(raw_value, str):
+        candidate = raw_value.strip()
+        if not candidate:
+            return None
+        try:
+            return json.loads(candidate)
+        except Exception:
+            return None
+    return None
+
+
+def _validate_safetensors_header_bytes(raw_bytes: bytes, max_header_bytes: int = ADMIN_LORA_HEADER_MAX_BYTES) -> Dict[str, Any]:
+    if len(raw_bytes) < 8:
+        raise HTTPException(status_code=400, detail="Invalid safetensors file: header is missing.")
+
+    header_length = int.from_bytes(raw_bytes[:8], "little")
+    if header_length <= 0:
+        raise HTTPException(status_code=400, detail="Invalid safetensors file: header length is invalid.")
+    if header_length > max_header_bytes:
+        raise HTTPException(status_code=400, detail="Invalid safetensors file: header is too large.")
+
+    required_length = 8 + header_length
+    if len(raw_bytes) < required_length:
+        raise HTTPException(status_code=400, detail="Invalid safetensors file: header is truncated.")
+
+    try:
+        header = json.loads(raw_bytes[8:required_length].decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid safetensors file: header JSON is unreadable ({exc}).")
+
+    if not isinstance(header, dict):
+        raise HTTPException(status_code=400, detail="Invalid safetensors file: header JSON must be an object.")
+
+    return header
+
+
+async def _validate_safetensors_upload(file: UploadFile) -> Dict[str, Any]:
+    await file.seek(0)
+    prefix = await file.read(8)
+    if len(prefix) < 8:
+        await file.seek(0)
+        raise HTTPException(status_code=400, detail="Invalid safetensors file: header is missing.")
+
+    header_length = int.from_bytes(prefix, "little")
+    if header_length <= 0:
+        await file.seek(0)
+        raise HTTPException(status_code=400, detail="Invalid safetensors file: header length is invalid.")
+    if header_length > ADMIN_LORA_HEADER_MAX_BYTES:
+        await file.seek(0)
+        raise HTTPException(status_code=400, detail="Invalid safetensors file: header is too large.")
+
+    header_bytes = await file.read(header_length)
+    try:
+        return _validate_safetensors_header_bytes(prefix + header_bytes)
+    finally:
+        await file.seek(0)
+
+
+async def _stream_upload_to_temp_file(file: UploadFile, temp_dir: str, max_bytes: int) -> Tuple[str, str, int]:
+    os.makedirs(temp_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix="manual-lora-", suffix=".tmp", dir=temp_dir)
+    sha256 = hashlib.sha256()
+    total_bytes = 0
+
+    try:
+        await file.seek(0)
+        with os.fdopen(fd, "wb") as handle:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > max_bytes:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"LoRA file is too large. Limit is {max_bytes // (1024 * 1024)} MB.",
+                    )
+                sha256.update(chunk)
+                handle.write(chunk)
+        if total_bytes <= 0:
+            raise HTTPException(status_code=400, detail="Empty safetensors upload.")
+        return temp_path, sha256.hexdigest().upper(), total_bytes
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+    finally:
+        await file.seek(0)
+
+
+def _build_lora_storage_path(name: str, version: str, base_model: str) -> str:
+    sanitized_name = _sanitize_lora_filename(name)
+    sanitized_version = _sanitize_lora_filename(version)
+    filename = f"{sanitized_name}-{sanitized_version}.safetensors"
+    base_model_folder = os.path.join(LORAS_FOLDER, _sanitize_lora_filename(base_model))
+    lora_folder = os.path.join(base_model_folder, sanitized_name)
+    return os.path.join(lora_folder, filename)
+
+
+def _build_manual_lora_download_url(name: str, version: str, base_model: str) -> str:
+    sanitized_name = _sanitize_lora_filename(name)
+    sanitized_version = _sanitize_lora_filename(version)
+    sanitized_base_model = _sanitize_lora_filename(base_model)
+    return f"manual-upload://{sanitized_base_model}/{sanitized_name}/{sanitized_version}"
+
+
+async def _allocate_manual_lora_version_id(acur) -> int:
+    await acur.execute("SELECT pg_advisory_xact_lock(%s)", (ADMIN_LORA_VERSION_ID_LOCK_KEY,))
+    await acur.execute(
+        "SELECT COALESCE(MIN(version_id), 0) FROM lora_metadata WHERE version_id IS NOT NULL"
+    )
+    row = await acur.fetchone()
+    lowest_version_id = int(row[0] or 0)
+    return lowest_version_id - 1 if lowest_version_id <= 0 else -1
+
+
+async def _find_existing_lora_by_sha256(acur, sha256_hash: str) -> Optional[Dict[str, Any]]:
+    await acur.execute(
+        "SELECT id, name, version, hashes FROM lora_metadata WHERE hashes IS NOT NULL"
+    )
+    rows = await acur.fetchall()
+
+    for lora_id, name, version, hashes in rows:
+        parsed_hashes = _coerce_lora_json_field(hashes)
+        if not isinstance(parsed_hashes, dict):
+            continue
+        existing_hash = str(parsed_hashes.get("SHA256") or "").strip().upper()
+        if existing_hash and existing_hash == sha256_hash:
+            return {
+                "id": lora_id,
+                "name": name,
+                "version": version,
+            }
+    return None
+
+
+def _has_civitai_version_id(version_id: Any) -> bool:
+    try:
+        return int(version_id) > 0
+    except Exception:
+        return False
+
+
 @app.patch("/admin/lora/{lora_id}")
 async def admin_update_lora(lora_id: int, data: LoraToggleRequest, user: dict = Depends(require_admin)):
     """Update a LoRA's active, NSFW status, name, or trigger words by id. Admin only."""
@@ -6076,6 +6300,202 @@ async def admin_update_lora(lora_id: int, data: LoraToggleRequest, user: dict = 
             "is_nsfw": row[3],
             "trigger_words": row[4] if len(row) > 4 else None
         }
+    }
+
+
+@app.post("/admin/lora/upload")
+async def admin_upload_manual_lora(
+    file: UploadFile = File(...),
+    preview_image: UploadFile = File(...),
+    name: str = Form(...),
+    version: str = Form(...),
+    base_model: str = Form(...),
+    trigger_words: Optional[str] = Form(None),
+    creator: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    is_nsfw: bool = Form(False),
+    user: dict = Depends(require_admin),
+):
+    normalized_name = (name or "").strip()
+    normalized_version = (version or "").strip()
+    normalized_base_model = (base_model or "").strip()
+    normalized_creator = (creator or "").strip() or None
+    normalized_description = (description or "").strip() or None
+
+    if not normalized_name:
+        raise HTTPException(status_code=400, detail="Name is required.")
+    if not normalized_version:
+        raise HTTPException(status_code=400, detail="Version is required.")
+    if not is_supported_lora_base_model(normalized_base_model):
+        raise HTTPException(status_code=400, detail="Unsupported base model.")
+
+    original_filename = (file.filename or "").strip()
+    if not original_filename.lower().endswith(".safetensors"):
+        raise HTTPException(status_code=400, detail="Model file must be a .safetensors file.")
+
+    if not preview_image.filename:
+        raise HTTPException(status_code=400, detail="Preview image is required for manual uploads.")
+    if not preview_image.content_type or not preview_image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Preview image must be an image file.")
+
+    normalized_trigger_words = _normalize_trigger_words_input(trigger_words)
+    await _validate_safetensors_upload(file)
+
+    preview_content = await preview_image.read()
+    if not preview_content:
+        raise HTTPException(status_code=400, detail="Preview image upload is empty.")
+
+    try:
+        optimized_preview = _process_lora_preview_image(preview_content)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to process preview image: {exc}")
+
+    final_file_path = _build_lora_storage_path(normalized_name, normalized_version, normalized_base_model)
+    manual_download_url = _build_manual_lora_download_url(
+        normalized_name,
+        normalized_version,
+        normalized_base_model,
+    )
+    temp_directory = os.path.dirname(final_file_path)
+    temp_file_path, sha256_hash, file_size = await _stream_upload_to_temp_file(
+        file,
+        temp_directory,
+        ADMIN_LORA_MAX_UPLOAD_BYTES,
+    )
+    final_file_written = False
+    created_row = None
+    columns: List[str] = []
+
+    try:
+        async with db_pool.connection() as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute(
+                    """
+                    SELECT id
+                    FROM lora_metadata
+                    WHERE LOWER(name) = LOWER(%s)
+                      AND LOWER(version) = LOWER(%s)
+                    LIMIT 1
+                    """,
+                    (normalized_name, normalized_version),
+                )
+                if await acur.fetchone():
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f'A LoRA named "{normalized_name}" with version "{normalized_version}" already exists.',
+                    )
+
+                existing_hash_match = await _find_existing_lora_by_sha256(acur, sha256_hash)
+                if existing_hash_match:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f'This safetensors file matches the existing LoRA '
+                            f'{existing_hash_match["name"]} ({existing_hash_match["version"]}).'
+                        ),
+                    )
+
+                if os.path.exists(final_file_path):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="A file already exists at the target LoRA path. Rename the LoRA or clean up the existing file first.",
+                    )
+
+                version_id = await _allocate_manual_lora_version_id(acur)
+                os.replace(temp_file_path, final_file_path)
+                final_file_written = True
+
+                await acur.execute(
+                    """
+                    INSERT INTO lora_metadata (
+                        name,
+                        version,
+                        base_model,
+                        download_url,
+                        is_nsfw,
+                        is_minor,
+                        creator,
+                        description,
+                        version_description,
+                        tags,
+                        who_added,
+                        status,
+                        trigger_words,
+                        hashes,
+                        image_url,
+                        file_path,
+                        version_id,
+                        image_blob
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                    RETURNING id
+                    """,
+                    (
+                        normalized_name,
+                        normalized_version,
+                        normalized_base_model,
+                        manual_download_url,
+                        bool(is_nsfw),
+                        False,
+                        normalized_creator,
+                        normalized_description,
+                        None,
+                        json.dumps([]),
+                        get_primary_lora_requestor(user),
+                        "downloaded",
+                        json.dumps(normalized_trigger_words),
+                        json.dumps({
+                            "SHA256": sha256_hash,
+                            "size_bytes": file_size,
+                            "source": "manual-upload",
+                        }),
+                        None,
+                        final_file_path,
+                        version_id,
+                        optimized_preview,
+                    ),
+                )
+                inserted_row = await acur.fetchone()
+                if not inserted_row:
+                    raise HTTPException(status_code=500, detail="Failed to create LoRA record.")
+
+                lora_id = inserted_row[0]
+                image_url = f"/lora-image/{lora_id}?v={int(time.time())}"
+
+                await acur.execute(
+                    """
+                    UPDATE lora_metadata
+                    SET image_url = %s
+                    WHERE id = %s
+                    RETURNING id, name, version, base_model, download_url, is_nsfw, is_minor,
+                              creator, description, version_description, tags, who_added, status,
+                              trigger_words, date_added, hashes, image_url, file_path, uses,
+                              is_active, last_used_date, version_id
+                    """,
+                    (image_url, lora_id),
+                )
+                created_row = await acur.fetchone()
+                columns = [desc[0] for desc in acur.description]
+                await aconn.commit()
+    except HTTPException:
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        if final_file_written and os.path.exists(final_file_path):
+            os.remove(final_file_path)
+        raise
+    except Exception as exc:
+        logging.error(f"Manual LoRA upload failed: {exc}")
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        if final_file_written and os.path.exists(final_file_path):
+            os.remove(final_file_path)
+        raise HTTPException(status_code=500, detail="Failed to upload manual LoRA.")
+
+    lora_payload = dict(zip(columns, created_row)) if created_row else {}
+    return {
+        "status": "success",
+        "lora": jsonable_encoder(lora_payload),
     }
 
 
