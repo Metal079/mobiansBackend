@@ -6193,20 +6193,26 @@ async def _stream_upload_to_temp_file(file: UploadFile, temp_dir: str, max_bytes
         await file.seek(0)
 
 
-def _build_lora_storage_path(name: str, version: str, base_model: str) -> str:
+def _build_lora_storage_path(name: str, version: str, base_model: str, storage_identity: Optional[Any] = None) -> str:
     sanitized_name = _sanitize_lora_filename(name)
     sanitized_version = _sanitize_lora_filename(version)
-    filename = f"{sanitized_name}-{sanitized_version}.safetensors"
+    identity_suffix = ""
+    if storage_identity is not None:
+        identity_suffix = f"-{_sanitize_lora_filename(str(storage_identity))}"
+    filename = f"{sanitized_name}-{sanitized_version}{identity_suffix}.safetensors"
     base_model_folder = os.path.join(LORAS_FOLDER, _sanitize_lora_filename(base_model))
     lora_folder = os.path.join(base_model_folder, sanitized_name)
     return os.path.join(lora_folder, filename)
 
 
-def _build_manual_lora_download_url(name: str, version: str, base_model: str) -> str:
+def _build_manual_lora_download_url(name: str, version: str, base_model: str, storage_identity: Optional[Any] = None) -> str:
     sanitized_name = _sanitize_lora_filename(name)
     sanitized_version = _sanitize_lora_filename(version)
     sanitized_base_model = _sanitize_lora_filename(base_model)
-    return f"manual-upload://{sanitized_base_model}/{sanitized_name}/{sanitized_version}"
+    identity_suffix = ""
+    if storage_identity is not None:
+        identity_suffix = f"/{_sanitize_lora_filename(str(storage_identity))}"
+    return f"manual-upload://{sanitized_base_model}/{sanitized_name}/{sanitized_version}{identity_suffix}"
 
 
 async def _allocate_manual_lora_version_id(acur) -> int:
@@ -6350,17 +6356,23 @@ async def admin_upload_manual_lora(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to process preview image: {exc}")
 
-    final_file_path = _build_lora_storage_path(normalized_name, normalized_version, normalized_base_model)
-    manual_download_url = _build_manual_lora_download_url(
-        normalized_name,
-        normalized_version,
-        normalized_base_model,
-    )
-    temp_directory = os.path.dirname(final_file_path)
+    temp_directory = os.path.dirname(_build_lora_storage_path(normalized_name, normalized_version, normalized_base_model))
     temp_file_path, sha256_hash, file_size = await _stream_upload_to_temp_file(
         file,
         temp_directory,
         ADMIN_LORA_MAX_UPLOAD_BYTES,
+    )
+    final_file_path = _build_lora_storage_path(
+        normalized_name,
+        normalized_version,
+        normalized_base_model,
+        sha256_hash,
+    )
+    manual_download_url = _build_manual_lora_download_url(
+        normalized_name,
+        normalized_version,
+        normalized_base_model,
+        sha256_hash,
     )
     final_file_written = False
     created_row = None
@@ -6369,22 +6381,6 @@ async def admin_upload_manual_lora(
     try:
         async with db_pool.connection() as aconn:
             async with aconn.cursor() as acur:
-                await acur.execute(
-                    """
-                    SELECT id
-                    FROM lora_metadata
-                    WHERE LOWER(name) = LOWER(%s)
-                      AND LOWER(version) = LOWER(%s)
-                    LIMIT 1
-                    """,
-                    (normalized_name, normalized_version),
-                )
-                if await acur.fetchone():
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f'A LoRA named "{normalized_name}" with version "{normalized_version}" already exists.',
-                    )
-
                 existing_hash_match = await _find_existing_lora_by_sha256(acur, sha256_hash)
                 if existing_hash_match:
                     raise HTTPException(
