@@ -3815,42 +3815,25 @@ class JobRetryInfo(BaseModel):
     job_id: str
 
 
+def _split_finished_images(finished_images: Any) -> List[str]:
+    return [image for image in str(finished_images or "").strip("{}").split(",") if image]
+
+
+_hash_persistence_scheduled_job_ids: set[str] = set()
+
+
 def _image_hash_insert_lock_id(job_id: Any) -> int:
     digest = hashlib.blake2b(str(job_id).encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "big", signed=True)
 
 
-def _split_finished_images(finished_images: Any) -> List[str]:
-    return [image for image in str(finished_images or "").strip("{}").split(",") if image]
-
-
-async def _get_job_hash_row_counts(job_id: str, acur=None) -> Tuple[int, int]:
-    if acur is None:
-        async with db_pool.connection() as aconn:
-            async with aconn.cursor() as inner_cur:
-                return await _get_job_hash_row_counts(job_id, inner_cur)
-
-    await acur.execute(
-        """
-        SELECT COUNT(*), COUNT(DISTINCT finished_images_index)
-        FROM hashes
-        WHERE job_id = %s
-        """,
-        (job_id,),
-    )
-    row = await acur.fetchone()
-    if not row:
-        return 0, 0
-
-    return int(row[0] or 0), int(row[1] or 0)
-
-
-async def _job_hashes_ready(job_id: str, expected_count: int, acur=None) -> bool:
-    if expected_count <= 0:
+def _schedule_hash_persistence(job_id: str, background_tasks: BackgroundTasks, task_func, *args) -> bool:
+    if job_id in _hash_persistence_scheduled_job_ids:
         return False
 
-    row_count, distinct_index_count = await _get_job_hash_row_counts(job_id, acur)
-    return row_count == expected_count and distinct_index_count == expected_count
+    _hash_persistence_scheduled_job_ids.add(job_id)
+    background_tasks.add_task(_run_hash_persistence_task, job_id, task_func, *args)
+    return True
 
 
 async def insert_image_hashes(image_hashes, metadata, job_data):
@@ -3885,9 +3868,6 @@ async def insert_image_hashes(image_hashes, metadata, job_data):
     async with db_pool.connection() as aconn:
         async with aconn.cursor() as acur:
             await acur.execute("SELECT pg_advisory_xact_lock(%s)", (_image_hash_insert_lock_id(job_id),))
-            if await _job_hashes_ready(job_id, len(values), acur):
-                await aconn.commit()
-                return
             await acur.execute("DELETE FROM hashes WHERE job_id = %s", (job_id,))
             await acur.executemany(insert_query, values)
             await aconn.commit()
@@ -3912,11 +3892,13 @@ async def process_images_and_store_hashes(image_results, metadata, job_data):
 
     try:
         await insert_image_hashes(image_hashes, metadata, job_data)
+        return True
     except Exception as e:
         logging.error(
             f"Error occurred while inserting image hash info into DB, JOB: {job_data.job_id}"
         )
         logging.error(str(e))
+        return False
 
 
 def _job_image_hash_metadata(job_details: Dict[str, Any]) -> Dict[str, Any]:
@@ -3948,12 +3930,20 @@ async def process_finished_job_images_and_store_hashes(finished_images: str, met
                 )
             )
 
-        await process_images_and_store_hashes(watermarked_image_base64, metadata, job_data)
+        return await process_images_and_store_hashes(watermarked_image_base64, metadata, job_data)
     except Exception as e:
         logging.error(
             f"Error occurred while preparing image hash info for DB, JOB: {job_data.job_id}",
             exc_info=True,
         )
+        return False
+
+
+async def _run_hash_persistence_task(job_id: str, task_func, *args):
+    try:
+        await task_func(*args)
+    finally:
+        _hash_persistence_scheduled_job_ids.discard(job_id)
 
 
 @app.post("/get_job/")
@@ -4027,13 +4017,14 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
 
             # Generate hashes for each image and store them in DB along with image info
             # Pass the results for images and other necessary data to the background task
-            if not await _job_hashes_ready(job_id, len(watermarked_image_base64)):
-                background_tasks.add_task(
-                    process_images_and_store_hashes,
-                    watermarked_image_base64,
-                    metadata,
-                    job_data,
-                )
+            _schedule_hash_persistence(
+                job_id,
+                background_tasks,
+                process_images_and_store_hashes,
+                watermarked_image_base64,
+                metadata,
+                job_data,
+            )
 
             return JSONResponse(
                 content={
@@ -4101,8 +4092,10 @@ async def get_job_status(job_data: GetJobData, background_tasks: BackgroundTasks
 
     if job_status == "completed":
         finished_images = _split_finished_images(job_details["finished_images"])
-        if finished_images and not await _job_hashes_ready(str(job_data.job_id), len(finished_images)):
-            background_tasks.add_task(
+        if finished_images:
+            _schedule_hash_persistence(
+                str(job_data.job_id),
+                background_tasks,
                 process_finished_job_images_and_store_hashes,
                 job_details["finished_images"],
                 _job_image_hash_metadata(job_details),
