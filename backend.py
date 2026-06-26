@@ -594,6 +594,9 @@ async def create_session_token(user_id: str) -> str:
     return token
 
 
+AUTH_SERVICE_UNAVAILABLE_DETAIL = "Authentication service temporarily unavailable. Please retry."
+
+
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Optional[dict]:
     """
     Dependency to get the current user from session token.
@@ -609,6 +612,9 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         return None
     
     try:
+        if db_pool is None:
+            raise HTTPException(status_code=503, detail=AUTH_SERVICE_UNAVAILABLE_DETAIL)
+
         async with db_pool.connection() as aconn:
             async with aconn.cursor() as acur:
                 # Look up the session token and get user data in one query
@@ -641,9 +647,11 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
                     "daily_bonus_streak": row[9],
                     "is_banned": row[10]
                 }
+    except HTTPException:
+        raise
     except Exception as e:
-        logging.error(f"Error fetching user: {e}")
-        return None
+        logging.exception("Error fetching user")
+        raise HTTPException(status_code=503, detail=AUTH_SERVICE_UNAVAILABLE_DETAIL) from e
 
 
 async def require_auth(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
@@ -6966,6 +6974,24 @@ async def trigger_download(user: dict = Depends(require_admin)):
 @app.get("/health_check")
 async def health_check():
     return {"status": 200}
+
+
+@app.get("/readiness_check")
+async def readiness_check():
+    """Return 200 only when the app can serve DB-backed requests."""
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database pool is not initialized.")
+
+    try:
+        async with db_pool.connection() as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute("SELECT 1")
+                await acur.fetchone()
+    except Exception as e:
+        logging.exception("Readiness check failed")
+        raise HTTPException(status_code=503, detail="Database is not reachable.") from e
+
+    return {"status": 200, "database": "ready"}
 
 # New endpoint to cancel a pending job by ID
 @app.delete("/cancel_job/{job_id}/")
