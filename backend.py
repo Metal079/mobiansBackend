@@ -98,22 +98,6 @@ ADMIN_LORA_HEADER_MAX_BYTES = max(
 )
 ADMIN_LORA_VERSION_ID_LOCK_KEY = 20498631
 
-# Credit costs by model type
-CREDIT_COSTS = {
-    "SD 1.5": 10,      # sonicDiffusionV4
-    "Pony": 15,        # autismMix (SDXL-based)
-    "Illustrious": 15,  # novaFurryXL_ilV140 (SDXL-based), novaMobianXL_v10, novaMobianXL_v20
-    "Anima": 20        # Anima-baseV1
-}
-
-# Additional cost per LoRA by model type
-LORA_CREDIT_COSTS = {
-    "SD 1.5": 2,
-    "Pony": 5,
-    "Illustrious": 5,
-    "Anima": 5
-}
-
 # Upscale credit multiplier (upscales are computationally expensive)
 UPSCALE_CREDIT_MULTIPLIER = 3
 
@@ -154,45 +138,179 @@ PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET")
 PAYPAL_MODE = os.environ.get("PAYPAL_MODE", "sandbox")  # "sandbox" or "live"
 PAYPAL_API_BASE = "https://api-m.sandbox.paypal.com" if PAYPAL_MODE == "sandbox" else "https://api-m.paypal.com"
 
-# Map model names to their base types
-MODEL_BASE_TYPES = {
-    "sonicDiffusionV4": "SD 1.5",
-    "autismMix": "Pony",
-    "novaMobianXL_v10": "Illustrious",
-    "novaFurryXL_ilV140": "Illustrious",
-    "novaMobianXL_v20": "Illustrious",
-    "Anima-baseV1": "Anima",
-}
-
 DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "novaMobianXL_v20")
 LORA_SUGGESTION_LIMIT = 5
 LORA_REREQUEST_COOLDOWN_DAYS = 7
 SUPPORTED_LORA_BASE_MODELS = {"Pony", "SD 1.5", "Illustrious", "Anima"}
 
+GENERATION_MODEL_COLUMNS = (
+    "model_id",
+    "display_name",
+    "base_model",
+    "default_cfg",
+    "credit_cost",
+    "lora_credit_cost",
+    "supports_sdxl_resolution",
+    "supports_regional_prompting",
+    "supports_upscale",
+    "is_active",
+    "is_default",
+    "display_order",
+)
 
-def is_supported_lora_base_model(base_model: Optional[str]) -> bool:
-    return (base_model or "").strip() in SUPPORTED_LORA_BASE_MODELS
+
+def _generation_model_from_row(row: Tuple[Any, ...]) -> Dict[str, Any]:
+    model = dict(zip(GENERATION_MODEL_COLUMNS, row))
+    model["default_cfg"] = float(model.get("default_cfg") or 0)
+    model["credit_cost"] = int(model.get("credit_cost") or 0)
+    model["lora_credit_cost"] = int(model.get("lora_credit_cost") or 0)
+    model["display_order"] = int(model.get("display_order") or 0)
+    for key in (
+        "supports_sdxl_resolution",
+        "supports_regional_prompting",
+        "supports_upscale",
+        "is_active",
+        "is_default",
+    ):
+        model[key] = bool(model.get(key))
+    return model
 
 
-def normalize_model_id(model: Optional[str]) -> str:
-    """Return a valid model id for generation.
+async def get_generation_models(include_inactive: bool = False) -> List[Dict[str, Any]]:
+    """Load editable generation model settings from Postgres."""
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database pool is not initialized.")
+
+    active_filter = "" if include_inactive else "WHERE is_active = TRUE"
+    try:
+        async with db_pool.connection() as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute(
+                    f"""
+                    SELECT {", ".join(GENERATION_MODEL_COLUMNS)}
+                    FROM public.generation_models
+                    {active_filter}
+                    ORDER BY display_order ASC, model_id ASC
+                    """
+                )
+                rows = await acur.fetchall()
+        models = [_generation_model_from_row(row) for row in rows]
+        if not models:
+            raise HTTPException(status_code=503, detail="No active generation models are configured.")
+        return models
+    except (errors.UndefinedTable, errors.UndefinedColumn) as exc:
+        logging.error("generation_models table is missing or invalid")
+        raise HTTPException(
+            status_code=503,
+            detail="Generation model settings table is missing. Apply migration 030_create_generation_models.sql.",
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.error(f"Failed to load generation model settings: {exc}")
+        raise HTTPException(status_code=503, detail="Failed to load generation model settings.") from exc
+
+
+def get_default_generation_model_id(model_settings: Optional[List[Dict[str, Any]]] = None) -> str:
+    model_settings = model_settings or []
+    active_models = [model for model in model_settings if model.get("is_active", True)]
+    for model in active_models:
+        if model.get("is_default"):
+            return str(model["model_id"])
+
+    available = [str(model["model_id"]) for model in active_models]
+    if DEFAULT_MODEL_ID in available:
+        return DEFAULT_MODEL_ID
+    if available:
+        return available[0]
+    raise HTTPException(status_code=503, detail="No active generation models are configured.")
+
+
+def get_generation_model_by_id(
+    model_id: Optional[str],
+    model_settings: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    model_settings = model_settings or []
+    normalized = (model_id or "").strip()
+    for model in model_settings:
+        if model.get("model_id") == normalized:
+            return model
+    return None
+
+
+def normalize_model_id(
+    model: Optional[str],
+    model_settings: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Return a valid active model id for generation.
 
     Clients can send stale/renamed model ids (e.g., from localStorage). To prevent
-    jobs from getting stuck in the queue, coerce missing/unknown values to a safe
-    default that exists in MODEL_BASE_TYPES.
+    jobs from getting stuck in the queue, coerce missing/unknown values to the
+    current DB default or first active model.
     """
-    available = list(MODEL_BASE_TYPES.keys())
-    fallback = DEFAULT_MODEL_ID if DEFAULT_MODEL_ID in MODEL_BASE_TYPES else (available[0] if available else "novaMobianXL_v20")
+    model_settings = model_settings or []
+    available = [
+        str(item["model_id"])
+        for item in model_settings
+        if item.get("is_active", True)
+    ]
+    fallback = get_default_generation_model_id(model_settings)
 
     if not model:
         return fallback
 
-    if model in MODEL_BASE_TYPES:
+    model = model.strip()
+    if model in available:
         return model
 
-    lower_map = {k.lower(): k for k in available}
+    lower_map = {model_id.lower(): model_id for model_id in available}
     mapped = lower_map.get(model.lower())
     return mapped or fallback
+
+
+def _calculate_model_credit_cost(
+    model_setting: Dict[str, Any],
+    loras: Optional[List[Dict[str, Any]]] = None,
+    multiplier: int = 1,
+) -> int:
+    base_cost = int(model_setting.get("credit_cost") or 0)
+    per_lora_cost = int(model_setting.get("lora_credit_cost") or 0)
+    lora_count = len(loras) if isinstance(loras, list) else 0
+    return (base_cost + (lora_count * per_lora_cost)) * multiplier
+
+
+def _model_maps_from_settings(
+    model_settings: List[Dict[str, Any]]
+) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, str]]:
+    costs: Dict[str, int] = {}
+    lora_costs: Dict[str, int] = {}
+    models: Dict[str, str] = {}
+    for model in model_settings:
+        model_id = str(model.get("model_id") or "")
+        base_model = str(model.get("base_model") or "SD 1.5")
+        if model_id:
+            models[model_id] = base_model
+        costs.setdefault(base_model, int(model.get("credit_cost") or 0))
+        lora_costs.setdefault(base_model, int(model.get("lora_credit_cost") or 0))
+    return costs, lora_costs, models
+
+
+async def get_supported_lora_base_models() -> set[str]:
+    model_settings = await get_generation_models()
+    supported = {
+        str(model.get("base_model") or "").strip()
+        for model in model_settings
+        if model.get("is_active", True)
+    }
+    return {base_model for base_model in supported if base_model} or set(SUPPORTED_LORA_BASE_MODELS)
+
+
+def is_supported_lora_base_model(
+    base_model: Optional[str],
+    supported_base_models: Optional[set[str]] = None,
+) -> bool:
+    supported_base_models = supported_base_models or SUPPORTED_LORA_BASE_MODELS
+    return (base_model or "").strip() in supported_base_models
 
 app = FastAPI()
 security = HTTPBearer(auto_error=False)
@@ -682,35 +800,33 @@ async def upsert_user(
             }
 
 
-def get_credit_cost(model: str, loras: Optional[List[Dict[str, Any]]] = None) -> int:
+async def get_credit_cost(model: str, loras: Optional[List[Dict[str, Any]]] = None) -> int:
     """Get the credit cost for a given model and optional LoRAs."""
-    normalized_model = normalize_model_id(model)
-    base_type = MODEL_BASE_TYPES.get(normalized_model, "SD 1.5")
-    base_cost = CREDIT_COSTS.get(base_type, CREDIT_COSTS.get("SD 1.5", 0))
-    lora_count = len(loras) if isinstance(loras, list) else 0
-    per_lora_cost = LORA_CREDIT_COSTS.get(base_type, 0)
-    return base_cost + (lora_count * per_lora_cost)
+    model_settings = await get_generation_models()
+    normalized_model = normalize_model_id(model, model_settings)
+    model_setting = get_generation_model_by_id(normalized_model, model_settings)
+    if not model_setting:
+        raise HTTPException(status_code=503, detail="Generation model settings are inconsistent.")
+    return _calculate_model_credit_cost(model_setting, loras)
 
-def get_upscale_credit_cost(model: str, loras: Optional[List[Dict[str, Any]]] = None) -> int:
+async def get_upscale_credit_cost(model: str, loras: Optional[List[Dict[str, Any]]] = None) -> int:
     """Get the credit cost for an upscale job (base model cost * multiplier + LoRA costs * 3)."""
-    normalized_model = normalize_model_id(model)
-    base_type = MODEL_BASE_TYPES.get(normalized_model, "SD 1.5")
-    base_cost = CREDIT_COSTS.get(base_type, CREDIT_COSTS.get("SD 1.5", 0))
-    lora_count = len(loras) if isinstance(loras, list) else 0
-    per_lora_cost = LORA_CREDIT_COSTS.get(base_type, 0)
-    lora_total = lora_count * per_lora_cost * UPSCALE_CREDIT_MULTIPLIER
-    return (base_cost * UPSCALE_CREDIT_MULTIPLIER) + lora_total
+    model_settings = await get_generation_models()
+    normalized_model = normalize_model_id(model, model_settings)
+    model_setting = get_generation_model_by_id(normalized_model, model_settings)
+    if not model_setting:
+        raise HTTPException(status_code=503, detail="Generation model settings are inconsistent.")
+    return _calculate_model_credit_cost(model_setting, loras, UPSCALE_CREDIT_MULTIPLIER)
 
 
-def get_hires_credit_cost(model: str, loras: Optional[List[Dict[str, Any]]] = None) -> int:
+async def get_hires_credit_cost(model: str, loras: Optional[List[Dict[str, Any]]] = None) -> int:
     """Get the credit cost for a hi-res (generate+upscale) job (base model cost * 4 + LoRA costs * 4)."""
-    normalized_model = normalize_model_id(model)
-    base_type = MODEL_BASE_TYPES.get(normalized_model, "SD 1.5")
-    base_cost = CREDIT_COSTS.get(base_type, CREDIT_COSTS.get("SD 1.5", 0))
-    lora_count = len(loras) if isinstance(loras, list) else 0
-    per_lora_cost = LORA_CREDIT_COSTS.get(base_type, 0)
-    lora_total = lora_count * per_lora_cost * HIRES_CREDIT_MULTIPLIER
-    return (base_cost * HIRES_CREDIT_MULTIPLIER) + lora_total
+    model_settings = await get_generation_models()
+    normalized_model = normalize_model_id(model, model_settings)
+    model_setting = get_generation_model_by_id(normalized_model, model_settings)
+    if not model_setting:
+        raise HTTPException(status_code=503, detail="Generation model settings are inconsistent.")
+    return _calculate_model_credit_cost(model_setting, loras, HIRES_CREDIT_MULTIPLIER)
 
 
 class ImageData(BaseModel):
@@ -2956,7 +3072,11 @@ async def submit_job(
     user: Optional[dict] = Depends(get_current_user),
 ):
     # Ensure model is always valid even if clients send stale/renamed ids.
-    job_data.model = normalize_model_id(job_data.model)
+    model_settings = await get_generation_models()
+    job_data.model = normalize_model_id(job_data.model, model_settings)
+    active_model_setting = get_generation_model_by_id(job_data.model, model_settings)
+    if not active_model_setting:
+        raise HTTPException(status_code=503, detail="Generation model settings are inconsistent.")
 
     # CRITICAL: Validate that img2img/inpainting/upscale jobs have required image data.
     # This prevents a frontend bug where job_type is set but image data is missing.
@@ -3018,12 +3138,20 @@ async def submit_job(
         
         user_id = user["user_id"]
         credit_cost = (
-            get_upscale_credit_cost(job_data.model, job_data.loras)
+            _calculate_model_credit_cost(
+                active_model_setting,
+                job_data.loras,
+                UPSCALE_CREDIT_MULTIPLIER,
+            )
             if is_upscale_job
             else (
-                get_hires_credit_cost(job_data.model, job_data.loras)
+                _calculate_model_credit_cost(
+                    active_model_setting,
+                    job_data.loras,
+                    HIRES_CREDIT_MULTIPLIER,
+                )
                 if is_hires_job
-                else get_credit_cost(job_data.model, job_data.loras)
+                else _calculate_model_credit_cost(active_model_setting, job_data.loras)
             )
         )
         
@@ -3143,9 +3271,10 @@ async def submit_job(
             # If priority queue with credits, deduct first (atomic with job creation)
             if queue_type == "priority" and credit_cost > 0 and user_id:
                 # Deduct credits
+                base_model_for_transaction = str(active_model_setting.get("base_model") or "SD 1.5")
                 await acur.execute(
                     "SELECT * FROM deduct_credits(%s, %s, %s, NULL, %s)",
-                    (user_id, credit_cost, f"generation_{MODEL_BASE_TYPES.get(job_data.model, 'SD 1.5').lower().replace(' ', '')}", 
+                    (user_id, credit_cost, f"generation_{base_model_for_transaction.lower().replace(' ', '')}",
                      f"Priority generation - {job_data.model}")
                 )
                 deduct_result = await acur.fetchone()
@@ -3273,6 +3402,7 @@ async def search_civitAi_loras_by_query(query: str, show_nsfw: bool = False):
     # We need to filter the data since it returns main pages that could contain several loras
     loras = []
     data = data['items']
+    supported_lora_base_models = await get_supported_lora_base_models()
     for lora in data:
         lora_page_info = {
             'model_page_id': lora.get('id'),
@@ -3301,7 +3431,7 @@ async def search_civitAi_loras_by_query(query: str, show_nsfw: bool = False):
             }
 
             # Only surface LoRAs that match the model families supported in the app.
-            if not is_supported_lora_base_model(lora_info['base_model']):
+            if not is_supported_lora_base_model(lora_info['base_model'], supported_lora_base_models):
                 continue
 
             # add the lora_info to the lora_page_info
@@ -3329,6 +3459,7 @@ async def search_civitAi_loras_by_id(id: str, show_nsfw: bool = False):
 
     loras = []
     if 'modelVersions' in data:
+        supported_lora_base_models = await get_supported_lora_base_models()
         if data.get('nsfw') and not show_nsfw:
             raise HTTPException(
                 status_code=422,
@@ -3366,7 +3497,7 @@ async def search_civitAi_loras_by_id(id: str, show_nsfw: bool = False):
             }
 
             # Only surface LoRAs that match the model families supported in the app.
-            if not is_supported_lora_base_model(lora_info['base_model']):
+            if not is_supported_lora_base_model(lora_info['base_model'], supported_lora_base_models):
                 continue
 
             # add the lora_info to the lora_page_info
@@ -3409,6 +3540,7 @@ async def search_civitAi_loras_by_user(username: str, show_nsfw: bool = False):
     # We need to filter the data since it returns main pages that could contain several loras
     loras = []
     data = data['items']
+    supported_lora_base_models = await get_supported_lora_base_models()
     for lora in data:
         if lora.get('type') != 'LORA' and lora.get('type') != 'LoCon':
             continue
@@ -3440,7 +3572,7 @@ async def search_civitAi_loras_by_user(username: str, show_nsfw: bool = False):
             }
 
             # Only surface LoRAs that match the model families supported in the app.
-            if not is_supported_lora_base_model(lora_info['base_model']):
+            if not is_supported_lora_base_model(lora_info['base_model'], supported_lora_base_models):
                 continue
 
             # add the lora_info to the lora_page_info
@@ -5176,28 +5308,54 @@ async def claim_daily_bonus(user: dict = Depends(require_auth)):
                 raise HTTPException(status_code=500, detail="Failed to claim daily bonus")
 
 
+@app.get("/models")
+async def get_generation_model_catalog():
+    """Get active generation models and editable website settings. Public endpoint."""
+    model_settings = await get_generation_models()
+    return {
+        "default_model": get_default_generation_model_id(model_settings),
+        "models": model_settings,
+        "supported_lora_base_models": sorted(await get_supported_lora_base_models()),
+    }
+
+
 @app.get("/credits/cost/{model}")
 async def get_model_credit_cost(model: str):
     """Get the credit cost for a specific model. Public endpoint."""
-    cost = get_credit_cost(model)
-    base_type = MODEL_BASE_TYPES.get(model, "SD 1.5")
-    per_lora_cost = LORA_CREDIT_COSTS.get(base_type, 0)
+    model_settings = await get_generation_models()
+    normalized_model = normalize_model_id(model, model_settings)
+    model_setting = get_generation_model_by_id(normalized_model, model_settings)
+    if not model_setting:
+        raise HTTPException(status_code=503, detail="Generation model settings are inconsistent.")
+    cost = _calculate_model_credit_cost(model_setting)
+    base_type = str(model_setting.get("base_model") or "SD 1.5")
+    per_lora_cost = int(model_setting.get("lora_credit_cost") or 0)
     
     return {
-        "model": model,
+        "model": normalized_model,
+        "requested_model": model,
+        "display_name": model_setting.get("display_name") or normalized_model,
         "base_type": base_type,
         "credit_cost": cost,
         "per_lora_credit_cost": per_lora_cost,
+        "default_cfg": model_setting.get("default_cfg"),
+        "supports_sdxl_resolution": model_setting.get("supports_sdxl_resolution"),
+        "supports_regional_prompting": model_setting.get("supports_regional_prompting"),
+        "supports_upscale": model_setting.get("supports_upscale"),
     }
 
 
 @app.get("/credits/costs")
 async def get_all_credit_costs():
     """Get credit costs for all models. Public endpoint."""
+    model_settings = await get_generation_models()
+    costs, lora_costs, models = _model_maps_from_settings(model_settings)
     return {
-        "costs": CREDIT_COSTS,
-        "lora_costs": LORA_CREDIT_COSTS,
-        "models": MODEL_BASE_TYPES
+        "costs": costs,
+        "lora_costs": lora_costs,
+        "models": models,
+        "default_model": get_default_generation_model_id(model_settings),
+        "model_settings": model_settings,
     }
 
 
@@ -6363,7 +6521,8 @@ async def admin_upload_manual_lora(
         raise HTTPException(status_code=400, detail="Name is required.")
     if not normalized_version:
         raise HTTPException(status_code=400, detail="Version is required.")
-    if not is_supported_lora_base_model(normalized_base_model):
+    supported_lora_base_models = await get_supported_lora_base_models()
+    if not is_supported_lora_base_model(normalized_base_model, supported_lora_base_models):
         raise HTTPException(status_code=400, detail="Unsupported base model.")
 
     original_filename = (file.filename or "").strip()
