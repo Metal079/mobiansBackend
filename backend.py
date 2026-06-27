@@ -161,7 +161,12 @@ GENERATION_MODEL_COLUMNS = (
 
 def _generation_model_from_row(row: Tuple[Any, ...]) -> Dict[str, Any]:
     model = dict(zip(GENERATION_MODEL_COLUMNS, row))
-    model["default_cfg"] = float(model.get("default_cfg") or 0)
+    default_cfg = float(model.get("default_cfg") or 0)
+    if not math.isfinite(default_cfg) or not default_cfg.is_integer() or default_cfg < 1 or default_cfg > 15:
+        raise ValueError(
+            f"Invalid default_cfg for generation model {model.get('model_id')}: {model.get('default_cfg')}"
+        )
+    model["default_cfg"] = int(default_cfg)
     model["credit_cost"] = int(model.get("credit_cost") or 0)
     model["lora_credit_cost"] = int(model.get("lora_credit_cost") or 0)
     model["display_order"] = int(model.get("display_order") or 0)
@@ -7068,6 +7073,13 @@ class SyncImageRequest(BaseModel):
     image_blob: str  # Base64 encoded image
 
 
+MAX_SYNC_BLOB_BATCH_SIZE = 100
+
+
+class SyncImageBlobsRequest(BaseModel):
+    image_uuids: List[str]
+
+
 class SyncTagsRequest(BaseModel):
     tags: List[dict]
 
@@ -7332,6 +7344,52 @@ async def get_synced_images(include_blobs: bool = True, user: dict = Depends(req
         })
     
     return images
+
+
+@app.post("/history/sync/images/blobs")
+async def get_synced_image_blobs(request: SyncImageBlobsRequest, user: dict = Depends(require_auth)):
+    """Get image blobs for a bounded set of synced image UUIDs."""
+    user_id = user["user_id"]
+
+    image_uuids: List[str] = []
+    seen_uuids = set()
+    for image_uuid in request.image_uuids or []:
+        normalized_uuid = str(image_uuid).strip()
+        if not normalized_uuid or normalized_uuid in seen_uuids:
+            continue
+        seen_uuids.add(normalized_uuid)
+        image_uuids.append(normalized_uuid)
+
+    if len(image_uuids) > MAX_SYNC_BLOB_BATCH_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Request too large. Limit image_uuids to {MAX_SYNC_BLOB_BATCH_SIZE} per request.",
+        )
+
+    if len(image_uuids) == 0:
+        return []
+
+    async with db_pool.connection() as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT image_uuid, image_blob
+                FROM user_synced_images
+                WHERE user_id = %s
+                  AND image_uuid = ANY(%s::varchar[])
+                  AND image_blob IS NOT NULL
+                """,
+                (user_id, image_uuids),
+            )
+            rows = await acur.fetchall()
+
+    return [
+        {
+            "image_uuid": row[0],
+            "image_blob": base64.b64encode(row[1]).decode("utf-8"),
+        }
+        for row in rows
+    ]
 
 
 @app.delete("/history/sync/image/{image_uuid}")
