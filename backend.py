@@ -3551,6 +3551,40 @@ async def import_dynamic_prompt_template(template_id: str, user: dict = Depends(
     return JSONResponse(content={"template": imported})
 
 
+ORIGINAL_IMAGE_LOOKUP_JOB_TYPES = {"img2img", "inpainting", "upscale"}
+
+
+async def replace_request_image_with_original_by_hash(job_data: JobData) -> None:
+    if job_data.job_type not in ORIGINAL_IMAGE_LOOKUP_JOB_TYPES:
+        return
+
+    if not job_data.image or not job_data.image.strip():
+        return
+
+    try:
+        image_hash = await asyncio.to_thread(image_phash_from_base64, job_data.image)
+        image_hash = await twos_complement(str(image_hash), 64)
+
+        async with db_connection("jobs.resolve_original_image_by_hash") as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute("SELECT * FROM get_image_by_hash(%s)", (image_hash,))
+                found_img = await acur.fetchone()
+
+        if found_img and found_img[0]:
+            logging.info(
+                "Found original image for %s job with hash %s",
+                job_data.job_type,
+                image_hash,
+            )
+            job_data.image = found_img[0]
+    except Exception as exc:
+        logging.error(
+            "Error resolving original image for %s job by hash: %s",
+            job_data.job_type,
+            exc,
+        )
+
+
 @app.post("/submit_job/")
 async def submit_job(
     job_data: JobData,
@@ -3594,6 +3628,8 @@ async def submit_job(
             "This is likely a stale frontend state."
         )
         job_data.color_inpaint = None
+
+    await replace_request_image_with_original_by_hash(job_data)
 
     job_data.loras = await hydrate_generation_loras(job_data.loras)
 
