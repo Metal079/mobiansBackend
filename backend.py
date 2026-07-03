@@ -3,6 +3,7 @@ import io
 import base64
 import sys
 import asyncio
+import gzip
 import hashlib
 from typing import Optional, Dict, List, Any, Tuple
 import logging
@@ -25,6 +26,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header, Up
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from PIL import Image
 from pydantic import BaseModel
@@ -77,6 +79,7 @@ DBPASS = os.environ.get("DBPASS")
 #   hold row locks indefinitely and block the generator's pending-job polling.
 DSN = (
     f"host={DBHOST} dbname='{DBNAME}' user={DBUSER} password={DBPASS} "
+    "application_name=mobians_backend "
     "keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3 "
     "options='-c idle_in_transaction_session_timeout=30000 "
     "-c statement_timeout=60000 -c lock_timeout=5000'"
@@ -113,6 +116,7 @@ DB_POOL_WAIT_WARNING_SECONDS = max(0.05, float(os.environ.get("DB_POOL_WAIT_WARN
 EVENT_LOOP_LAG_INTERVAL_SECONDS = max(0.25, float(os.environ.get("EVENT_LOOP_LAG_INTERVAL_SECONDS", "1")))
 EVENT_LOOP_LAG_WARNING_SECONDS = max(0.1, float(os.environ.get("EVENT_LOOP_LAG_WARNING_SECONDS", "1")))
 LORAS_CACHE_TTL_SECONDS = max(0.0, float(os.environ.get("LORAS_CACHE_TTL_SECONDS", "60")))
+LORAS_CACHE_STALE_SECONDS = max(0.0, float(os.environ.get("LORAS_CACHE_STALE_SECONDS", "300")))
 
 # Upscale credit multiplier (upscales are computationally expensive)
 UPSCALE_CREDIT_MULTIPLIER = 3
@@ -341,8 +345,9 @@ session = None
 # Define db_pool as a global variable
 db_pool = None
 webpush_semaphore = asyncio.Semaphore(WEBPUSH_CONCURRENCY)
-loras_response_cache: Dict[str, dict[str, Any]] = {}
-loras_cache_locks: Dict[str, asyncio.Lock] = {}
+loras_response_cache: Dict[tuple[str, str], dict[str, Any]] = {}
+loras_cache_locks: Dict[tuple[str, str], asyncio.Lock] = {}
+loras_cache_refresh_tasks: Dict[tuple[str, str], asyncio.Task] = {}
 
 
 def _json_for_log(value: Any) -> str:
@@ -402,6 +407,212 @@ async def event_loop_lag_monitor_task():
             )
         expected = now + EVENT_LOOP_LAG_INTERVAL_SECONDS
 
+
+def _normalize_loras_status(status: str = "active") -> str:
+    status_norm = (status or "active").strip().lower()
+    return status_norm if status_norm in {"active", "inactive", "all"} else "active"
+
+
+def _normalize_loras_fields(fields: str = "summary") -> str:
+    fields_norm = (fields or "summary").strip().lower()
+    return fields_norm if fields_norm in {"summary", "full"} else "summary"
+
+
+def _loras_select_columns(fields_norm: str) -> list[str]:
+    if fields_norm == "full":
+        return [
+            "id",
+            "name",
+            "version",
+            "base_model",
+            "download_url",
+            "is_nsfw",
+            "is_minor",
+            "creator",
+            "description",
+            "version_description",
+            "tags",
+            "who_added",
+            "status",
+            "trigger_words",
+            "date_added",
+            "hashes",
+            "image_url",
+            "file_path",
+            "uses",
+            "is_active",
+            "last_used_date",
+            "version_id",
+        ]
+
+    return [
+        "id",
+        "name",
+        "version",
+        "base_model",
+        "is_nsfw",
+        "is_minor",
+        "tags",
+        "trigger_words",
+        "date_added",
+        "image_url",
+        "uses",
+        "is_active",
+        "version_id",
+    ]
+
+
+def _request_accepts_gzip(request: Optional[Request]) -> bool:
+    if request is None:
+        return False
+
+    accept_encoding = request.headers.get("accept-encoding", "")
+    for item in accept_encoding.split(","):
+        encoding, _, params = item.strip().lower().partition(";")
+        if encoding != "gzip":
+            continue
+        for param in params.split(";"):
+            key, _, value = param.strip().partition("=")
+            if key == "q":
+                try:
+                    return float(value) > 0
+                except ValueError:
+                    return False
+        return True
+    return False
+
+
+def _loras_cache_response(
+    cache_state: dict[str, Any],
+    cache_status: str,
+    request: Optional[Request] = None,
+) -> Response:
+    headers = {
+        "Cache-Control": (
+            f"public, max-age={int(LORAS_CACHE_TTL_SECONDS)}, "
+            f"stale-while-revalidate={int(LORAS_CACHE_STALE_SECONDS)}"
+        ),
+        "X-Loras-Cache": cache_status,
+        "X-Loras-Fields": cache_state.get("fields", "summary"),
+        "Vary": "Accept-Encoding",
+    }
+    if _request_accepts_gzip(request):
+        headers["Content-Encoding"] = "gzip"
+        body = cache_state["gzip_body"]
+    else:
+        body = cache_state["body"]
+
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers=headers,
+    )
+
+
+def _loras_where_clause(status_norm: str) -> str:
+    if status_norm == "inactive":
+        return "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL) and is_active = false"
+    if status_norm == "all":
+        return "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL)"
+    return "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL) and is_active = true"
+
+
+async def _build_loras_response_body(status_norm: str, fields_norm: str) -> tuple[bytes, bytes, int, float, float, float]:
+    select_columns = _loras_select_columns(fields_norm)
+    select_clause = ",\n                    ".join(select_columns)
+    query_start = time.perf_counter()
+    async with db_connection("loras.get_loras") as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                f"""
+                SELECT
+                    {select_clause}
+                FROM lora_metadata
+                {_loras_where_clause(status_norm)}
+                ORDER BY uses DESC
+                """
+            )
+            columns = [desc[0] for desc in acur.description]
+            rows = await acur.fetchall()
+
+    query_ms = (time.perf_counter() - query_start) * 1000
+    encode_start = time.perf_counter()
+    result = [dict(zip(columns, row)) for row in rows]
+    body = json.dumps(jsonable_encoder(result), separators=(",", ":")).encode("utf-8")
+    encode_ms = (time.perf_counter() - encode_start) * 1000
+    gzip_start = time.perf_counter()
+    gzip_body = await asyncio.to_thread(gzip.compress, body, compresslevel=5)
+    gzip_ms = (time.perf_counter() - gzip_start) * 1000
+    return body, gzip_body, len(rows), query_ms, encode_ms, gzip_ms
+
+
+async def _refresh_loras_cache(status_norm: str, fields_norm: str, reason: str) -> dict[str, Any]:
+    body, gzip_body, row_count, query_ms, encode_ms, gzip_ms = await _build_loras_response_body(status_norm, fields_norm)
+    expires_at = time.time() + LORAS_CACHE_TTL_SECONDS
+    cache_state = {
+        "body": body,
+        "gzip_body": gzip_body,
+        "expires_at": expires_at,
+        "stale_until": expires_at + LORAS_CACHE_STALE_SECONDS,
+        "status": status_norm,
+        "fields": fields_norm,
+    }
+    if LORAS_CACHE_TTL_SECONDS > 0:
+        loras_response_cache[(status_norm, fields_norm)] = cache_state
+
+    total_ms = query_ms + encode_ms + gzip_ms
+    log_method = logger.warning if total_ms >= SLOW_REQUEST_WARNING_SECONDS * 1000 else logger.info
+    log_method(
+        "get_loras_%s status=%s fields=%s rows=%s bytes=%s gzip_bytes=%s query_ms=%.1f encode_ms=%.1f gzip_ms=%.1f cache_ttl_seconds=%.1f stale_seconds=%.1f",
+        reason,
+        status_norm,
+        fields_norm,
+        row_count,
+        len(body),
+        len(gzip_body),
+        query_ms,
+        encode_ms,
+        gzip_ms,
+        LORAS_CACHE_TTL_SECONDS,
+        LORAS_CACHE_STALE_SECONDS,
+    )
+    return cache_state
+
+
+async def warm_loras_cache_task():
+    try:
+        await _refresh_loras_cache("active", "summary", "warm")
+    except Exception:
+        logger.exception("Failed to warm active LoRA cache")
+
+
+async def _refresh_loras_cache_with_lock(status_norm: str, fields_norm: str, reason: str) -> dict[str, Any]:
+    cache_key = (status_norm, fields_norm)
+    lock = loras_cache_locks.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        now = time.time()
+        cached = loras_response_cache.get(cache_key)
+        if cached and cached["expires_at"] > now:
+            return cached
+        return await _refresh_loras_cache(status_norm, fields_norm, reason)
+
+
+def _schedule_loras_cache_refresh(status_norm: str, fields_norm: str, reason: str = "stale-refresh") -> None:
+    cache_key = (status_norm, fields_norm)
+    existing_task = loras_cache_refresh_tasks.get(cache_key)
+    if existing_task is not None and not existing_task.done():
+        return
+
+    async def refresh_task():
+        try:
+            await _refresh_loras_cache_with_lock(status_norm, fields_norm, reason)
+        except Exception:
+            logger.exception("Failed to refresh LoRA cache status=%s fields=%s", status_norm, fields_norm)
+        finally:
+            loras_cache_refresh_tasks.pop(cache_key, None)
+
+    loras_cache_refresh_tasks[cache_key] = asyncio.create_task(refresh_task())
+
 # Set up the CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -410,6 +621,7 @@ app.add_middleware(
     allow_methods=["*"],  # Allow all methods
     allow_headers=["*"],  # Allow all headers
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 # Create a connection pool
@@ -452,6 +664,8 @@ async def startup_event():
     # Start the server-side push notifier so users get pinged when their
     # long-running upscale/hi-res jobs finish even if the tab is closed.
     asyncio.create_task(job_completion_notifier_task())
+
+    await warm_loras_cache_task()
 
     asyncio.create_task(event_loop_lag_monitor_task())
 
@@ -604,6 +818,20 @@ def _apply_common_response_headers(response: Response, request_id: str) -> Respo
     return response
 
 
+def _response_diagnostics_for_log(response: Optional[Response]) -> dict[str, Any]:
+    if response is None:
+        return {}
+
+    headers = response.headers
+    diagnostics = {
+        "content_length": headers.get("content-length"),
+        "content_encoding": headers.get("content-encoding"),
+        "loras_cache": headers.get("x-loras-cache"),
+        "loras_fields": headers.get("x-loras-fields"),
+    }
+    return {key: value for key, value in diagnostics.items() if value}
+
+
 @app.middleware("http")
 async def add_cors_headers(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
@@ -635,13 +863,14 @@ async def add_cors_headers(request: Request, call_next):
         if elapsed_seconds >= SLOW_REQUEST_WARNING_SECONDS or (status_code is not None and status_code >= 500):
             log_method = logger.error if status_code is not None and status_code >= 500 else logger.warning
             log_method(
-                "request_finished request_id=%s method=%s path=%s status=%s elapsed_ms=%.1f client=%s pool=%s",
+                "request_finished request_id=%s method=%s path=%s status=%s elapsed_ms=%.1f client=%s response=%s pool=%s",
                 request_id,
                 request.method,
                 request.url.path,
                 status_code,
                 elapsed_seconds * 1000,
                 request.client.host if request.client else None,
+                _json_for_log(_response_diagnostics_for_log(response)),
                 _json_for_log(_db_pool_stats_for_log()),
             )
 
@@ -4484,92 +4713,30 @@ async def get_job_image(job_id: str, image_index: int):
 
 
 @app.get("/get_loras/")
-async def get_loras(status: str = "active"):
-    status_norm = (status or "active").strip().lower()
-    if status_norm not in {"active", "inactive", "all"}:
-        status_norm = "active"
-
-    def cached_response(cache_state: dict[str, Any], cache_status: str) -> Response:
-        return Response(
-            content=cache_state["body"],
-            media_type="application/json",
-            headers={
-                "Cache-Control": f"public, max-age={int(LORAS_CACHE_TTL_SECONDS)}",
-                "X-Loras-Cache": cache_status,
-            },
-        )
-
-    cache_key = status_norm
+async def get_loras(request: Request, status: str = "active", fields: str = "summary"):
+    status_norm = _normalize_loras_status(status)
+    fields_norm = _normalize_loras_fields(fields)
+    cache_key = (status_norm, fields_norm)
     now = time.time()
     cached = loras_response_cache.get(cache_key)
     if cached and cached["expires_at"] > now:
-        return cached_response(cached, "hit")
+        return _loras_cache_response(cached, "hit", request)
+    if cached and cached.get("stale_until", 0) > now:
+        _schedule_loras_cache_refresh(status_norm, fields_norm)
+        return _loras_cache_response(cached, "stale", request)
 
     lock = loras_cache_locks.setdefault(cache_key, asyncio.Lock())
     async with lock:
         now = time.time()
         cached = loras_response_cache.get(cache_key)
         if cached and cached["expires_at"] > now:
-            return cached_response(cached, "hit-after-wait")
+            return _loras_cache_response(cached, "hit-after-wait", request)
+        if cached and cached.get("stale_until", 0) > now:
+            _schedule_loras_cache_refresh(status_norm, fields_norm)
+            return _loras_cache_response(cached, "stale-after-wait", request)
 
-        if status_norm == "inactive":
-            where_clause = "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL) and is_active = false"
-        elif status_norm == "all":
-            where_clause = "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL)"
-        else:
-            where_clause = "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL) and is_active = true"
-
-        query_start = time.perf_counter()
-        async with db_connection("loras.get_loras") as aconn:
-            async with aconn.cursor() as acur:
-                await acur.execute(
-                    f"""
-                    SELECT
-                        id, name, version, base_model, download_url, is_nsfw, is_minor,
-                        creator, description, version_description, tags, who_added, status,
-                        trigger_words, date_added, hashes, image_url, file_path, uses,
-                        is_active, last_used_date, version_id
-                    FROM lora_metadata
-                    {where_clause}
-                    ORDER BY uses DESC
-                    """
-                )
-                columns = [desc[0] for desc in acur.description]
-                rows = await acur.fetchall()
-
-        query_ms = (time.perf_counter() - query_start) * 1000
-        encode_start = time.perf_counter()
-        result = [dict(zip(columns, row)) for row in rows]
-        body = json.dumps(jsonable_encoder(result), separators=(",", ":")).encode("utf-8")
-        encode_ms = (time.perf_counter() - encode_start) * 1000
-
-        if LORAS_CACHE_TTL_SECONDS > 0:
-            loras_response_cache[cache_key] = {
-                "body": body,
-                "expires_at": time.time() + LORAS_CACHE_TTL_SECONDS,
-            }
-
-        total_ms = query_ms + encode_ms
-        if total_ms >= SLOW_REQUEST_WARNING_SECONDS * 1000:
-            logger.warning(
-                "get_loras_slow status=%s rows=%s bytes=%s query_ms=%.1f encode_ms=%.1f cache_ttl_seconds=%.1f",
-                status_norm,
-                len(rows),
-                len(body),
-                query_ms,
-                encode_ms,
-                LORAS_CACHE_TTL_SECONDS,
-            )
-
-        response = Response(
-            content=body,
-            media_type="application/json",
-            headers={
-                "Cache-Control": f"public, max-age={int(LORAS_CACHE_TTL_SECONDS)}",
-                "X-Loras-Cache": "miss",
-            },
-        )
-        return response
+        cache_state = await _refresh_loras_cache(status_norm, fields_norm, "miss")
+        return _loras_cache_response(cache_state, "miss", request)
 
 async def enhanced_filter(prompt, pattern, replacement):
     # Replace spaces with \W+ to match any non-word characters between the words
@@ -5527,10 +5694,17 @@ async def claim_daily_bonus(user: dict = Depends(require_auth)):
 async def get_generation_model_catalog():
     """Get active generation models and editable website settings. Public endpoint."""
     model_settings = await get_generation_models()
+    supported_base_models = {
+        str(model.get("base_model") or "").strip()
+        for model in model_settings
+        if model.get("is_active", True)
+    }
     return {
         "default_model": get_default_generation_model_id(model_settings),
         "models": model_settings,
-        "supported_lora_base_models": sorted(await get_supported_lora_base_models()),
+        "supported_lora_base_models": sorted(
+            base_model for base_model in supported_base_models if base_model
+        ),
     }
 
 
@@ -7331,31 +7505,24 @@ async def get_sync_status(user: dict = Depends(require_auth)):
     """Get the current sync status for the user."""
     user_id = user["user_id"]
     
-    async with db_pool.connection() as aconn:
+    async with db_connection("history.get_sync_status") as aconn:
         async with aconn.cursor() as acur:
-            # Count synced images
             await acur.execute(
-                "SELECT COUNT(*) FROM user_synced_images WHERE user_id = %s",
+                """
+                SELECT
+                    COUNT(*) AS images_in_cloud,
+                    MAX(updated_at) AS last_sync_time,
+                    COALESCE(array_agg(image_uuid ORDER BY created_at), ARRAY[]::varchar[]) AS synced_uuids
+                FROM user_synced_images
+                WHERE user_id = %s
+                """,
                 (user_id,)
             )
-            count_row = await acur.fetchone()
-            images_in_cloud = count_row[0] if count_row else 0
-            
-            # Get last sync time (most recent updated_at)
-            await acur.execute(
-                "SELECT MAX(updated_at) FROM user_synced_images WHERE user_id = %s",
-                (user_id,)
-            )
-            time_row = await acur.fetchone()
-            last_sync_time = time_row[0].isoformat() if time_row and time_row[0] else None
-            
-            # Get list of synced UUIDs
-            await acur.execute(
-                "SELECT image_uuid FROM user_synced_images WHERE user_id = %s",
-                (user_id,)
-            )
-            uuid_rows = await acur.fetchall()
-            synced_uuids = [row[0] for row in uuid_rows]
+            row = await acur.fetchone()
+
+    images_in_cloud = row[0] if row else 0
+    last_sync_time = row[1].isoformat() if row and row[1] else None
+    synced_uuids = list(row[2] or []) if row else []
     
     return {
         "images_in_cloud": images_in_cloud,
@@ -7631,7 +7798,7 @@ async def sync_tags(request: SyncTagsRequest, user: dict = Depends(require_auth)
     """
     user_id = user["user_id"]
     
-    async with db_pool.connection() as aconn:
+    async with db_connection("history.sync_tags") as aconn:
         async with aconn.cursor() as acur:
             for tag in request.tags:
                 tag_id = tag.get("id")
@@ -7673,7 +7840,7 @@ async def get_synced_tags(user: dict = Depends(require_auth)):
     """Get user's synced tags."""
     user_id = user["user_id"]
     
-    async with db_pool.connection() as aconn:
+    async with db_connection("history.get_synced_tags") as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 "SELECT id, name, color, created_at FROM user_tags WHERE user_id = %s ORDER BY created_at",
@@ -7764,7 +7931,7 @@ async def get_lora_preferences(user: dict = Depends(require_auth)):
     """Get user's LoRA favorites and last-used timestamps."""
     user_id = user["user_id"]
 
-    async with db_pool.connection() as aconn:
+    async with db_connection("lora.get_preferences") as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
@@ -7827,7 +7994,7 @@ async def get_regional_prompt_presets(user: dict = Depends(require_auth)):
     """Get account-backed regional prompt presets for the current user."""
     user_id = user["user_id"]
 
-    async with db_pool.connection() as aconn:
+    async with db_connection("regional_presets.get") as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
