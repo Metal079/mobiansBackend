@@ -304,6 +304,124 @@ def _calculate_model_credit_cost(
     return (base_cost + (lora_count * per_lora_cost)) * multiplier
 
 
+def _int_lora_identifier(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def hydrate_generation_loras(loras: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+    if not loras:
+        return loras
+    if not isinstance(loras, list):
+        raise HTTPException(status_code=400, detail="loras must be a list")
+
+    version_ids: set[int] = set()
+    row_ids: set[int] = set()
+    normalized_loras: list[dict[str, Any]] = []
+
+    for lora in loras:
+        if not isinstance(lora, dict):
+            raise HTTPException(status_code=400, detail="Each LoRA entry must be an object")
+
+        normalized = dict(lora)
+        if normalized.get("strength") is None:
+            normalized["strength"] = 1.0
+        normalized_loras.append(normalized)
+
+        needs_lookup = not normalized.get("file_path") or not normalized.get("name") or not normalized.get("version")
+        if not needs_lookup:
+            continue
+
+        version_id = _int_lora_identifier(
+            normalized.get("version_id")
+            or normalized.get("model_version_id")
+            or normalized.get("lora_version_id")
+            or normalized.get("modelVersionId")
+            or normalized.get("versionId")
+        )
+        row_id = _int_lora_identifier(normalized.get("id"))
+        if version_id is not None:
+            version_ids.add(version_id)
+        if row_id is not None:
+            row_ids.add(row_id)
+
+    if not version_ids and not row_ids:
+        missing = [
+            lora.get("name") or lora.get("version_id") or "unknown"
+            for lora in normalized_loras
+            if not lora.get("file_path") or not lora.get("name") or not lora.get("version")
+        ]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Selected LoRA is missing required metadata: {missing[0]}")
+        return normalized_loras
+
+    async with db_connection("loras.hydrate_generation_loras") as aconn:
+        async with aconn.cursor() as acur:
+            await acur.execute(
+                """
+                SELECT id, version_id, name, version, base_model, trigger_words, image_url, file_path
+                FROM lora_metadata
+                WHERE (%s::bigint[] IS NOT NULL AND version_id = ANY(%s::bigint[]))
+                   OR (%s::bigint[] IS NOT NULL AND id = ANY(%s::bigint[]))
+                """,
+                (
+                    list(version_ids) if version_ids else None,
+                    list(version_ids) if version_ids else None,
+                    list(row_ids) if row_ids else None,
+                    list(row_ids) if row_ids else None,
+                ),
+            )
+            rows = await acur.fetchall()
+
+    by_version_id: dict[int, tuple[Any, ...]] = {}
+    by_id: dict[int, tuple[Any, ...]] = {}
+    for row in rows:
+        row_id, version_id = row[0], row[1]
+        if row_id is not None:
+            by_id[int(row_id)] = row
+        if version_id is not None:
+            by_version_id[int(version_id)] = row
+
+    for normalized in normalized_loras:
+        needs_lookup = not normalized.get("file_path") or not normalized.get("name") or not normalized.get("version")
+        if not needs_lookup:
+            continue
+
+        version_id = _int_lora_identifier(
+            normalized.get("version_id")
+            or normalized.get("model_version_id")
+            or normalized.get("lora_version_id")
+            or normalized.get("modelVersionId")
+            or normalized.get("versionId")
+        )
+        row_id = _int_lora_identifier(normalized.get("id"))
+        row = by_version_id.get(version_id) if version_id is not None else None
+        if row is None and row_id is not None:
+            row = by_id.get(row_id)
+
+        if row is None or not row[7]:
+            label = normalized.get("name") or normalized.get("version_id") or normalized.get("id") or "unknown"
+            raise HTTPException(status_code=400, detail=f"Selected LoRA is missing file_path: {label}")
+
+        normalized.setdefault("id", row[0])
+        normalized.setdefault("version_id", row[1])
+        if not normalized.get("name"):
+            normalized["name"] = row[2]
+        if not normalized.get("version"):
+            normalized["version"] = row[3]
+        normalized.setdefault("base_model", row[4])
+        normalized.setdefault("trigger_words", row[5])
+        normalized.setdefault("image_url", row[6])
+        if not normalized.get("file_path"):
+            normalized["file_path"] = row[7]
+
+    return normalized_loras
+
+
 def _model_maps_from_settings(
     model_settings: List[Dict[str, Any]]
 ) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, str]]:
@@ -456,6 +574,7 @@ def _loras_select_columns(fields_norm: str) -> list[str]:
         "trigger_words",
         "date_added",
         "image_url",
+        "file_path",
         "uses",
         "is_active",
         "version_id",
@@ -1299,7 +1418,7 @@ CUSTOM_CATEGORY_DESCRIPTION_MAX = 500
 CUSTOM_CATEGORY_MAX_ENTRIES = 250
 CUSTOM_CATEGORY_ENTRY_MAX = 180
 DYNAMIC_PROMPT_VOTE_CONTENT_TYPES = {"template", "category"}
-DYNAMIC_PROMPT_CREATOR_VOTE_REWARD_CREDITS = 50
+DYNAMIC_PROMPT_CREATOR_VOTE_REWARD_CREDITS = 100
 DYNAMIC_PROMPT_VOTER_VOTE_REWARD_CREDITS = 15
 DYNAMIC_PROMPT_TEMPLATE_VOTER_DAILY_CAP = 3
 DYNAMIC_PROMPT_CATEGORY_VOTER_DAILY_CAP = 3
@@ -3475,6 +3594,8 @@ async def submit_job(
             "This is likely a stale frontend state."
         )
         job_data.color_inpaint = None
+
+    job_data.loras = await hydrate_generation_loras(job_data.loras)
 
     # Determine queue type and credit cost
     queue_type = job_data.queue_type or "free"
