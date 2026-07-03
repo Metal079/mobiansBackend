@@ -466,6 +466,7 @@ webpush_semaphore = asyncio.Semaphore(WEBPUSH_CONCURRENCY)
 loras_response_cache: Dict[tuple[str, str], dict[str, Any]] = {}
 loras_cache_locks: Dict[tuple[str, str], asyncio.Lock] = {}
 loras_cache_refresh_tasks: Dict[tuple[str, str], asyncio.Task] = {}
+loras_cache_generation = 0
 
 
 def _json_for_log(value: Any) -> str:
@@ -621,6 +622,9 @@ def _loras_cache_response(
         "X-Loras-Fields": fields,
         "Vary": "Accept-Encoding",
     }
+    if fields == "full":
+        headers["Pragma"] = "no-cache"
+        headers["Expires"] = "0"
     if _request_accepts_gzip(request):
         headers["Content-Encoding"] = "gzip"
         body = cache_state["gzip_body"]
@@ -671,7 +675,13 @@ async def _build_loras_response_body(status_norm: str, fields_norm: str) -> tupl
     return body, gzip_body, len(rows), query_ms, encode_ms, gzip_ms
 
 
-async def _refresh_loras_cache(status_norm: str, fields_norm: str, reason: str) -> dict[str, Any]:
+async def _refresh_loras_cache(
+    status_norm: str,
+    fields_norm: str,
+    reason: str,
+    cache_generation: Optional[int] = None,
+) -> dict[str, Any]:
+    expected_generation = loras_cache_generation if cache_generation is None else cache_generation
     body, gzip_body, row_count, query_ms, encode_ms, gzip_ms = await _build_loras_response_body(status_norm, fields_norm)
     expires_at = time.time() + LORAS_CACHE_TTL_SECONDS
     cache_state = {
@@ -682,13 +692,15 @@ async def _refresh_loras_cache(status_norm: str, fields_norm: str, reason: str) 
         "status": status_norm,
         "fields": fields_norm,
     }
-    if LORAS_CACHE_TTL_SECONDS > 0:
+    cache_stored = False
+    if fields_norm != "full" and LORAS_CACHE_TTL_SECONDS > 0 and expected_generation == loras_cache_generation:
         loras_response_cache[(status_norm, fields_norm)] = cache_state
+        cache_stored = True
 
     total_ms = query_ms + encode_ms + gzip_ms
     log_method = logger.warning if total_ms >= SLOW_REQUEST_WARNING_SECONDS * 1000 else logger.info
     log_method(
-        "get_loras_%s status=%s fields=%s rows=%s bytes=%s gzip_bytes=%s query_ms=%.1f encode_ms=%.1f gzip_ms=%.1f cache_ttl_seconds=%.1f stale_seconds=%.1f",
+        "get_loras_%s status=%s fields=%s rows=%s bytes=%s gzip_bytes=%s query_ms=%.1f encode_ms=%.1f gzip_ms=%.1f cache_ttl_seconds=%.1f stale_seconds=%.1f cache_stored=%s cache_generation=%s current_generation=%s",
         reason,
         status_norm,
         fields_norm,
@@ -700,6 +712,9 @@ async def _refresh_loras_cache(status_norm: str, fields_norm: str, reason: str) 
         gzip_ms,
         LORAS_CACHE_TTL_SECONDS,
         LORAS_CACHE_STALE_SECONDS,
+        cache_stored,
+        expected_generation,
+        loras_cache_generation,
     )
     return cache_state
 
@@ -715,11 +730,12 @@ async def _refresh_loras_cache_with_lock(status_norm: str, fields_norm: str, rea
     cache_key = (status_norm, fields_norm)
     lock = loras_cache_locks.setdefault(cache_key, asyncio.Lock())
     async with lock:
+        cache_generation = loras_cache_generation
         now = time.time()
         cached = loras_response_cache.get(cache_key)
         if cached and cached["expires_at"] > now:
             return cached
-        return await _refresh_loras_cache(status_norm, fields_norm, reason)
+        return await _refresh_loras_cache(status_norm, fields_norm, reason, cache_generation)
 
 
 def _schedule_loras_cache_refresh(status_norm: str, fields_norm: str, reason: str = "stale-refresh") -> None:
@@ -740,9 +756,11 @@ def _schedule_loras_cache_refresh(status_norm: str, fields_norm: str, reason: st
 
 
 def _invalidate_loras_response_cache(reason: str) -> None:
+    global loras_cache_generation
     cache_count = len(loras_response_cache)
     task_count = len(loras_cache_refresh_tasks)
 
+    loras_cache_generation += 1
     loras_response_cache.clear()
     for task in list(loras_cache_refresh_tasks.values()):
         if not task.done():
@@ -750,10 +768,11 @@ def _invalidate_loras_response_cache(reason: str) -> None:
     loras_cache_refresh_tasks.clear()
 
     logger.info(
-        "loras_cache_invalidated reason=%s cleared_entries=%s cancelled_refresh_tasks=%s",
+        "loras_cache_invalidated reason=%s cleared_entries=%s cancelled_refresh_tasks=%s cache_generation=%s",
         reason,
         cache_count,
         task_count,
+        loras_cache_generation,
     )
 
 # Set up the CORS middleware
@@ -4897,6 +4916,10 @@ async def get_job_image(job_id: str, image_index: int):
 async def get_loras(request: Request, status: str = "active", fields: str = "summary"):
     status_norm = _normalize_loras_status(status)
     fields_norm = _normalize_loras_fields(fields)
+    if fields_norm == "full":
+        cache_state = await _refresh_loras_cache(status_norm, fields_norm, "bypass", loras_cache_generation)
+        return _loras_cache_response(cache_state, "bypass", request)
+
     cache_key = (status_norm, fields_norm)
     now = time.time()
     cached = loras_response_cache.get(cache_key)
@@ -7220,7 +7243,7 @@ async def admin_upload_manual_lora(
                     raise HTTPException(status_code=500, detail="Failed to create LoRA record.")
 
                 lora_id = inserted_row[0]
-                image_url = f"/lora-image/{lora_id}?v={int(time.time())}"
+                image_url = f"/lora-image/{lora_id}?v={time.time_ns()}"
 
                 await acur.execute(
                     """
@@ -7287,7 +7310,7 @@ async def admin_upload_lora_image(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to process image: {exc}")
 
-    cache_bust = int(time.time())
+    cache_bust = time.time_ns()
     image_url = f"/lora-image/{lora_id}?v={cache_bust}"
 
     async with db_pool.connection() as aconn:
