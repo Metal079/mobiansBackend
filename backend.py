@@ -14,13 +14,14 @@ import math
 import secrets
 import tempfile
 import uuid
+from contextlib import asynccontextmanager
 
 # Fix for Windows - psycopg async requires SelectorEventLoop
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header, UploadFile, File, Form, Query
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header, UploadFile, File, Form, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,12 +50,17 @@ from dynamic_prompts.library import (
 )
 from helper_functions import *
 
+load_dotenv()
+
 PROFILING = False  # Set this from a settings model
 
-logging.basicConfig(level=logging.ERROR)  # Configure logging
-
-# Run 3 retries with exponential backoff strategy
-load_dotenv()
+LOG_LEVEL_NAME = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.INFO)
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("mobians.backend")
 
 API_KEY = os.environ.get("API_KEY")
 CIVITAI_API_KEY = os.environ.get("CIVITAI_API_KEY")
@@ -82,6 +88,8 @@ VAPID_CLAIMS = os.environ.get("VAPID_CLAIMS")
 # Windows Push Service rejects Web Push requests with TTL=0, so use a
 # non-zero default unless explicitly overridden.
 WEBPUSH_TTL_SECONDS = max(1, int(os.environ.get("WEBPUSH_TTL_SECONDS", "300")))
+WEBPUSH_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("WEBPUSH_TIMEOUT_SECONDS", "10")))
+WEBPUSH_CONCURRENCY = max(1, int(os.environ.get("WEBPUSH_CONCURRENCY", "4")))
 # Shared secret used by trusted local services (e.g., lora_downloader_service)
 # to trigger server-initiated push notifications. Leave unset to disable.
 INTERNAL_API_TOKEN = os.environ.get("INTERNAL_API_TOKEN")
@@ -97,6 +105,14 @@ ADMIN_LORA_HEADER_MAX_BYTES = max(
     int(os.environ.get("ADMIN_LORA_HEADER_MAX_BYTES", str(16 * 1024 * 1024))),
 )
 ADMIN_LORA_VERSION_ID_LOCK_KEY = 20498631
+DB_POOL_MIN_SIZE = max(0, int(os.environ.get("DB_POOL_MIN_SIZE", "2")))
+DB_POOL_MAX_SIZE = max(DB_POOL_MIN_SIZE or 1, int(os.environ.get("DB_POOL_MAX_SIZE", "10")))
+DB_POOL_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("DB_POOL_TIMEOUT_SECONDS", "10")))
+SLOW_REQUEST_WARNING_SECONDS = max(0.1, float(os.environ.get("SLOW_REQUEST_WARNING_SECONDS", "2")))
+DB_POOL_WAIT_WARNING_SECONDS = max(0.05, float(os.environ.get("DB_POOL_WAIT_WARNING_SECONDS", "0.5")))
+EVENT_LOOP_LAG_INTERVAL_SECONDS = max(0.25, float(os.environ.get("EVENT_LOOP_LAG_INTERVAL_SECONDS", "1")))
+EVENT_LOOP_LAG_WARNING_SECONDS = max(0.1, float(os.environ.get("EVENT_LOOP_LAG_WARNING_SECONDS", "1")))
+LORAS_CACHE_TTL_SECONDS = max(0.0, float(os.environ.get("LORAS_CACHE_TTL_SECONDS", "60")))
 
 # Upscale credit multiplier (upscales are computationally expensive)
 UPSCALE_CREDIT_MULTIPLIER = 3
@@ -188,7 +204,7 @@ async def get_generation_models(include_inactive: bool = False) -> List[Dict[str
 
     active_filter = "" if include_inactive else "WHERE is_active = TRUE"
     try:
-        async with db_pool.connection() as aconn:
+        async with db_connection("generation_models.load") as aconn:
             async with aconn.cursor() as acur:
                 await acur.execute(
                     f"""
@@ -324,6 +340,67 @@ civitai_link_cache: Dict[int, str] = {}
 session = None
 # Define db_pool as a global variable
 db_pool = None
+webpush_semaphore = asyncio.Semaphore(WEBPUSH_CONCURRENCY)
+loras_response_cache: Dict[str, dict[str, Any]] = {}
+loras_cache_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _json_for_log(value: Any) -> str:
+    try:
+        return json.dumps(value, default=str, sort_keys=True)
+    except Exception:
+        return str(value)
+
+
+def _db_pool_stats_for_log() -> dict[str, Any]:
+    if db_pool is None:
+        return {"status": "not_initialized"}
+    try:
+        return db_pool.get_stats()
+    except Exception as exc:
+        return {"status": "stats_unavailable", "error": str(exc)}
+
+
+def _redact_token(token: Optional[str]) -> str:
+    if not token:
+        return "<empty>"
+    if len(token) <= 8:
+        return "<redacted>"
+    return f"{token[:4]}...{token[-4:]}"
+
+
+@asynccontextmanager
+async def db_connection(operation: str):
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database pool is not initialized.")
+
+    start = time.perf_counter()
+    async with db_pool.connection() as aconn:
+        wait_seconds = time.perf_counter() - start
+        if wait_seconds >= DB_POOL_WAIT_WARNING_SECONDS:
+            logger.warning(
+                "db_pool_wait operation=%s wait_ms=%.1f pool=%s",
+                operation,
+                wait_seconds * 1000,
+                _json_for_log(_db_pool_stats_for_log()),
+            )
+        yield aconn
+
+
+async def event_loop_lag_monitor_task():
+    expected = time.perf_counter() + EVENT_LOOP_LAG_INTERVAL_SECONDS
+    while True:
+        await asyncio.sleep(EVENT_LOOP_LAG_INTERVAL_SECONDS)
+        now = time.perf_counter()
+        lag_seconds = now - expected
+        if lag_seconds >= EVENT_LOOP_LAG_WARNING_SECONDS:
+            logger.warning(
+                "event_loop_lag lag_ms=%.1f threshold_ms=%.1f pool=%s",
+                lag_seconds * 1000,
+                EVENT_LOOP_LAG_WARNING_SECONDS * 1000,
+                _json_for_log(_db_pool_stats_for_log()),
+            )
+        expected = now + EVENT_LOOP_LAG_INTERVAL_SECONDS
 
 # Set up the CORS middleware
 app.add_middleware(
@@ -337,7 +414,14 @@ app.add_middleware(
 
 # Create a connection pool
 async def get_db_pool():
-    return psycopg_pool.AsyncConnectionPool(DSN, min_size=2, max_size=10, timeout=10, max_lifetime=3600, max_idle=300)
+    return psycopg_pool.AsyncConnectionPool(
+        DSN,
+        min_size=DB_POOL_MIN_SIZE,
+        max_size=DB_POOL_MAX_SIZE,
+        timeout=DB_POOL_TIMEOUT_SECONDS,
+        max_lifetime=3600,
+        max_idle=300,
+    )
 
 
 @app.on_event("startup")
@@ -345,9 +429,15 @@ async def startup_event():
     global db_pool
     try:
         db_pool = await get_db_pool()
-        print("Database pool initialized successfully")
+        logger.info(
+            "Database pool initialized min_size=%s max_size=%s timeout_seconds=%.1f stats=%s",
+            DB_POOL_MIN_SIZE,
+            DB_POOL_MAX_SIZE,
+            DB_POOL_TIMEOUT_SECONDS,
+            _json_for_log(_db_pool_stats_for_log()),
+        )
     except Exception as e:
-        print(f"Error initializing database pool: {e}")
+        logger.exception("Error initializing database pool")
 
     global session
     global r
@@ -362,6 +452,8 @@ async def startup_event():
     # Start the server-side push notifier so users get pinged when their
     # long-running upscale/hi-res jobs finish even if the tab is closed.
     asyncio.create_task(job_completion_notifier_task())
+
+    asyncio.create_task(event_loop_lag_monitor_task())
 
 
 async def orphaned_job_cleanup_task():
@@ -503,23 +595,55 @@ async def shutdown_event():
     await session.close()
     # await app.state.db_pool.close()
 
-@app.middleware("http")
-async def add_cors_headers(request, call_next):
-    # Handle preflight OPTIONS request
-    if request.method == "OPTIONS":
-        response = JSONResponse(content=None, status_code=200)
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Methods"] = "*"
-        response.headers["Access-Control-Allow-Headers"] = "*"
-        return response
-    
-    response = await call_next(request)
+def _apply_common_response_headers(response: Response, request_id: str) -> Response:
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Allow-Methods"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["X-Request-ID"] = request_id
     return response
+
+
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    start = time.perf_counter()
+    response: Optional[Response] = None
+    try:
+        # Handle preflight OPTIONS request
+        if request.method == "OPTIONS":
+            response = JSONResponse(content=None, status_code=200)
+            return _apply_common_response_headers(response, request_id)
+
+        response = await call_next(request)
+        return _apply_common_response_headers(response, request_id)
+    except Exception:
+        elapsed_seconds = time.perf_counter() - start
+        logger.exception(
+            "request_unhandled_error request_id=%s method=%s path=%s elapsed_ms=%.1f client=%s pool=%s",
+            request_id,
+            request.method,
+            request.url.path,
+            elapsed_seconds * 1000,
+            request.client.host if request.client else None,
+            _json_for_log(_db_pool_stats_for_log()),
+        )
+        raise
+    finally:
+        elapsed_seconds = time.perf_counter() - start
+        status_code = response.status_code if response is not None else None
+        if elapsed_seconds >= SLOW_REQUEST_WARNING_SECONDS or (status_code is not None and status_code >= 500):
+            log_method = logger.error if status_code is not None and status_code >= 500 else logger.warning
+            log_method(
+                "request_finished request_id=%s method=%s path=%s status=%s elapsed_ms=%.1f client=%s pool=%s",
+                request_id,
+                request.method,
+                request.url.path,
+                status_code,
+                elapsed_seconds * 1000,
+                request.client.host if request.client else None,
+                _json_for_log(_db_pool_stats_for_log()),
+            )
 
 
 # Exception handler to ensure CORS headers on errors
@@ -608,11 +732,11 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     Returns None if no valid token is provided (allows anonymous access).
     """
     if not credentials:
-        print("DEBUG: No credentials provided")
+        logger.debug("auth_lookup skipped reason=no_credentials")
         return None
     
     token = credentials.credentials
-    print(f"DEBUG: Token received: {token[:20]}..." if token and len(token) > 20 else f"DEBUG: Token: {token}")
+    logger.debug("auth_lookup token=%s", _redact_token(token))
     if not token:
         return None
     
@@ -620,7 +744,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         if db_pool is None:
             raise HTTPException(status_code=503, detail=AUTH_SERVICE_UNAVAILABLE_DETAIL)
 
-        async with db_pool.connection() as aconn:
+        async with db_connection("auth.get_current_user") as aconn:
             async with aconn.cursor() as acur:
                 # Look up the session token and get user data in one query
                 await acur.execute(
@@ -635,10 +759,11 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
                     (token,)
                 )
                 row = await acur.fetchone()
-                print(f"DEBUG: Query result row: {row}")
                 if not row:
+                    logger.debug("auth_lookup result=invalid_token token=%s", _redact_token(token))
                     return None
                 
+                logger.debug("auth_lookup result=success user_id=%s token=%s", row[0], _redact_token(token))
                 return {
                     "user_id": str(row[0]),
                     "discord_user_id": row[1],
@@ -3777,6 +3902,11 @@ def decode_base64_to_image(base64_str):
     return image
 
 
+def image_phash_from_base64(image_result):
+    image = decode_base64_to_image(image_result)
+    return imagehash.phash(image, 8)
+
+
 async def get_pending_queue_position(acur, job_id: str, fast_pass_enabled: bool, create_date) -> Optional[int]:
     if create_date is None:
         return None
@@ -3805,7 +3935,7 @@ async def get_pending_queue_position(acur, job_id: str, fast_pass_enabled: bool,
 
 
 async def get_generation_job_details(job_id: str) -> Optional[dict[str, Any]]:
-    async with db_pool.connection() as aconn:
+    async with db_connection("jobs.get_generation_job_details") as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
@@ -4030,8 +4160,7 @@ async def twos_complement(hexstr, bits):
 async def process_images_and_store_hashes(image_results, metadata, job_data):
     image_hashes = []
     for image_result in image_results:
-        image = decode_base64_to_image(image_result)
-        image_hash = imagehash.phash(image, 8)
+        image_hash = await asyncio.to_thread(image_phash_from_base64, image_result)
         image_hash = await twos_complement(str(image_hash), 64)
         image_hashes.append(image_hash)
 
@@ -4066,7 +4195,7 @@ async def process_finished_job_images_and_store_hashes(finished_images: str, met
         base64_strings = _split_finished_images(finished_images)
         watermarked_image_base64 = []
         for base64_string in base64_strings:
-            image = decode_base64_to_image(base64_string)
+            image = await asyncio.to_thread(decode_base64_to_image, base64_string)
             watermarked_image_base64.append(
                 await add_image_metadata(
                     image.convert("RGB"),
@@ -4155,7 +4284,7 @@ async def get_job(job_data: GetJobData, background_tasks: BackgroundTasks):
             # Add watermark and metadata
             watermarked_image_base64 = []
             for i in range(4):
-                image = decode_base64_to_image(base64_strings[i])
+                image = await asyncio.to_thread(decode_base64_to_image, base64_strings[i])
                 watermarked_image_base64.append(
                     await add_image_metadata(image.convert("RGB"), metadata, lossy_image=metadata['lossy_images'])
                 )
@@ -4333,7 +4462,7 @@ async def get_job_image(job_id: str, image_index: int):
         "regional_prompting": parse_regional_prompting(job_details["control_image"]),
     }
 
-    image = decode_base64_to_image(base64_strings[image_index])
+    image = await asyncio.to_thread(decode_base64_to_image, base64_strings[image_index])
     watermarked_base64 = await add_image_metadata(image.convert("RGB"), metadata, lossy_image=lossy_images)
 
     # Decode the watermarked base64 back to binary
@@ -4357,40 +4486,90 @@ async def get_job_image(job_id: str, image_index: int):
 @app.get("/get_loras/")
 async def get_loras(status: str = "active"):
     status_norm = (status or "active").strip().lower()
-    if status_norm == "inactive":
-        where_clause = "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL) and is_active = false"
-    elif status_norm == "all":
-        where_clause = "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL)"
-    else:
-        # Default to active
-        where_clause = "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL) and is_active = true"
+    if status_norm not in {"active", "inactive", "all"}:
+        status_norm = "active"
 
-    async with db_pool.connection() as aconn:
-        async with aconn.cursor() as acur:
-            await acur.execute(
-                f"""
-                SELECT
-                    id, name, version, base_model, download_url, is_nsfw, is_minor,
-                    creator, description, version_description, tags, who_added, status,
-                    trigger_words, date_added, hashes, image_url, file_path, uses,
-                    is_active, last_used_date, version_id
-                FROM lora_metadata
-                {where_clause}
-                ORDER BY uses DESC
-                """
+    def cached_response(cache_state: dict[str, Any], cache_status: str) -> Response:
+        return Response(
+            content=cache_state["body"],
+            media_type="application/json",
+            headers={
+                "Cache-Control": f"public, max-age={int(LORAS_CACHE_TTL_SECONDS)}",
+                "X-Loras-Cache": cache_status,
+            },
+        )
+
+    cache_key = status_norm
+    now = time.time()
+    cached = loras_response_cache.get(cache_key)
+    if cached and cached["expires_at"] > now:
+        return cached_response(cached, "hit")
+
+    lock = loras_cache_locks.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        now = time.time()
+        cached = loras_response_cache.get(cache_key)
+        if cached and cached["expires_at"] > now:
+            return cached_response(cached, "hit-after-wait")
+
+        if status_norm == "inactive":
+            where_clause = "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL) and is_active = false"
+        elif status_norm == "all":
+            where_clause = "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL)"
+        else:
+            where_clause = "WHERE (image_url IS NOT NULL OR image_blob IS NOT NULL) and is_active = true"
+
+        query_start = time.perf_counter()
+        async with db_connection("loras.get_loras") as aconn:
+            async with aconn.cursor() as acur:
+                await acur.execute(
+                    f"""
+                    SELECT
+                        id, name, version, base_model, download_url, is_nsfw, is_minor,
+                        creator, description, version_description, tags, who_added, status,
+                        trigger_words, date_added, hashes, image_url, file_path, uses,
+                        is_active, last_used_date, version_id
+                    FROM lora_metadata
+                    {where_clause}
+                    ORDER BY uses DESC
+                    """
+                )
+                columns = [desc[0] for desc in acur.description]
+                rows = await acur.fetchall()
+
+        query_ms = (time.perf_counter() - query_start) * 1000
+        encode_start = time.perf_counter()
+        result = [dict(zip(columns, row)) for row in rows]
+        body = json.dumps(jsonable_encoder(result), separators=(",", ":")).encode("utf-8")
+        encode_ms = (time.perf_counter() - encode_start) * 1000
+
+        if LORAS_CACHE_TTL_SECONDS > 0:
+            loras_response_cache[cache_key] = {
+                "body": body,
+                "expires_at": time.time() + LORAS_CACHE_TTL_SECONDS,
+            }
+
+        total_ms = query_ms + encode_ms
+        if total_ms >= SLOW_REQUEST_WARNING_SECONDS * 1000:
+            logger.warning(
+                "get_loras_slow status=%s rows=%s bytes=%s query_ms=%.1f encode_ms=%.1f cache_ttl_seconds=%.1f",
+                status_norm,
+                len(rows),
+                len(body),
+                query_ms,
+                encode_ms,
+                LORAS_CACHE_TTL_SECONDS,
             )
-            # Fetch column names
-            columns = [desc[0] for desc in acur.description]
-            # Fetch all rows
-            rows = await acur.fetchall()
-            
-            # Convert to list of dictionaries
-            result = [dict(zip(columns, row)) for row in rows]
 
-    # Convert the result to a JSON-serializable format
-    json_compatible_result = jsonable_encoder(result)
-    
-    return JSONResponse(content=json_compatible_result)
+        response = Response(
+            content=body,
+            media_type="application/json",
+            headers={
+                "Cache-Control": f"public, max-age={int(LORAS_CACHE_TTL_SECONDS)}",
+                "X-Loras-Cache": "miss",
+            },
+        )
+        return response
 
 async def enhanced_filter(prompt, pattern, replacement):
     # Replace spaces with \W+ to match any non-word characters between the words
@@ -4724,7 +4903,7 @@ def _vapid_claims() -> dict:
 
 async def _delete_push_subscription(endpoint: str) -> None:
     try:
-        async with db_pool.connection() as aconn:
+        async with db_connection("push.delete_subscription") as aconn:
             async with aconn.cursor() as acur:
                 await acur.execute(
                     "DELETE FROM push_subscriptions WHERE endpoint = %s",
@@ -4738,29 +4917,52 @@ async def _delete_push_subscription(endpoint: str) -> None:
 async def _send_webpush(endpoint: str, p256dh: str, auth: str, payload: dict) -> bool:
     """Send a single web push. Returns True on success. Prunes dead subs."""
     if not VAPID_PRIVATE_KEY:
-        logging.warning("VAPID_PRIVATE_KEY not configured; skipping push notification")
+        logger.warning("VAPID_PRIVATE_KEY not configured; skipping push notification")
         return False
+    start = time.perf_counter()
     try:
-        webpush(
-            subscription_info={
-                "endpoint": endpoint,
-                "keys": {"p256dh": p256dh, "auth": auth},
-            },
-            data=json.dumps(payload),
-            ttl=WEBPUSH_TTL_SECONDS,
-            vapid_private_key=VAPID_PRIVATE_KEY,
-            vapid_claims=_vapid_claims(),
-        )
+        async with webpush_semaphore:
+            await asyncio.to_thread(
+                webpush,
+                subscription_info={
+                    "endpoint": endpoint,
+                    "keys": {"p256dh": p256dh, "auth": auth},
+                },
+                data=json.dumps(payload),
+                ttl=WEBPUSH_TTL_SECONDS,
+                timeout=WEBPUSH_TIMEOUT_SECONDS,
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims=_vapid_claims(),
+            )
+        elapsed_seconds = time.perf_counter() - start
+        if elapsed_seconds >= SLOW_REQUEST_WARNING_SECONDS:
+            logger.warning(
+                "webpush_slow endpoint=%s elapsed_ms=%.1f timeout_seconds=%.1f",
+                endpoint,
+                elapsed_seconds * 1000,
+                WEBPUSH_TIMEOUT_SECONDS,
+            )
         return True
     except WebPushException as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
         if status in (404, 410):
             # Endpoint gone permanently — drop it.
             await _delete_push_subscription(endpoint)
-        logging.warning(f"webpush failed (status={status}) for {endpoint}: {exc}")
+        logger.warning(
+            "webpush_failed status=%s endpoint=%s elapsed_ms=%.1f error=%s",
+            status,
+            endpoint,
+            (time.perf_counter() - start) * 1000,
+            exc,
+        )
         return False
     except Exception as exc:
-        logging.error(f"webpush unexpected error for {endpoint}: {exc}")
+        logger.error(
+            "webpush_unexpected_error endpoint=%s elapsed_ms=%.1f error=%s",
+            endpoint,
+            (time.perf_counter() - start) * 1000,
+            exc,
+        )
         return False
 
 
@@ -4768,7 +4970,7 @@ async def send_push_to_user(user_id: str, payload: dict) -> int:
     """Send the given payload to every subscription owned by user_id."""
     if not user_id:
         return 0
-    async with db_pool.connection() as aconn:
+    async with db_connection("push.send_to_user") as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 "SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = %s",
@@ -4786,7 +4988,7 @@ async def send_push_to_anonymous(anonymous_id: str, payload: dict) -> int:
     """Send the given payload to anonymous (not-logged-in) subscriptions."""
     if not anonymous_id:
         return 0
-    async with db_pool.connection() as aconn:
+    async with db_connection("push.send_to_anonymous") as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
@@ -4903,7 +5105,7 @@ async def _resolve_user_id_from_requestor(requestor: Optional[str]) -> Optional[
     """
     if not requestor:
         return None
-    async with db_pool.connection() as aconn:
+    async with db_connection("lora_notify.resolve_requestor") as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
@@ -4939,7 +5141,7 @@ async def internal_notify_lora_downloaded(
     requestor = payload.requestor
     # Fallback: look up requestor from the suggestion if not supplied.
     if not requestor:
-        async with db_pool.connection() as aconn:
+        async with db_connection("lora_notify.lookup_suggestion") as aconn:
             async with aconn.cursor() as acur:
                 await acur.execute(
                     "SELECT requestor, name, version FROM lora_suggestions WHERE version_id = %s",
@@ -7375,7 +7577,7 @@ async def get_synced_image_blobs(request: SyncImageBlobsRequest, user: dict = De
     if len(image_uuids) == 0:
         return []
 
-    async with db_pool.connection() as aconn:
+    async with db_connection("history.get_synced_image_blobs") as aconn:
         async with aconn.cursor() as acur:
             await acur.execute(
                 """
