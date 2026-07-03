@@ -6996,6 +6996,12 @@ async def readiness_check():
         logging.exception("Readiness check failed")
         raise HTTPException(status_code=503, detail="Database is not reachable.") from e
 
+    try:
+        await get_generation_models()
+    except HTTPException as e:
+        logging.exception("Readiness check failed: generation model settings unavailable")
+        raise HTTPException(status_code=503, detail="Generation model settings are not ready.") from e
+
     return {"status": 200, "database": "ready"}
 
 # New endpoint to cancel a pending job by ID
