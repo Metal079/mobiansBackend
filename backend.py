@@ -606,13 +606,19 @@ def _loras_cache_response(
     cache_status: str,
     request: Optional[Request] = None,
 ) -> Response:
-    headers = {
-        "Cache-Control": (
+    fields = cache_state.get("fields", "summary")
+    cache_control = (
+        "private, no-store"
+        if fields == "full"
+        else (
             f"public, max-age={int(LORAS_CACHE_TTL_SECONDS)}, "
             f"stale-while-revalidate={int(LORAS_CACHE_STALE_SECONDS)}"
-        ),
+        )
+    )
+    headers = {
+        "Cache-Control": cache_control,
         "X-Loras-Cache": cache_status,
-        "X-Loras-Fields": cache_state.get("fields", "summary"),
+        "X-Loras-Fields": fields,
         "Vary": "Accept-Encoding",
     }
     if _request_accepts_gzip(request):
@@ -731,6 +737,24 @@ def _schedule_loras_cache_refresh(status_norm: str, fields_norm: str, reason: st
             loras_cache_refresh_tasks.pop(cache_key, None)
 
     loras_cache_refresh_tasks[cache_key] = asyncio.create_task(refresh_task())
+
+
+def _invalidate_loras_response_cache(reason: str) -> None:
+    cache_count = len(loras_response_cache)
+    task_count = len(loras_cache_refresh_tasks)
+
+    loras_response_cache.clear()
+    for task in list(loras_cache_refresh_tasks.values()):
+        if not task.done():
+            task.cancel()
+    loras_cache_refresh_tasks.clear()
+
+    logger.info(
+        "loras_cache_invalidated reason=%s cleared_entries=%s cancelled_refresh_tasks=%s",
+        reason,
+        cache_count,
+        task_count,
+    )
 
 # Set up the CORS middleware
 app.add_middleware(
@@ -5461,6 +5485,7 @@ async def internal_notify_lora_downloaded(
 ):
     """Called by the LoRA downloader service once a LoRA is available on-site."""
     _require_internal_token(x_internal_token)
+    _invalidate_loras_response_cache("internal_notify_lora_downloaded")
 
     requestor = payload.requestor
     # Fallback: look up requestor from the suggestion if not supplied.
@@ -7031,6 +7056,8 @@ async def admin_update_lora(lora_id: int, data: LoraToggleRequest, user: dict = 
                 raise HTTPException(status_code=404, detail="LoRA not found")
             
             await aconn.commit()
+
+    _invalidate_loras_response_cache("admin_update_lora")
     
     return {
         "status": "success",
@@ -7210,6 +7237,7 @@ async def admin_upload_manual_lora(
                 created_row = await acur.fetchone()
                 columns = [desc[0] for desc in acur.description]
                 await aconn.commit()
+                _invalidate_loras_response_cache("admin_upload_manual_lora")
     except HTTPException:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
@@ -7278,6 +7306,8 @@ async def admin_upload_lora_image(
             if not row:
                 raise HTTPException(status_code=404, detail="LoRA not found")
             await aconn.commit()
+
+    _invalidate_loras_response_cache("admin_upload_lora_image")
 
     return {"status": "success", "image_url": row[1]}
 
