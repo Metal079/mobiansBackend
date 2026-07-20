@@ -16,6 +16,7 @@ import secrets
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
+from html.parser import HTMLParser
 
 # Fix for Windows - psycopg async requires SelectorEventLoop
 if sys.platform == "win32":
@@ -4009,20 +4010,287 @@ async def search_civitAi_loras_by_query(query: str, show_nsfw: bool = False):
 
     return JSONResponse(content=loras)
 
+CIVITAI_MODEL_PAGE_MAX_BYTES = 2 * 1024 * 1024
+CIVITAI_MODEL_PAGE_MAX_VERSIONS = 25
+CIVITAI_SAFE_MINOR_NSFW_LEVELS = {1, 2}  # CivitAI PG and PG-13 flags.
+
+
+class _CivitaiNextDataParser(HTMLParser):
+    """Extract the server-rendered Next.js payload from a public CivitAI page."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self._inside_next_data = False
+        self._chunks: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if tag.lower() != "script":
+            return
+        attributes = dict(attrs)
+        if attributes.get("id") == "__NEXT_DATA__":
+            self._inside_next_data = True
+
+    def handle_data(self, data: str) -> None:
+        if self._inside_next_data:
+            self._chunks.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script" and self._inside_next_data:
+            self._inside_next_data = False
+
+    @property
+    def payload(self) -> str:
+        return "".join(self._chunks)
+
+
+def _civitai_headers(accept: str, *, include_auth: bool = True) -> Dict[str, str]:
+    headers = {
+        "Accept": accept,
+        "User-Agent": "mobians.ai/1.0 (+https://mobians.ai)",
+    }
+    if include_auth and CIVITAI_API_KEY:
+        headers["Authorization"] = f"Bearer {CIVITAI_API_KEY}"
+    return headers
+
+
+async def _civitai_get_json(url: str) -> Tuple[int, Any, str]:
+    if session is None:
+        raise HTTPException(status_code=503, detail="CivitAI lookup service is not initialized")
+
+    async with session.get(
+        url,
+        headers=_civitai_headers("application/json"),
+        timeout=20,
+    ) as resp:
+        body = await resp.text()
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            payload = None
+        return resp.status, payload, body[:500]
+
+
+async def _civitai_get_model_page(model_id: int) -> str:
+    if session is None:
+        raise HTTPException(status_code=503, detail="CivitAI lookup service is not initialized")
+
+    async with session.get(
+        f"https://civitai.com/models/{model_id}",
+        # The public page does not need an API token, and keeping auth off HTML
+        # navigation prevents credentials from ever participating in redirects.
+        headers=_civitai_headers("text/html,application/xhtml+xml", include_auth=False),
+        timeout=20,
+        allow_redirects=True,
+        max_redirects=5,
+    ) as resp:
+        if resp.status != 200:
+            raise ValueError(f"public model page returned HTTP {resp.status}")
+
+        final_host = (resp.url.host or "").lower()
+        if final_host not in {"civitai.com", "www.civitai.com"}:
+            raise ValueError("public model page redirected outside civitai.com")
+
+        chunks: List[bytes] = []
+        total_bytes = 0
+        async for chunk in resp.content.iter_chunked(64 * 1024):
+            total_bytes += len(chunk)
+            if total_bytes > CIVITAI_MODEL_PAGE_MAX_BYTES:
+                raise ValueError("public model page exceeded the response size limit")
+            chunks.append(chunk)
+        return b"".join(chunks).decode(resp.charset or "utf-8", errors="replace")
+
+
+def _extract_civitai_page_model(page_html: str, expected_model_id: int) -> Dict[str, Any]:
+    parser = _CivitaiNextDataParser()
+    parser.feed(page_html)
+    if not parser.payload:
+        raise ValueError("public model page did not include Next.js model data")
+
+    try:
+        next_data = json.loads(parser.payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError("public model page contained invalid Next.js model data") from exc
+
+    queries = (
+        next_data.get("props", {})
+        .get("pageProps", {})
+        .get("trpcState", {})
+        .get("json", {})
+        .get("queries", [])
+    )
+    if not isinstance(queries, list):
+        raise ValueError("public model page did not include model queries")
+
+    for query in queries:
+        if not isinstance(query, dict):
+            continue
+        data = query.get("state", {}).get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("modelVersions"), list):
+            continue
+        try:
+            model_id = int(data.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if model_id == expected_model_id:
+            return data
+
+    raise ValueError(f"public model page did not contain model {expected_model_id}")
+
+
+def _civitai_page_creator(model: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    user = model.get("user")
+    if not isinstance(user, dict) or not user.get("username"):
+        return None
+    return {
+        "username": user.get("username"),
+        "image": user.get("image"),
+    }
+
+
+def _civitai_page_tags(model: Dict[str, Any]) -> List[str]:
+    tags: List[str] = []
+    for item in model.get("tagsOnModels") or []:
+        if not isinstance(item, dict):
+            continue
+        tag = item.get("tag") if isinstance(item.get("tag"), dict) else item
+        name = tag.get("name") if isinstance(tag, dict) else None
+        if isinstance(name, str) and name.strip():
+            tags.append(name.strip())
+    return tags
+
+
+async def _fetch_civitai_model_from_public_page(model_id: int) -> Dict[str, Any]:
+    """Recover a public model whose legacy CivitAI model endpoint returns 404.
+
+    CivitAI's public HTML contains the parent model and version ids. Version
+    details are then loaded through CivitAI's documented version endpoint so we
+    do not depend on the page's internal representation for files and images.
+    """
+
+    page_model = _extract_civitai_page_model(await _civitai_get_model_page(model_id), model_id)
+    if page_model.get("status") != "Published" or page_model.get("availability") != "Public":
+        raise ValueError("model is not published and public")
+    if page_model.get("type") not in {"LORA", "LoCon"}:
+        raise ValueError("model is not a LoRA")
+
+    is_minor = page_model.get("minor") is True
+    if is_minor and page_model.get("nsfw") is True:
+        raise ValueError("NSFW models marked as depicting a minor are not eligible for fallback")
+
+    page_versions: List[Dict[str, Any]] = []
+    for version in page_model.get("modelVersions", []):
+        if not isinstance(version, dict):
+            continue
+        if version.get("status") != "Published" or version.get("availability") != "Public":
+            continue
+        if is_minor and version.get("nsfwLevel") not in CIVITAI_SAFE_MINOR_NSFW_LEVELS:
+            continue
+        try:
+            int(version.get("id"))
+        except (TypeError, ValueError):
+            continue
+        page_versions.append(version)
+
+    if not page_versions:
+        raise ValueError("model has no eligible public versions")
+
+    version_payloads: List[Dict[str, Any]] = []
+    last_failure: Optional[Tuple[int, str]] = None
+    for page_version in page_versions[:CIVITAI_MODEL_PAGE_MAX_VERSIONS]:
+        version_id = int(page_version["id"])
+        status, payload, response_body = await _civitai_get_json(
+            f"https://civitai.com/api/v1/model-versions/{version_id}"
+        )
+        if status != 200 or not isinstance(payload, dict):
+            last_failure = (status, response_body)
+            continue
+        try:
+            payload_model_id = int(payload.get("modelId"))
+        except (TypeError, ValueError):
+            continue
+        if payload_model_id != model_id or payload.get("status") != "Published":
+            continue
+        if is_minor and payload.get("nsfwLevel") not in CIVITAI_SAFE_MINOR_NSFW_LEVELS:
+            continue
+        if is_minor:
+            payload = {
+                **payload,
+                "images": [
+                    image
+                    for image in payload.get("images") or []
+                    if isinstance(image, dict)
+                    and image.get("nsfwLevel") in CIVITAI_SAFE_MINOR_NSFW_LEVELS
+                ],
+            }
+        version_payloads.append(payload)
+
+    if not version_payloads:
+        if last_failure:
+            status, response_body = last_failure
+            raise ValueError(
+                f"version lookup returned HTTP {status}: {response_body[:200]}"
+            )
+        raise ValueError("model versions could not be verified")
+
+    return {
+        "id": model_id,
+        "name": page_model.get("name"),
+        "description": page_model.get("description"),
+        "minor": is_minor,
+        "poi": page_model.get("poi"),
+        "nsfw": page_model.get("nsfw"),
+        "type": page_model.get("type"),
+        "creator": _civitai_page_creator(page_model),
+        "tags": _civitai_page_tags(page_model),
+        "modelVersions": version_payloads,
+    }
+
+
+async def _fetch_civitai_model_by_id(model_id: int) -> Dict[str, Any]:
+    status, payload, response_body = await _civitai_get_json(
+        f"https://civitai.com/api/v1/models/{model_id}"
+    )
+    if status == 200 and isinstance(payload, dict):
+        return payload
+    if status != 404:
+        raise HTTPException(
+            status_code=status,
+            detail=(
+                "Error in CivitAI search. "
+                + (f"Upstream: {response_body[:200]}" if response_body else "Please try again.")
+            ).strip(),
+        )
+
+    try:
+        model = await _fetch_civitai_model_from_public_page(model_id)
+        logger.info("civitai_model_page_fallback model_id=%s", model_id)
+        return model
+    except ValueError as exc:
+        logger.warning(
+            "civitai_model_page_fallback_failed model_id=%s reason=%s upstream=%s",
+            model_id,
+            exc,
+            response_body[:200],
+        )
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"CivitAI could not return a public LoRA for model ID {model_id}. "
+                "The model may be unavailable, restricted, or have no eligible public version."
+            ),
+        ) from exc
+
+
 @app.get("/search_civitAi_loras_by_id/{id}")
 async def search_civitAi_loras_by_id(id: str, show_nsfw: bool = False):
-    civiAi_url = f"https://civitai.com/api/v1/models/{id}"
+    try:
+        model_id = int(id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="CivitAI model ID must be a positive integer")
+    if model_id <= 0:
+        raise HTTPException(status_code=422, detail="CivitAI model ID must be a positive integer")
 
-    headers: Dict[str, str] = {}
-    if CIVITAI_API_KEY:
-        headers["Authorization"] = f"Bearer {CIVITAI_API_KEY}"
-
-    async with session.get(civiAi_url, headers=headers) as resp:
-        if resp.status != 200:
-            raise HTTPException(
-                status_code=resp.status, detail="Error in CivitAi search, ensure the model id is correct"
-            )
-        data = await resp.json()
+    data = await _fetch_civitai_model_by_id(model_id)
 
     loras = []
     if 'modelVersions' in data:
@@ -4072,10 +4340,7 @@ async def search_civitAi_loras_by_id(id: str, show_nsfw: bool = False):
 
             loras.append({**lora_page_info, **lora_info})
     else:
-        # error
-        raise HTTPException(
-                status_code=resp.status, detail="No model found"
-            )
+        raise HTTPException(status_code=502, detail="CivitAI response did not include model versions")
 
     return JSONResponse(content=loras)
 
