@@ -26,12 +26,14 @@ import re
 import json
 import hashlib
 import logging
+import ssl
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 
 import aiohttp
+import certifi
 import psycopg_pool
 from dotenv import load_dotenv
 from aiohttp import web
@@ -65,6 +67,11 @@ DSN = f"host={DBHOST} dbname='{DBNAME}' user={DBUSER} password={DBPASS}"
 # Retry configuration
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2  # seconds
+
+# CivitAI suppresses some public minor-character models from the model-detail
+# endpoint even though their published version endpoint remains available.
+CIVITAI_SAFE_MINOR_NSFW_LEVELS = {1, 2}  # PG and PG-13
+CIVITAI_LORA_MODEL_TYPES = {"LORA", "LOCON"}
 
 # Global state
 db_pool: Optional[psycopg_pool.AsyncConnectionPool] = None
@@ -105,6 +112,11 @@ def setup_logging():
     return logger
 
 logger = setup_logging()
+
+
+def create_http_ssl_context() -> ssl.SSLContext:
+    """Use a current CA bundle instead of the machine default trust store."""
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 # ============================================
@@ -209,7 +221,12 @@ async def retry_with_backoff(func, *args, max_retries=MAX_RETRIES, **kwargs):
 async def fetch_lora_version(version_id: str) -> Optional[Dict[str, Any]]:
     """Fetch LoRA version details from CivitAI API."""
     url = f"https://civitai.com/api/v1/model-versions/{version_id}"
-    headers = {"Authorization": f"Bearer {CIVITAI_API_KEY}"}
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mobians-LoRA-Downloader/1.0",
+    }
+    if CIVITAI_API_KEY:
+        headers["Authorization"] = f"Bearer {CIVITAI_API_KEY}"
     
     async with http_session.get(url, headers=headers) as response:
         if response.status == 200:
@@ -219,17 +236,93 @@ async def fetch_lora_version(version_id: str) -> Optional[Dict[str, Any]]:
             return None
 
 
-async def fetch_lora_model(model_id: str) -> Optional[Dict[str, Any]]:
+def build_lora_model_fallback(
+    model_id: str,
+    lora_version: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Build safe parent metadata from a CivitAI version response.
+
+    CivitAI's version endpoint includes a small authoritative ``model`` object.
+    This is used only after the corresponding public model endpoint returns 404.
+    Treating the recovered model as minor is conservative and preserves the flag
+    which caused CivitAI to suppress the affected public model records.
+    """
+    if not isinstance(lora_version, dict):
+        return None
+
+    try:
+        expected_model_id = int(model_id)
+        version_model_id = int(lora_version.get("modelId"))
+        nsfw_level = int(lora_version.get("nsfwLevel"))
+    except (TypeError, ValueError):
+        return None
+
+    if version_model_id != expected_model_id:
+        return None
+    if str(lora_version.get("status") or "").casefold() != "published":
+        return None
+    if nsfw_level not in CIVITAI_SAFE_MINOR_NSFW_LEVELS:
+        return None
+
+    embedded_model = lora_version.get("model")
+    if not isinstance(embedded_model, dict):
+        return None
+
+    name = str(embedded_model.get("name") or "").strip()
+    model_type = str(embedded_model.get("type") or "").strip().upper()
+    if not name or model_type not in CIVITAI_LORA_MODEL_TYPES:
+        return None
+    if embedded_model.get("nsfw") is not False:
+        return None
+
+    creator = embedded_model.get("creator")
+    tags = embedded_model.get("tags")
+    return {
+        "id": expected_model_id,
+        "name": name,
+        "type": model_type,
+        "nsfw": False,
+        "minor": True,
+        "creator": creator if isinstance(creator, dict) else {},
+        "description": embedded_model.get("description"),
+        "tags": tags if isinstance(tags, list) else [],
+    }
+
+
+async def fetch_lora_model(
+    model_id: str,
+    lora_version: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Fetch LoRA main model page from CivitAI API."""
     url = f"https://civitai.com/api/v1/models/{model_id}"
-    headers = {"Authorization": f"Bearer {CIVITAI_API_KEY}"}
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mobians-LoRA-Downloader/1.0",
+    }
+    if CIVITAI_API_KEY:
+        headers["Authorization"] = f"Bearer {CIVITAI_API_KEY}"
     
     async with http_session.get(url, headers=headers) as response:
         if response.status == 200:
             return await response.json()
-        else:
-            logger.error(f"Failed to fetch model {model_id}: HTTP {response.status}")
+
+        if response.status == 404:
+            fallback = build_lora_model_fallback(model_id, lora_version)
+            if fallback:
+                logger.warning(
+                    f"CivitAI model {model_id} returned 404; using its published "
+                    "version metadata"
+                )
+                return fallback
+
+            logger.error(
+                f"CivitAI model {model_id} returned 404 and its version metadata "
+                "was not an eligible safe public LoRA"
+            )
             return None
+
+        logger.error(f"Failed to fetch model {model_id}: HTTP {response.status}")
+        return None
 
 
 # ============================================
@@ -245,6 +338,50 @@ def sanitize_filename(name: str) -> str:
 def is_english(text: str) -> bool:
     """Check if text contains only English characters."""
     return re.match(r'^[a-zA-Z0-9\s\-_.,!?()\'\"]+$', text) is not None
+
+
+def is_preferred_preview_media(media: Dict[str, Any]) -> bool:
+    """Return True for static image media that our UI can render reliably."""
+    if not isinstance(media, dict):
+        return False
+
+    url = str(media.get("url") or "").strip().lower()
+    if not url:
+        return False
+
+    media_type = str(media.get("type") or "").strip().lower()
+    mime_type = str(media.get("mimeType") or "").strip().lower()
+    metadata_mime = str((media.get("metadata") or {}).get("mimeType") or "").strip().lower()
+    combined = " ".join(part for part in [media_type, mime_type, metadata_mime] if part)
+
+    if "video" in combined or "gif" in combined:
+        return False
+
+    if any(ext in url for ext in [".mp4", ".webm", ".mov", ".avi", ".m3u8", ".gif"]):
+        return False
+
+    if media_type == "image":
+        return True
+
+    if mime_type.startswith("image/") and mime_type != "image/gif":
+        return True
+
+    if metadata_mime.startswith("image/") and metadata_mime != "image/gif":
+        return True
+
+    return any(ext in url for ext in [".png", ".jpg", ".jpeg", ".webp", ".avif"])
+
+
+def select_preferred_preview_url(images: Any) -> Optional[str]:
+    if not isinstance(images, list):
+        return None
+
+    valid_items = [item for item in images if isinstance(item, dict) and item.get("url")]
+    preferred = [item for item in valid_items if is_preferred_preview_media(item)]
+    if preferred:
+        return str(preferred[0].get("url") or "").strip() or None
+
+    return None
 
 
 async def download_file_async(url: str, file_path: str, expected_hash: Optional[str] = None) -> bool:
@@ -303,36 +440,7 @@ async def upload_metadata(metadata: Dict[str, Any]) -> Optional[int]:
     try:
         async with db_pool.connection() as conn:
             async with conn.cursor() as cur:
-                sql = """
-                INSERT INTO lora_metadata (
-                    name, version, base_model, download_url, is_nsfw, is_minor, 
-                    creator, description, version_description, tags, 
-                    who_added, status, trigger_words, hashes, image_url, file_path, version_id
-                ) VALUES (
-                    %(name)s, %(version)s, %(base_model)s, %(download_url)s, %(is_nsfw)s, %(is_minor)s, 
-                    %(creator)s, %(description)s, %(version_description)s, %(tags)s, 
-                    %(who_added)s, %(status)s, %(trigger_words)s, %(hashes)s, %(image_url)s, %(file_path)s, %(version_id)s
-                )
-                ON CONFLICT ON CONSTRAINT unique_name_version DO UPDATE SET
-                    base_model = EXCLUDED.base_model,
-                    download_url = EXCLUDED.download_url,
-                    is_nsfw = EXCLUDED.is_nsfw,
-                    is_minor = EXCLUDED.is_minor,
-                    creator = EXCLUDED.creator,
-                    description = EXCLUDED.description,
-                    version_description = EXCLUDED.version_description,
-                    tags = EXCLUDED.tags,
-                    who_added = EXCLUDED.who_added,
-                    status = EXCLUDED.status,
-                    trigger_words = EXCLUDED.trigger_words,
-                    hashes = EXCLUDED.hashes,
-                    image_url = EXCLUDED.image_url,
-                    file_path = EXCLUDED.file_path,
-                    version_id = EXCLUDED.version_id
-                RETURNING id;
-                """
-                
-                await cur.execute(sql, {
+                params = {
                     'name': metadata['name'],
                     'version': metadata['version'],
                     'base_model': metadata['base_model'],
@@ -350,9 +458,52 @@ async def upload_metadata(metadata: Dict[str, Any]) -> Optional[int]:
                     'image_url': metadata.get('image_url'),
                     'file_path': metadata.get('file_path'),
                     'version_id': metadata['version_id']
-                })
-                
+                }
+
+                await cur.execute("""
+                UPDATE lora_metadata SET
+                    base_model = %(base_model)s,
+                    name = %(name)s,
+                    version = %(version)s,
+                    download_url = %(download_url)s,
+                    is_nsfw = %(is_nsfw)s,
+                    is_minor = %(is_minor)s,
+                    creator = %(creator)s,
+                    description = %(description)s,
+                    version_description = %(version_description)s,
+                    tags = %(tags)s,
+                    who_added = %(who_added)s,
+                    status = %(status)s,
+                    trigger_words = %(trigger_words)s,
+                    hashes = %(hashes)s,
+                    image_url = %(image_url)s,
+                    file_path = %(file_path)s
+                WHERE id = (
+                    SELECT id
+                    FROM lora_metadata
+                    WHERE version_id = %(version_id)s
+                    ORDER BY id
+                    LIMIT 1
+                )
+                RETURNING id
+                """, params)
+
                 record = await cur.fetchone()
+                if not record:
+                    await cur.execute("""
+                    INSERT INTO lora_metadata (
+                        name, version, base_model, download_url, is_nsfw, is_minor, 
+                        creator, description, version_description, tags, 
+                        who_added, status, trigger_words, hashes, image_url, file_path, version_id
+                    ) VALUES (
+                        %(name)s, %(version)s, %(base_model)s, %(download_url)s, %(is_nsfw)s, %(is_minor)s, 
+                        %(creator)s, %(description)s, %(version_description)s, %(tags)s, 
+                        %(who_added)s, %(status)s, %(trigger_words)s, %(hashes)s, %(image_url)s, %(file_path)s, %(version_id)s
+                    )
+                    RETURNING id
+                    """, params)
+                    record = await cur.fetchone()
+                
                 logger.info(f"Metadata uploaded for {metadata['name']} v{metadata['version']}")
                 return record[0] if record else None
                 
@@ -409,7 +560,11 @@ async def process_approved_loras():
                 
                 # Fetch main model page
                 model_id = lora_version.get('modelId')
-                main_page = await retry_with_backoff(fetch_lora_model, str(model_id))
+                main_page = await retry_with_backoff(
+                    fetch_lora_model,
+                    str(model_id),
+                    lora_version,
+                )
                 if not main_page:
                     raise Exception(f"Failed to fetch model page for {model_id}")
                 
@@ -426,7 +581,11 @@ async def process_approved_loras():
                     logger.warning(f"Skipping {lora_display_name}: no preview image")
                     await update_suggestion_status(version_id, "failed", "No preview image available")
                     continue
-                image_url = images[0]['url']
+                image_url = select_preferred_preview_url(images)
+                if not image_url:
+                    logger.warning(f"Skipping {lora_display_name}: no static preview image")
+                    await update_suggestion_status(version_id, "failed", "No static preview image available")
+                    continue
                 
                 # Find safetensors file
                 download_url = None
@@ -449,7 +608,8 @@ async def process_approved_loras():
                 # Build file path
                 sanitized_version = sanitize_filename(lora_version['name'])
                 sanitized_name = sanitize_filename(main_page['name'])
-                filename = f"{sanitized_name}-{sanitized_version}.safetensors"
+                storage_identity = sanitize_filename(str(lora_version['id']))
+                filename = f"{sanitized_name}-{sanitized_version}-{storage_identity}.safetensors"
                 
                 base_model_folder = os.path.join(LORAS_FOLDER, sanitize_filename(base_model))
                 lora_folder = os.path.join(base_model_folder, sanitized_name)
@@ -478,7 +638,7 @@ async def process_approved_loras():
                     "download_url": download_url,
                     "is_nsfw": main_page.get('nsfw', False),
                     "is_minor": main_page.get('minor', False),
-                    "creator": main_page.get('creator', {}).get('username'),
+                    "creator": (main_page.get('creator') or {}).get('username'),
                     "description": main_page.get('description'),
                     "version_description": lora_version.get('description'),
                     "tags": main_page.get('tags', []),
@@ -686,7 +846,9 @@ async def main():
         
         # Create HTTP session
         timeout = aiohttp.ClientTimeout(total=3600)  # 1 hour timeout for large files
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        connector = aiohttp.TCPConnector(ssl=create_http_ssl_context())
+        logger.info(f"Using CA bundle: {certifi.where()}")
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             http_session = session
             
             # Start HTTP server
