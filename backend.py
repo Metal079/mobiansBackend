@@ -4427,6 +4427,70 @@ class addLoraSuggestion(BaseModel):
     preview_image: str
     base_model: Optional[str] = None
 
+
+async def validate_lora_suggestion_version(
+    version_id: int,
+    submitted_base_model: Optional[str],
+) -> str:
+    """Validate a requested CivitAI version and return its authoritative base model."""
+    if version_id <= 0:
+        raise HTTPException(status_code=422, detail="CivitAI version ID must be a positive integer")
+
+    status, payload, response_body = await _civitai_get_json(
+        f"https://civitai.com/api/v1/model-versions/{version_id}"
+    )
+    if status == 404:
+        raise HTTPException(status_code=422, detail="CivitAI could not find that LoRA version")
+    if status != 200 or not isinstance(payload, dict):
+        logger.warning(
+            "civitai_suggestion_version_lookup_failed version_id=%s status=%s response=%s",
+            version_id,
+            status,
+            response_body[:200],
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="CivitAI could not verify that LoRA version. Please try again later.",
+        )
+
+    try:
+        returned_version_id = int(payload.get("id"))
+    except (TypeError, ValueError):
+        returned_version_id = 0
+    if returned_version_id != version_id:
+        raise HTTPException(status_code=422, detail="CivitAI returned mismatched LoRA version data")
+
+    if str(payload.get("status") or "").casefold() != "published":
+        raise HTTPException(status_code=422, detail="Only published CivitAI LoRA versions can be requested")
+
+    embedded_model = payload.get("model")
+    model_type = str(
+        embedded_model.get("type") if isinstance(embedded_model, dict) else ""
+    ).strip().upper()
+    if model_type not in {"LORA", "LOCON"}:
+        raise HTTPException(status_code=422, detail="The requested CivitAI model is not a LoRA")
+
+    actual_base_model = str(payload.get("baseModel") or "").strip()
+    supported_base_models = await get_supported_lora_base_models()
+    if not is_supported_lora_base_model(actual_base_model, supported_base_models):
+        supported_display = ", ".join(sorted(supported_base_models))
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"LoRAs for {actual_base_model or 'this model type'} are not currently supported. "
+                f"Available model types: {supported_display}."
+            ),
+        )
+
+    normalized_submitted_base_model = str(submitted_base_model or "").strip()
+    if normalized_submitted_base_model and normalized_submitted_base_model != actual_base_model:
+        raise HTTPException(
+            status_code=422,
+            detail="The submitted base model does not match the selected CivitAI version",
+        )
+
+    return actual_base_model
+
 @app.post("/add_lora_suggestion/")
 async def add_lora_suggestion(lora_data: addLoraSuggestion, user: dict = Depends(require_auth)):
     requestor_candidates = get_lora_requestor_candidates(user)
@@ -4473,6 +4537,13 @@ async def add_lora_suggestion(lora_data: addLoraSuggestion, user: dict = Depends
             },
             status_code=429,
         )
+
+    # Never trust the client-provided base model. Verify the exact CivitAI
+    # version and use the active website model catalog as the allowlist.
+    lora_data.base_model = await validate_lora_suggestion_version(
+        lora_data.lora_version_id,
+        lora_data.base_model,
+    )
 
     # Try to insert the suggestion into the database
     try:
