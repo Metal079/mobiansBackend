@@ -52,6 +52,9 @@ from dynamic_prompts.library import (
     WILDCARD_SET_ID,
 )
 from helper_functions import *
+from video_generation import register_video_routes, video_completion_notifier_task
+from characters import register_character_routes
+from character_support import validate_attribution, record_attributed_job, capture_character_outcomes
 
 load_dotenv()
 
@@ -827,6 +830,17 @@ async def startup_event():
     # Start the server-side push notifier so users get pinged when their
     # long-running upscale/hi-res jobs finish even if the tab is closed.
     asyncio.create_task(job_completion_notifier_task())
+    asyncio.create_task(character_outcome_task())
+
+    # Video jobs are persisted separately from image jobs so their notifications
+    # survive tab closes, device switches, and backend restarts.
+    asyncio.create_task(
+        video_completion_notifier_task(
+            lambda: db_pool,
+            send_push_to_user,
+            PUBLIC_SITE_URL,
+        )
+    )
 
     await warm_loras_cache_task()
 
@@ -842,6 +856,7 @@ async def orphaned_job_cleanup_task():
         try:
             async with db_pool.connection() as aconn:
                 async with aconn.cursor() as acur:
+                    await capture_character_outcomes(acur)
                     # Call the cleanup function (cleans jobs older than 1 hour)
                     await acur.execute("SELECT * FROM cleanup_orphaned_jobs(1)")
                     result = await acur.fetchone()
@@ -903,6 +918,17 @@ async def _send_job_completion_notification(
         }
     }
     await send_push_to_user(user_id, payload)
+
+
+async def character_outcome_task():
+    while True:
+        try:
+            async with db_pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await capture_character_outcomes(cur)
+        except Exception:
+            logger.exception('Character usage reconciliation failed; will retry')
+        await asyncio.sleep(30)
 
 
 async def job_completion_notifier_task():
@@ -1473,6 +1499,8 @@ DYNAMIC_PROMPT_CATEGORY_VOTER_TRANSACTION_TYPE = "dynamic_category_vote_given"
 
 
 class JobData(BaseModel):
+    character_id: Optional[str] = None
+    character_look_id: Optional[str] = None
     prompt: str
     image: Optional[str] = None
     image_UUID: Optional[str] = None
@@ -3902,6 +3930,8 @@ async def submit_job(
                 ),
             )
             job_id = await acur.fetchone()
+            character_attribution = await record_attributed_job(
+                acur, job_id[0], user_id, job_data.character_id, job_data.character_look_id, queue_type, credit_cost)
             
             # Update the credit transaction with job_id if credits were deducted
             if queue_type == "priority" and credit_cost > 0 and user_id:
@@ -3919,6 +3949,9 @@ async def submit_job(
                 )
 
     response_data: Dict[str, Any] = {"job_id": str(job_id[0]), "queue_type": queue_type}
+    if character_attribution:
+        response_data['character_id'] = str(character_attribution[0])
+        response_data['character_look_id'] = str(character_attribution[1])
     if dynamic_expanded_prompt:
         response_data["expanded_prompt"] = dynamic_expanded_prompt
         if dynamic_prompt_template:
@@ -7846,7 +7879,10 @@ async def get_downloader_status(user: dict = Depends(require_admin)):
 
 
 @app.get("/admin/download-history")
-async def get_download_history(limit: int = 20, user: dict = Depends(require_admin)):
+async def get_download_history(
+    limit: int = Query(100, ge=1, le=500),
+    user: dict = Depends(require_admin),
+):
     """Get recent download history from lora_suggestions. Admin only."""
     try:
         async with db_pool.connection() as aconn:
@@ -7955,6 +7991,13 @@ async def cancel_job(job_id: str):
                     refund_result = await acur.fetchone()
                     if refund_result and refund_result[0]:  # success = True
                         credits_refunded = credit_cost
+
+                # Cancellation deletes the queue row before issuing its refund.
+                # Complete the durable outcome in this same transaction.
+                await acur.execute(
+                    "UPDATE character_job_usage SET status='cancelled', refunded=%s, completed_at=coalesce(completed_at,now()) WHERE job_id=%s",
+                    (credits_refunded > 0, job_id_deleted),
+                )
                 
                 await aconn.commit()
                 return JSONResponse(content={
@@ -7982,6 +8025,8 @@ async def cancel_job(job_id: str):
 # ============================================================================
 
 class SyncImageRequest(BaseModel):
+    character_id: Optional[str] = None
+    character_look_id: Optional[str] = None
     image_uuid: str
     prompt: Optional[str] = None
     prompt_summary: Optional[str] = None
@@ -8109,15 +8154,16 @@ async def sync_image(request: SyncImageRequest, user: dict = Depends(require_aut
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Invalid base64 image data: {e}")
             
+            attribution = await validate_attribution(acur, user_id, request.character_id, request.character_look_id)
             # Upsert the image
             await acur.execute(
                 """
                 INSERT INTO user_synced_images (
                     user_id, image_uuid, prompt, prompt_summary, prompt_template, negative_prompt,
                     model, seed, cfg, width, height, aspect_ratio,
-                    is_favorite, sync_priority, loras, regional_prompting, tags, image_blob, updated_at
+                    is_favorite, sync_priority, loras, regional_prompting, tags, image_blob, character_id, character_look_id, updated_at
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
                 )
                 ON CONFLICT (user_id, image_uuid) DO UPDATE SET
                     prompt = EXCLUDED.prompt,
@@ -8136,6 +8182,8 @@ async def sync_image(request: SyncImageRequest, user: dict = Depends(require_aut
                     regional_prompting = EXCLUDED.regional_prompting,
                     tags = EXCLUDED.tags,
                     image_blob = EXCLUDED.image_blob,
+                    character_id = coalesce(EXCLUDED.character_id, user_synced_images.character_id),
+                    character_look_id = coalesce(EXCLUDED.character_look_id, user_synced_images.character_look_id),
                     updated_at = NOW()
                 """,
                 (
@@ -8146,7 +8194,7 @@ async def sync_image(request: SyncImageRequest, user: dict = Depends(require_aut
                     json.dumps(request.loras or []),
                     json.dumps(request.regional_prompting) if request.regional_prompting is not None else None,
                     json.dumps(request.tags or []),
-                    image_blob
+                    image_blob, attribution[0] if attribution else None, attribution[1] if attribution else None
                 )
             )
             await aconn.commit()
@@ -8219,7 +8267,7 @@ async def get_synced_images(include_blobs: bool = True, user: dict = Depends(req
                 query = """
                 SELECT image_uuid, prompt, prompt_summary, prompt_template, negative_prompt, model,
                        seed, cfg, width, height, aspect_ratio, is_favorite,
-                       sync_priority, loras, regional_prompting, tags, image_blob, created_at
+                       sync_priority, loras, regional_prompting, tags, image_blob, created_at, character_id, character_look_id
                 FROM user_synced_images
                 WHERE user_id = %s
                 ORDER BY sync_priority DESC, created_at DESC
@@ -8228,7 +8276,7 @@ async def get_synced_images(include_blobs: bool = True, user: dict = Depends(req
                 query = """
                 SELECT image_uuid, prompt, prompt_summary, prompt_template, negative_prompt, model,
                        seed, cfg, width, height, aspect_ratio, is_favorite,
-                       sync_priority, loras, regional_prompting, tags, created_at
+                       sync_priority, loras, regional_prompting, tags, created_at, character_id, character_look_id
                 FROM user_synced_images
                 WHERE user_id = %s
                 ORDER BY sync_priority DESC, created_at DESC
@@ -8261,7 +8309,9 @@ async def get_synced_images(include_blobs: bool = True, user: dict = Depends(req
             "regional_prompting": row[14] if row[14] else {"enabled": False, "regions": []},
             "tags": row[15] if row[15] else [],
             "image_blob": image_blob_b64,
-            "created_at": created_at.isoformat() if created_at else None
+            "created_at": created_at.isoformat() if created_at else None,
+            "character_id": str(row[-2]) if row[-2] else None,
+            "character_look_id": str(row[-1]) if row[-1] else None
         })
     
     return images
@@ -8760,4 +8810,28 @@ async def get_ring_leaderboard(current_user: Optional[dict] = Depends(get_curren
         })
 
     return {"leaderboard": leaderboard, "viewer": viewer}
+
+
+# Video route registration lives in its own module to keep the image-generation
+# backend readable. It still shares this process's authentication, DB pool, HTTP
+# session, and Web Push setup.
+register_character_routes(app, pool_getter=lambda: db_pool, require_auth_dep=require_auth)
+
+register_video_routes(
+    app,
+    pool_getter=lambda: db_pool,
+    session_getter=lambda: session,
+    require_auth_dep=require_auth,
+    get_current_user_dep=get_current_user,
+    require_admin_dep=require_admin,
+    media_token_secret=(
+        os.environ.get("VIDEO_MEDIA_TOKEN_SECRET")
+        or os.environ.get("JWT_SECRET")
+        or INTERNAL_API_TOKEN
+        or API_KEY
+        # Stable across Gunicorn workers in local development. Production should
+        # always set VIDEO_MEDIA_TOKEN_SECRET explicitly.
+        or hashlib.sha256(DSN.encode("utf-8")).hexdigest()
+    ),
+)
 
